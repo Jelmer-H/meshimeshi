@@ -1,0 +1,44 @@
+# Meshimeshi scenarioknooppunten — synthetische posities in een NL-regio
+# (Utrecht / Gelderse vallei), op de knooppuntdichtheid van een bestaand landelijk LoRa-netwerk.
+# GEEN echte locaties; hoogtes representeren gebouw- en mastmontages.
+# Formaat: id,lat,lon,hoogte_m,naam
+0x0100,51.918,4.948,28,Culemborg
+0x0101,51.902,5.118,45,Geldermalsen
+0x0102,51.935,5.286,22,Tiel-West
+0x0103,51.912,5.457,38,Brakel
+0x0104,51.928,5.610,30,Zetten
+0x0105,51.905,5.782,25,Overbetuwe-Oost
+0x0106,51.982,4.935,40,Schoonhoven
+0x0107,51.984,5.069,375,Lopik
+0x0108,52.008,5.236,35,IJsselstein
+0x0109,51.989,5.410,25,Houten-Zuid
+0x010A,52.021,5.588,50,Wijk-bij-Duurstede
+0x010B,51.995,5.765,32,Rhenen-Oost
+0x010C,52.068,4.955,30,Oudewater
+0x010D,52.092,5.098,25,Utrecht-West
+0x010E,52.075,5.271,42,Utrecht-Zuid
+0x010F,52.105,5.438,28,De-Bilt
+0x0110,52.061,5.605,60,Doorn
+0x0111,52.088,5.794,22,Veenendaal-Zuid
+0x0112,52.148,4.932,45,Woerden
+0x0113,52.172,5.115,30,Utrecht-Noord
+0x0114,52.156,5.290,35,Zeist-West
+0x0115,52.184,5.465,300,Zeist
+0x0116,52.142,5.628,27,Soesterberg
+0x0117,52.169,5.802,55,Vallei-Oost
+0x0118,52.228,4.945,33,Kockengen
+0x0119,52.252,5.078,48,Loenersloot
+0x011A,52.236,5.262,20,Soest
+0x011B,52.214,5.434,36,Soestduinen
+0x011C,52.245,5.598,30,Leusden
+0x011D,52.223,5.769,40,Leusden-Oost
+0x011E,52.315,4.968,25,Breukelen
+0x011F,52.338,5.105,55,Nederhorst
+0x0120,52.322,5.284,45,Hilversum-Zuid
+0x0121,52.299,5.451,28,Hilversum
+0x0122,52.341,5.617,62,Nijkerk
+0x0123,52.308,5.790,24,Voorthuizen
+0x0124,52.385,4.988,38,Schermer
+0x0125,52.409,5.122,26,Naarden
+0x0126,52.393,5.295,50,Laren
+0x0127,52.421,5.460,33,Eemdijk
