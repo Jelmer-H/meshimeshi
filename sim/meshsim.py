@@ -220,7 +220,7 @@ def lokaal_net(mk, jitter):
         f"gemiddelde graad {sum(graad.values())/len(ids):.1f}, "
         f"min {min(graad.values())}, max {max(graad.values())}")
     fase = {}
-    def fasegrens():   # 7e ronde is de eerste op het 1-uursinterval
+    def fasegrens():   # na de opstartrondes (laatste op ~1890 s); daarna alleen keepalive (4.1)
         fase.update(air=radio.airtime[:], hello=radio.hello_air[:],
                     ack=radio.ack_air[:], t=radio.now)
     radio.schedule(3_700_000_000, fasegrens)

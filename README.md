@@ -5,9 +5,10 @@ Protocolkern in C voor repeaters/companions + Python-simulator. Zie
 
 ## Status (okt 2026)
 
-- **Bouwsteen 1 compleet**: hello (adaptief + jitter), directionele hello-acks
+- **Bouwsteen 1 compleet**: hello (opstartrondes adaptief + jitter, daarna
+  per-kanaal-keepalive), directionele hello-acks
   met snooping, symmetrie-status per buur (gezien/bevestigd), unicast met
-  ack1/2/3, retries, budget, botstings- en capturemodel, GPS/hoogte-linkbudget.
+  ack1/2/3, retries, budget, botsings- en capturemodel, GPS/hoogte-linkbudget.
   Scenario's tot en met `lokaal-net` (40 nodes uit een nodelijst).
 - **In voorbereiding**: hello-op-behoefte in de kern (4.1), slot × 3/n
   (open punt 3), bouwsteen 2: tablepull, veroudering, routering (10).

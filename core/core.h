@@ -72,6 +72,11 @@ struct mimeshi_node {
     uint64_t hello_jitter_us;         /* random fase per ronde; 0 = geen jitter.
                                          Default MC_HELLO_JITTER_US; voor de
                                          simulatie in te stellen vóór mimeshi_start */
+    uint8_t  ka_idle[MC_N_CHANNELS];  /* stillteteller per kanaal in keepaliveticks
+                                         (4.1): elke eigen identificerende zending
+                                         op kanaal c zet hem op 0; na 64 ticks
+                                         (= T_keepalive, core.c) stilte volgt
+                                         precies één hello op c */
     mimeshi_tx_fn     tx;
     mimeshi_timer_fn  timer;
     mimeshi_switch_fn switch_ch;
@@ -84,7 +89,8 @@ struct mimeshi_node {
 void mimeshi_init(mimeshi_node *n, uint16_t id, mimeshi_tx_fn tx, mimeshi_timer_fn timer,
                 mimeshi_switch_fn sw, mimeshi_rand_fn rnd, void *user);
 
-/* Eerste hello-ronde direct, daarna adaptief met random fase (jitter). */
+/* Eerste hello-ronde direct, daarna opstartrondes met random fase (jitter);
+ * na de opstartfase bestaat de hello alleen nog als per-kanaal-keepalive (4.1). */
 void mimeshi_start(mimeshi_node *n);
 
 /* Unicast naar dst. 0 = geaccepteerd, -1 = dst niet in de kaart (geen flood),

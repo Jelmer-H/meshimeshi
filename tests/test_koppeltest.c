@@ -8,6 +8,9 @@
  *
  * Deze test gebruikt een mini-eventqueue in plaats van de Python-simulator:
  * hij toetst de kern zelfstandig, de simulator blijft de second opinion.
+ * Sinds de per-kanaal-keepalive (4.1) toetst hij ook dat: na de opstart-
+ * rondes volgt precies één hello per stil kanaal, en een eigen roep op
+ * een kanaal reset alleen die teller.
  */
 #include <stdio.h>
 #include <string.h>
@@ -16,7 +19,7 @@
 #include "core/core.h"
 
 /* --- mini virtuele radio ---------------------------------------------- */
-#define MAXEV 256
+#define MAXEV 1024
 typedef struct { uint64_t at; mimeshi_node *n; void (*cb)(mimeshi_node *, void *); void *ud; int live; } ev;
 static ev q[MAXEV]; static int qn;
 static uint64_t now;
@@ -39,11 +42,16 @@ static void pump_until(uint64_t until) {
 /* --- vastleggen wat de kern doet ---------------------------------------- */
 static int tx_count, hello_seen, switch_count;
 static uint8_t last_type, last_ch;
+static int hello_cnt_A[3], hello_cnt_B[3];   /* hellos per kanaal per node (keepalive, 4.1) */
 
 static void vrtx(mimeshi_node *n, uint8_t ch, const uint8_t *pkt, uint16_t len, uint64_t air) {
-    (void)n; (void)len; (void)air;
+    (void)len; (void)air;
     tx_count++; last_type = pkt[0]; last_ch = ch;
-    if ((pkt[0] & 0x0F) == 1) hello_seen++;           /* PKT_HELLO */
+    if ((pkt[0] & 0x0F) == 1) {              /* PKT_HELLO */
+        hello_seen++;
+        if (n->id == 0x0102) hello_cnt_A[ch]++;
+        else if (n->id == 0x0100) hello_cnt_B[ch]++;
+    }
     /* afleveren aan de andere node in de test is niet nodig: we toetsen
        de kern-uitgang, niet de ronddraaiende keten (dat doet sim1.py). */
 }
@@ -130,6 +138,29 @@ int main(void) {
             if (A.nbr[i].alive && A.nbr[i].id == 0x0107) gezien = A.nbr[i].sym;
         assert(gezien == 0);              /* gezien, niet bevestigd */
     }
+
+    /* --- keepalive (4.1): na de opstartrondes (0-3810 s; de interval-
+     * verdubbeling valt na de ronde, dus de laatste ronde staat op het
+     * 1920 s-interval en de stop komt pas op het 1-uursinterval) bestaat
+     * de hello alleen nog als per-kanaal-keepalive: precies één hello na
+     * T_keepalive stilte op een kanaal, en een eigen roep reset alleen
+     * dát kanaal. */
+    pump_until(4500000000ull);            /* alle opstartrondes voorbij */
+    int rA[3] = { hello_cnt_A[0], hello_cnt_A[1], hello_cnt_A[2] };
+    int rB[3] = { hello_cnt_B[0], hello_cnt_B[1], hello_cnt_B[2] };
+    /* identificerend verkeer voor A op kanaal 1 (ack1 + ack2 daar): reset
+     * alleen kanaal 1 van A; 0 en 2 blijven tellen vanaf de ronde op 3810 s. */
+    uint8_t data[11] = { 5, 7,0, 0x00,0x01, 0x02,0x01, 0x00,0x01, 32, 'x' };
+    mimeshi_rx(&A, 1, -60, data, 11);
+    pump_until(7500000000ull);            /* ~1 u stilte: kanaal 0 en 2 van A (sinds 3810 s) */
+    assert(hello_cnt_A[0] == rA[0] + 1);       /* keepalive na ~1 u stilte */
+    assert(hello_cnt_A[2] == rA[2] + 1);
+    assert(hello_cnt_A[1] == rA[1]);           /* gereset door verkeer op kanaal 1 */
+    assert(hello_cnt_B[0] == rB[0] + 1 && hello_cnt_B[1] == rB[1] + 1
+        && hello_cnt_B[2] == rB[2] + 1);       /* B stil: alle drie de kanalen */
+    pump_until(8200000000ull);            /* A's kanaal 1: stil sinds 4500 s */
+    assert(hello_cnt_A[1] == rA[1] + 1);       /* alsnog precies één keepalive */
+    assert(hello_cnt_B[0] == rB[0] + 1);       /* B krijgt geen tweede: teller reset bij de roep */
 
     printf("koppeltest: OK (tx=%d, hellos=%d, switches=%d)\n", tx_count, hello_seen, switch_count);
     return 0;

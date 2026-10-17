@@ -43,7 +43,9 @@
  * Waarden en status staan in het ontwerpdocument; wijzig ze daar eerst
  * (werkregel: ontwerp -> kern -> ctest + sim1.py laten meegroeien). */
 #define MC_HELLO_START_US  30000000ull     /* 30 s na opstarten (4.1) */
-#define MC_HELLO_MAX_US    3600000000ull   /* 1 u stabiel (4.1) */
+#define MC_HELLO_MAX_US    3600000000ull   /* 1 u stabiel (4.1); = T_keepalive */
+#define MC_KEEPALIVE_TICKS 64u             /* stilte-ticks = T_keepalive (4.1) */
+#define MC_KEEPALIVE_TICK_US (MC_HELLO_MAX_US / MC_KEEPALIVE_TICKS)  /* ~56 s: de tijdbasis zonder klok */
 #define MC_HELLO_JITTER_US 1000000ull      /* random fase per ronde (4.1, open punt 3) */
 #define MC_HELLO_ACK_WIN_US 3000000ull     /* max responstijd hello-acks: 3 s (2) */
 #define MC_HELLO_ACK_JITTER_US (MC_HELLO_ACK_WIN_US / 16u)  /* ~187 ms, > t_ack + S (2) */
@@ -89,6 +91,18 @@ enum {
 /* little-endian lezen/schrijven van 16-bits velden (6.1) */
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+
+/* ---------------- keepalivetellers (4.1) ----------------
+ * Per kanaal telt de node hoeveel keepaliveticks verstreken zijn sinds hij
+ * daar zelf voor het laatst "geroepen" heeft — een identificerende zending
+ * op dat kanaal (hello, hello-ack, ack1, ack2, data als prev_hop, ack3,
+ * straks pull-verkeer). ANN en FULL zijn anoniem en resetten dus NIET.
+ * Elke eigen roep zet de teller van dat kanaal op 0; na MC_KEEPALIVE_TICKS
+ * stilte volgt precies één hello op dat kanaal (ka_tick). De kern heeft geen
+ * klok: de tick-timer ís de tijdbasis. */
+static void ka_called(mimeshi_node *n, uint8_t ch) {
+    if (ch < MC_N_CHANNELS) n->ka_idle[ch] = 0;
+}
 
 /* ---------------- neighbor table en dedup ---------------- */
 
@@ -191,6 +205,7 @@ static void hello_round(mimeshi_node *n) {
     wr16(p + 1, n->id); wr16(p + 3, n->my_state_ver);
     for (uint8_t c = 0; c < MC_N_CHANNELS; c++) {          /* vaste volgorde */
         bound_send(n, c, p, 5, t_hello_us());
+        ka_called(n, c);                                   /* eigen roep op c (4.1) */
     }
     /* na de ronde is de node thuis; hello-acks komen daar (binnen het venster) */
 }
@@ -206,15 +221,46 @@ static uint64_t hello_jitter(mimeshi_node *n) {
 
 /* Ronde draaien, interval verdubbelen (30 s -> 60 s -> ... -> 1 u) en de
  * volgende ronde plannen. De verdubbeling is per (4.1): langer aanwezige
- * nodes storen minder. De jitter zit op de timer, niet op de ronde zelf. */
+ * nodes storen minder. De jitter zit op de timer, niet op de ronde zelf.
+ * Bij het maximum (1 u) stopt de opstartfase (4.1): deze tick zendt geen
+ * ronde meer en plant er ook geen — de hello bestaat voortaan alleen nog
+ * als per-kanaal-keepalive (ka_tick hieronder). */
 static void hello_tick(mimeshi_node *n, void *ud) {
     (void)ud;
+    if (n->hello_interval_us >= MC_HELLO_MAX_US) return;
     hello_round(n);
-    if (n->hello_interval_us < MC_HELLO_MAX_US) {
-        n->hello_interval_us *= 2;
-        if (n->hello_interval_us > MC_HELLO_MAX_US) n->hello_interval_us = MC_HELLO_MAX_US;
-    }
+    n->hello_interval_us *= 2;
+    if (n->hello_interval_us > MC_HELLO_MAX_US) n->hello_interval_us = MC_HELLO_MAX_US;
     n->timer(n, n->hello_interval_us + hello_jitter(n), hello_tick, 0);
+}
+
+/* Keepalive-hello op kanaal c (4.1): precies één hello, niet een ronde —
+ * alleen het kanaal dat een uur stil was. Met de gebruikelijke random fase,
+ * zodat stille regio's vanzelf desynchroniseren (4.1, koppeltest). */
+static void ka_fire(mimeshi_node *n, void *ud) {
+    uint8_t c = (uint8_t)(size_t)ud;
+    uint8_t p[5] = { PKT_HELLO, 0,0,0,0 };
+    wr16(p + 1, n->id); wr16(p + 3, n->my_state_ver);
+    bound_send(n, c, p, 5, t_hello_us());
+    ka_called(n, c);                        /* teller loopt pas weer vanaf deze roep */
+}
+
+/* De keepalivetijdbasis: de kern heeft geen klok, dus telt hij stilte in
+ * ticks. Is op kanaal c MC_KEEPALIVE_TICKS stilte verstreken (= T_keepalive),
+ * dan volgt precies één hello op c, met jitter gepland. Plant zichzelf
+ * opnieuw; gestart in mimeshi_start(). Tijdens de opstartfase haalt de
+ * ronde-ritme de teller steeds terug — keepalive en ronde storen elkaar
+ * daardoor niet. */
+static void ka_tick(mimeshi_node *n, void *ud) {
+    (void)ud;
+    for (uint8_t c = 0; c < MC_N_CHANNELS; c++) {
+        if (n->ka_idle[c] < MC_KEEPALIVE_TICKS) n->ka_idle[c]++;
+        if (n->ka_idle[c] >= MC_KEEPALIVE_TICKS) {
+            n->ka_idle[c] = 0;              /* teller reset bij het plannen: één hello, geen storm */
+            n->timer(n, hello_jitter(n), ka_fire, (void *)(size_t)c);
+        }
+    }
+    n->timer(n, MC_KEEPALIVE_TICK_US, ka_tick, 0);
 }
 
 /* Hello-ack afgeven op het THUISkanaal van de hello-verzender (2): de
@@ -234,6 +280,7 @@ static void hello_ack_fire(mimeshi_node *n, void *ud) {
     wr16(p + 3, n->id);
     wr16(p + 5, n->my_state_ver);
     bound_send(n, (uint8_t)(to % MC_N_CHANNELS), p, 7, t_ack_us()); /* naar THUIS van verzender */
+    ka_called(n, (uint8_t)(to % MC_N_CHANNELS));    /* eigen roep op dat kanaal (4.1) */
 }
 
 /* Wachttijd en besluit voor de hello-ack, na ontvangst van een hello:
@@ -304,6 +351,7 @@ static void ack1_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint8_t ch
     uint8_t p[7] = { PKT_ACK1, 0,0, 0,0, 0,0 };
     wr16(p + 1, msg_id); wr16(p + 3, src); wr16(p + 5, n->id);
     n->tx(n, ch, p, 7, t_ack_us());       /* zelfde kanaal als de data (wisselregel) */
+    ka_called(n, ch);                     /* eigen roep op het datakanaal (4.1) */
 }
 
 /* Ack2 naar de vorige hop, op DIENS thuiskanaal (2, 7.1): de vorige hop
@@ -313,6 +361,7 @@ static void ack2_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint16_t p
     uint8_t p[7] = { (uint8_t)(PKT_ACK2 | (neg ? F_NEG_ACK2 : 0)), 0,0, 0,0, 0,0 };
     wr16(p + 1, msg_id); wr16(p + 3, src); wr16(p + 5, n->id);
     bound_send(n, (uint8_t)(prev % MC_N_CHANNELS), p, 7, t_ack_us()); /* THUIS van vorige hop */
+    ka_called(n, (uint8_t)(prev % MC_N_CHANNELS));  /* eigen roep daar (4.1) */
 }
 
 static void pending_try(mimeshi_node *n, mimeshi_pending *p);
@@ -353,6 +402,7 @@ static void ack1_timeout(mimeshi_node *n, void *ud) {
 static void pending_try(mimeshi_node *n, mimeshi_pending *p) {
     p->pkt[9] = p->budget_left;
     bound_send(n, (uint8_t)(p->next_hop % MC_N_CHANNELS), p->pkt, p->pkt_len, t_data_us(p->pkt_len));
+    ka_called(n, (uint8_t)(p->next_hop % MC_N_CHANNELS));   /* data als prev_hop (4.1) */
     n->timer(n, MC_S_SWITCH_US + t_data_us(p->pkt_len) + t_ack_us() + MC_ACK1_MARGIN_US, ack1_timeout, p);
 }
 
@@ -493,6 +543,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
             wr16(a + 1, (uint16_t)n->rand(n)); wr16(a + 3, n->id);
             wr16(a + 5, src); wr16(a + 7, n->id); a[9] = MC_BUDGET_INIT; wr16(a + 10, msg_id);
             bound_send(n, (uint8_t)(prev % MC_N_CHANNELS), a, 14, t_data_us(14));
+            ka_called(n, (uint8_t)(prev % MC_N_CHANNELS));   /* eigen roep (4.1) */
         }
         break;
     }
@@ -524,4 +575,6 @@ void mimeshi_start(mimeshi_node *n) {
     hello_round(n);
     /* random fase: voorkomt synchrone rondes bij gelijktijdig opstarten (4.1) */
     n->timer(n, n->hello_interval_us + hello_jitter(n), hello_tick, 0);
+    /* keepalivetick: de tijdbasis voor de per-kanaal-keepalive (4.1) */
+    n->timer(n, MC_KEEPALIVE_TICK_US, ka_tick, 0);
 }

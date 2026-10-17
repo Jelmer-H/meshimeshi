@@ -296,10 +296,10 @@ class Node:
                           f"op kanaal {ch} ({reden})")
         self.radio.schedule(delay, deliver)
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- 
 # C-kern via ctypes — de enige protocolimplementatie (ontwerp 13b).
 # Structlayout is geverifieerd tegen sizeof/offsetof van core.h
-# (neighbor 12, pending 256, node 5440 B).
+# (neighbor 12, pending 256, node 5448 B).
 # ---------------------------------------------------------------------------
 MC_MAX_NEIGHBORS, MC_MAX_PENDING, MC_MAX_DEDUP, MC_MAX_PAYLOAD = 64, 16, 128, 230
 
@@ -337,6 +337,7 @@ CNode._fields_ = [
     ("nbr", CNeighbor * MC_MAX_NEIGHBORS), ("pend", CPending * MC_MAX_PENDING),
     ("dedup", CDedup * MC_MAX_DEDUP), ("hello_interval_us", ctypes.c_uint64),
     ("hello_jitter_us", ctypes.c_uint64),
+    ("ka_idle", ctypes.c_uint8 * 3),   # keepalivetellers per kanaal (4.1)
     ("tx", TX_FN), ("timer", TIMER_FN), ("switch_ch", SWITCH_FN), ("rand", RAND_FN),
     ("user", ctypes.c_void_p),
 ]
