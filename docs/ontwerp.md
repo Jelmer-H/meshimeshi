@@ -53,11 +53,12 @@ Elke node luistert continu op zijn eigen thuiskanaal. Hij wisselt alleen van kan
 - **Unicast data:** de verzender wisselt naar het thuiskanaal van de ontvanger, zendt, wacht daar op ack1 en keert terug. Per hop maximaal twee wissels voor de verzender (heen en terug), en nul voor de ontvanger.
 - **Ack2:** de volgende hop wisselt naar het thuiskanaal van de vorige hop, zendt, en keert direct terug. Eén exchange.
 - **Tablepulls:** unicast naar het thuiskanaal van de partner. Dit is een exchange, dus wisselen is toegestaan.
+- **Bewijslijst (4.2):** een klein pakket met de node-ID's van buren waarvan het tegenrichtingbewijs binnenkort afloopt. Alleen de sub-lijst van buren die op dát kanaal thuis zijn; elk kanaal heeft per node één flush-moment per uur (20-minutenrotatie), dus maximaal één bewijslijst-pakket per kanaal per uur. Het pakket is een eigen roep op dat kanaal en reset de keepaliveteller ervan (4.1). Een ontvanger die erin staat, verversst zijn bewijs en reageert niet; een ontvanger die er niet in staat, verwerkt de zender zoals snooping dat doet (liveness, versie, kwaliteit, "gezien").
 - **Aankondigingen (ANN):** op alle drie de kanalen in vaste volgorde. Een FULL-fetch is een exchange (`T_full`), dus de fetcher wisselt naar het kanaal van de aankondiger en keert terug.
 - **Gedeelde chatkanalen** (#public, #test) vervallen.
 - **Simulatiemeting:** de tijd per node buiten het eigen thuiskanaal, de "thuis-doofheid". Elk moment buiten het eigen kanaal is gemiste ontvangst op het eigen kanaal.
 - **Ack eligibility (besloten, okt 2026):** een zending leidt alleen tot een ack als aan drie onafhankelijke voorwaarden is voldaan:
-  1. **Need:** de link staat op "gezien" in plaats van "bevestigd symmetrisch", het tegenrichtingbewijs is verouderd (na `T_sym`), of er staat een courtesy ack open. In rust is deze voorwaarde niet waar, en dat beperkt het aantal acks, ook als een buur veel zendt.
+  1. **Need:** de link staat op "gezien" in plaats van "bevestigd symmetrisch", of er staat een courtesy ack open. Verouderd tegenbewijs is geen ack-reden: dat onderhoudt de bewijslijst (4.2). In rust is deze voorwaarde niet waar, en dat beperkt het aantal acks, ook als een buur veel zendt.
   2. **Pace:** de teller per buur (sectie 4.1) en de cooldown na een eigen ack.
   3. **Spacing:** de rangorde op RSSI met jitter (zie hierboven), zodat acks van meerdere responders elkaar niet raken.
 
@@ -135,20 +136,25 @@ De bevestiging komt uitsluitend van de buur zelf:
 - (a) een aan ons gerichte hello-ack, het bewijskanaal van het hello-proces. Dit is beschikbaar vóór de eerste unicast.
 - (b) een geslaagde unicast-uitwisseling met ack1.
 - (c) straks een tablepull van de buur waarin wij staan (4.3), met zijn eigen meting van ons signaal.
+- (d) een bewijslijst van de buur waarin wij staan (hierna).
 
 Een aan een ander gerichte, afgeluisterde hello-ack bewijst geen symmetrie. Routering kiest de volgende hop alleen via bevestigd symmetrische buren (10.1). Directe antwoorden in exchanges zijn altijd toegestaan (4.3). Het meeadverteren van deze status in de neighbor table komt met de tablepull van bouwsteen 2.
 
-**Symmetrie op de lange termijn (voorstel, okt 2026).** De bevestigde status is niet eeuwig geldig. Per buur houdt een node bij hoe oud het tegenrichtingbewijs is ("laatst bewezen"). Dat wordt ververst door een aan ons gerichte hello-ack, een geslaagde unicast met ack1, of een tablepull van de buur waarin wij staan.
+**Symmetrie op de lange termijn (voorstel, okt 2026).** De bevestigde status is niet eeuwig geldig. Per buur houdt een node bij hoe oud het tegenrichtingbewijs is ("laatst bewezen"). Dat wordt ververst door een aan ons gerichte hello-ack, een geslaagde unicast met ack1, een tablepull van de buur waarin wij staan (4.3), of doordat wij in zijn bewijslijst staan.
 
-Zonder onderhoud ontstaat een impasse: de buur die als eerste opnieuw ackt (de druppel, 4.1), ververst alleen zijn ontvanger. De zender leert niets van zijn eigen zending, dus zijn bewijs veroudert eeuwig, terwijl de link gezond is.
+Zonder onderhoud ontstaat er een impasse: de buur die als eerste opnieuw ackt (de druppel, 4.1), ververst alleen zijn ontvanger. De zender leert niets van zijn eigen zending, dus zijn bewijs veroudert eeuwig, terwijl de link gezond is.
 
-De oplossing is de vlagbit "bevestig dit" in de hello-ack (sectie 2). Bij een bewijsleeftijd van `T_sym/2` stuurt een node zijn volgende hello-ack met vlag. De ontvanger antwoordt precies één keer; zijn eigen bewijs is door de ontvangst al vers, en zonder vlag zou hij zwijgen.
+De oplossing is de **bewijslijst**: een klein pakket met de node-ID's van buren waarvan het tegenrichtingbewijs binnenkort afloopt. Het werkingsprincipe: een bewijs over de richting buur→ons kan alleen van óns komen, want wij zijn de enige bron van hun onmeetbare richting, en omgekeerd. Publiceert een node "ik hoor X", dan is bij X in één ontvangst de richting X→node bevestigd (de claim van de node zelf) en de richting node→X vers gemeten (de ontvangst zelf). Er is geen antwoord nodig: elke kant onderhoudt de andere via zijn eigen lijsten, onafhankelijk en symmetrisch.
 
-- Kosten: twee pakketten van 7 bytes per link per periode. Dat komt vrijwel alleen in een stil netwerk voor, want bij verkeer verversen ack1's en tablepulls het bewijs meestal eerder.
-- De marge tussen `T_sym/2` en `T_sym` vangt verloren uitwisselingen op. Bij `T_sym` degradeert de link naar "gezien", en routering (10.1) kiest hem dan niet meer.
-- Parameter: `T_sym`, startwaarde 6 uur, te toetsen in scenario 5.
+- **Trigger.** Per buur houdt de node bij wanneer hij die voor het laatst heeft bevestigd (aan hem gerichte hello-ack, ack1 op zijn data, tablepull, of een eerdere lijst) — dat is de eigen zendlog, dus exact lokaal berekenbaar. Loopt de bevestigingsleeftijd boven `T_sym − 2 u`, dan komt de buur in de lijst. De marge geeft elke link nog twee flush-momenten vóór verval; bij `T_sym` degradeert de link naar "gezien", en routering (10.1) kiest hem dan niet meer.
+- **Kadans en kap.** Flush-check elke 20 minuten, roterend per kanaal (`slot mod 3`). Daarmee heeft elk kanaal één flush-moment per uur: maximaal één bewijslijst-pakket per kanaal per uur per node, dezelfde frequentie als de keepalive zelf (4.1). De drie kanalen van een node liggen 20 minuten uit elkaar, dus geen zelf-opstopping.
+- **Kanaal.** Alleen de sub-lijst van buren die op dát kanaal thuis zijn; elke ontvanger luistert thuis. Het pakket is een eigen roep op dat kanaal en reset de keepaliveteller (4.1).
+- **Reactieloos.** In de lijst staan verversst het bewijs; niet in de lijst staan is snooping ("gezien", liveness, versie, kwaliteit). Geen enkele ontvangst triggert een reactie; de ack-op-op-regress blijft afgesneden, zonder vlagsemantiek of antwoordregel.
+- **Kosten.** Per link per `T_sym`-periode twee lijst-entries, een per kant — bij losse entries evenveel lucht als de eerdere vlagbit-oplossing (2 × 78 ms), maar de entries bundelen (2 t/m 17 ID's in één pakket van de 173 ms-klasse), het schema plant zichzelf (geen afhankelijkheid van ack-kansen) en op hubs daalt het aantal pakketten. Vrijwel alleen in een stil netwerk, want bij verkeer verversen ack1's en tablepulls het bewijs meestal eerder.
+- **Massa-gebeurtenissen.** Na regionale stilte lopen veel bewijzen synchroon af. De golf spreidt vanzelf: elke node heeft zijn eigen rotatie en zijn eigen bevestigings-leeftijden (het laatste verkeer per link, geen gedeelde klok), en de lijstjes bundelen wat tegelijk afloopt.
+- **Parameters.** `T_sym` startwaarde 6 uur (te toetsen in scenario 5); flush-marge 2 uur; kadans 20 minuten (rotatie).
 
-**Status:** besloten.
+**Status:** symmetriestatus (gezien/bevestigd) besloten; bewijslijst voorstel, te toetsen in scenario 5.
 
 ### 4.3 Tabelophalen
 
@@ -231,7 +237,8 @@ Optioneel: bron-geo (4 bytes, sectie 5), aanwezig als de flag is gezet. Dat is n
 | ack1 | 7 bytes | Volgende hop → vorige hop | Zelfde kanaal als de data-uitwisseling; de verzender wacht daar volgens de wisselregel |
 | ack2 | 7 bytes | Volgende hop → vorige hop | Thuiskanaal van de vorige hop |
 | ack3 | Routed bericht, payload 4 bytes | Bestemming → bron | Via routering |
-| hello-ack | 7 bytes, directioneel: type (incl. vlagbit "bevestig dit", 4.2), bestemmings-id (de getriggerde zender), afzender-id, state-versie (sectie 2) | Responder → getriggerde zender | Bij een hello-ronde: thuiskanaal van de hello-verzender. Bij een thuis-zending van de trigger (ANN, FULL, of ack1 op het eigen kanaal): dat kanaal zelf, want de trigger-zender luistert daar per definitie. |
+| hello-ack | 7 bytes, directioneel: type, bestemmings-id (de getriggerde zender), afzender-id, state-versie (sectie 2) | Responder → getriggerde zender | Bij een hello-ronde: thuiskanaal van de hello-verzender. Bij een thuis-zending van de trigger (ANN, FULL, of ack1 op het eigen kanaal): dat kanaal zelf, want de trigger-zender luistert daar per definitie. |
+| bewijslijst | 7 + 2n bytes (n buur-ID's, n ≤ 17): type, node-ID (2), state-versie (2), daarna n × 2 B | Node → alle buren die op dat kanaal thuis zijn | Alleen de sub-lijst van buren die op kanaal c thuis zijn; max één per kanaal per uur (4.2). In de lijst staan = bewijs ververst, geen reactie; niet in de lijst = snooping. |
 
 Ack1 bevat de identiteit van het oorspronkelijke bericht en de afzender van ack1.
 
@@ -502,7 +509,7 @@ Threads kunnen met een kortere limiet werken, bijvoorbeeld drie bits. Dat levert
 | 14 | SF8-terugval voor afgelegen nodes. Een receiver luistert op één SF, dus de keuze geldt per link of per regio, niet per node. Geschatte winst: 25–30% bereik tegen ongeveer 2× airtime. | Radioontwerp, mogelijk per regio |
 | 15 | Lokale drukte-meting (kanaalbezetting via CAD, eigen duty-cycle, faalpercentage van acks) om onderhoud te plannen in rustige momenten. Taken: (a) lokaal rekenwerk zonder airtime: Gabriel-graaf herberekenen, routes opnieuw uitrekenen, tombstones opruimen, dedup-cache comprimeren; (b) kleine unicast-taken: routeinformatie van 2-hop-buren ophalen, neighbor tables van buren verversen; (c) probes naar gepenaliseerde links, en kwaliteit in beide richtingen meten; (d) meetwerk voor de SF8-vraag. Niet toegestaan in rustige periodes: floods, brede pulls, en alles wat de hello verandert. Kennis uit buren krijgt een leeftijd en een bron, en weegt zwaarder naarmate ze recenter is. Zo reikt de kennis van de kaart verder dan twee hops, zonder dat één node alles hoeft op te halen. | Onderhoud zonder extra netwerkbelasting |
 | 16 | Triggergeneralisatie (sectie 2): de hello-ack volgt op elke identificerende thuis-zending van een buur. Te meten in scenario 2: de stabiele ackbelasting mag niet boven het schema uitkomen (0,12–0,17% per kanaal). Ook: ackbotsingen bij ANN/FULL-triggers en de rangspreiding daar. | Bepaalt of keepalive-hello en gegeneraliseerde ack samen het rustverkeer dragen |
-| 17 | `T_sym` voor de herbevestiging van symmetrie (4.2, startwaarde 6 uur), en de verhouding `T_keepalive : T_expire = 1 : 4` (startwaarden 1 uur / 4 uur, 4.4). | Routestabiliteit tegenover airtime; te toetsen in scenario 5 |
+| 17 | `T_sym` en de flush-marge van de bewijslijst (4.2; startwaarden 6 uur / 2 uur), en de verhouding `T_keepalive : T_expire = 1 : 4` (startwaarden 1 uur / 4 uur, 4.4). | Routestabiliteit tegenover airtime; te toetsen in scenario 5 |
 | 18 | Ackkanaal bij een keepalive-hello op kanaal c: (a) de verzender blijft op c in een kort venster, responders wisselen niet (voorkeur, sectie 2); of (b) de huidige regel: acks wisselen naar het thuiskanaal van de verzender. | (a) concentreert de thuis-doofheid bij één node per keepalive-hello; (b) verspreidt wissels over alle responders |
 
 ---
@@ -565,7 +572,7 @@ Threads kunnen met een kortere limiet werken, bijvoorbeeld drie bits. Dat levert
 - Budgetverbruik per bericht.
 - Latentie (ter informatie).
 - Dubbelwerk bij threads: verhouding FULL-zendingen tot het aantal nodes.
-- Keepalive-hello's per node per kanaal, vertraging van versie-verversing, en herbevestigingsuitwisselingen (`T_sym`, 4.2).
+- Keepalive-hello's per node per kanaal, vertraging van versie-verversing, en bewijslijst-pakketten per kanaal per uur (`T_sym`, 4.2).
 
 **Topologie:** echte repeaterlocaties als die beschikbaar zijn, anders synthetisch met dezelfde dichtheid per regio. Water wordt uitgesloten (bijvoorbeeld via OpenStreetMap).
 
@@ -632,5 +639,7 @@ Grof gekalibreerd: masten van 20–40 m reiken ongeveer 12–14 km, hoge masten 
 | Repeater-WiFi standaard aan | Vervallen | Stroomverbruik op zonne-energie; nu standaard uit |
 | Repeater-opslag voor companions | Vervallen | Companions halen threads op uit de threadcache van hun repeater |
 | "Hello op behoefte", regels 1 en 2 (stale-buur- en versietrigger) | Vervangen (okt 2026) | Snooping en de gegeneraliseerde hello-ack dekken liveness en versie. Over blijft de per-kanaal-keepalive (4.1). |
-| Hello-ack alleen na een hello | Vervangen (okt 2026) | Gegeneraliseerd naar elke identificerende thuis-zending, met de ack eligibility-conditie, cooldown en herbevestigingsvlag (sectie 2 en 4.2) |
+| Hello-ack alleen na een hello | Vervangen (okt 2026) | Gegeneraliseerd naar elke identificerende thuis-zending, met de ack eligibility-conditie en cooldown; destijds inclusief een herbevestigingsvlag, later zelf vervangen (rij hierboven) |
 | Verwijdering door stilte mét tombstone | Vervangen (okt 2026) | Stilte is dooddetectie (4 uur, 4.4) zonder tombstone. De tombstone blijft voor neighbor table limit churn op hub-sites (10.4). |
+| Vlagbit "bevestig dit" + antwoordregel | Vervangen (okt 2026) | De bewijslijst (4.2) onderhoudt de bewijzen zonder vlag, zonder antwoord en zonder afhankelijkheid van ack-kansen; zelfde lucht per link, minder pakketten op hubs |
+| Volle buur-ID-lijst in de keepalive | Vervallen (okt 2026) | Lucht is superlineaal (5 B = 70 ms, 133 B = 459 ms) en het pakket gaat elk uur elk kanaal naar iedereen; het "afgelopen uur"-filter filtert niets, want door de keepalive is elke levende buur per definitie binnen het laatste uur gehoord; routering heeft kwaliteit/geo/richting nodig, dus de pulls blijven. De deltavariant (bewijslijst) houdt de aggregatiewinst zonder de kosten |
