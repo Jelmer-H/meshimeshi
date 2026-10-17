@@ -10,7 +10,7 @@ Protocolkern in C voor repeaters/companions + Python-simulator. Zie
   ack1/2/3, retries, budget, botstings- en capturemodel, GPS/hoogte-linkbudget.
   Scenario's tot en met `lokaal-net` (40 nodes uit een nodelijst).
 - **In voorbereiding**: hello-op-behoefte in de kern (4.1), slot × 3/n
-  (open punt 3), bouwsteen 2: tabelpull, veroudering, routering (10).
+  (open punt 3), bouwsteen 2: tablepull, veroudering, routering (10).
 - Alle besluiten en metingen staan met rationale in `docs/ontwerp.md`;
   de werkvolgorde in 14.1.
 
@@ -20,7 +20,7 @@ Protocolkern in C voor repeaters/companions + Python-simulator. Zie
 meshimeshi/
 ├── core/            # protocolkern: platformonafhankelijk, geen dynamische allocatie
 │   ├── core.h       #   API + hardware-interface (tx / timer / wissel / RNG)
-│   └── core.c       #   hello, buurtabel, acks, unicast, budget, wisselregel
+│   └── core.c       #   hello, neighbor table, acks, unicast, budget, wisselregel
 ├── sim/             # simulator (event-gestuurde virtuele radio, SF7/62,5 kHz)
 │   ├── sim1.py      #   platformlaag (klok/radio/RNG) + koppeltest-scenario
 │   └── meshsim.py   #   simpy-motor + scenario-register (hergebruikt sim1.py)

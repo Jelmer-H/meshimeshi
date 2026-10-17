@@ -27,13 +27,15 @@
 typedef struct {
     uint16_t id;
     uint8_t  quality;      /* afgeleid van RSSI, bijgewerkt per hello/ack */
-    uint8_t  ack_try;      /* ack-pogingen richting deze buur: backoff-schema (4.1);
-                              reset bij bevestiging of hernieuwd contact */
+    uint8_t  ack_try;      /* teller per buur (4.1): elke identificerende
+                              zending van de buur telt; ack-pogingen op de
+                              tellerstanden 1, 2, 4, 8, 16, daarna gemiddeld
+                              1 op 16; reset bij bevestiging of hernieuwd contact */
     uint32_t last_seen;
     uint16_t state_ver;    /* laatst geziene state-versie van deze buur (4.3) */
     uint8_t  alive;
-    uint8_t  sym;           /* 1 = bevestigd symmetrisch (geslaagde ack1-
-                               uitwisseling of tabelpull van de buur); 0 =
+    uint8_t  sym;           /* 1 = bevestigd symmetrisch (geslaagde unicast
+                               met ack1 of tablepull van de buur); 0 =
                                alleen gezien, één richting (4.2, 10.1) */
 } mimeshi_neighbor;
 

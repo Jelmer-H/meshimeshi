@@ -2,9 +2,9 @@
  * Meshimeshi — protocolkern, implementatie. Zie core.h (API + node-struct)
  * en docs/ontwerp.md (sectieverwijzingen hieronder verwijzen daarnaartoe).
  *
- * Bouwsteen 1 (koppeltest): hello-ronde, buurtabel, hello-acks met
+ * Bouwsteen 1 (koppeltest): hello-ronde, neighbor table, hello-acks met
  * RSSI-spreiding, unicast met ack1/ack2/ack3, retries, budget.
- * Forwarding, routering (10.2), T_ack2-venster (7.3) en tabelpull (4.3)
+ * Forwarding, routering (10.2), T_ack2-venster (7.3) en tablepull (4.3)
  * zijn bouwsteen 2 — waar dat gedrag nog ontbreekt staat dat vermeld.
  *
  * Architectuur (13b): de kern heeft geen klok, radio of RNG. Alles komt
@@ -22,15 +22,15 @@
  *    getallen, firmware met een lokale hardware-teller (13). Geen kloksync.
  *
  * Wisselregel (2), afgedwongen via bound_send():
- *  - Gebonden uitwisseling = wissel naar het kanaal van de partner
+ *  - Exchange = wissel naar het kanaal van de partner
  *    (MC_S_SWITCH_US), zenden zodra de radio op kanaal zit. De kern heeft
  *    geen expliciete "keer terug naar huis"-aanroep: de platformlaag keert
- *    na de gebonden zending zelfstandig terug naar het thuiskanaal (bij
- *    data na het ack1-venster op het uitwisselingskanaal, 7.3). De
+ *    na de exchange zelfstandig terug naar het thuiskanaal (bij
+ *    data na het ack1-venster op het exchangekanaal, 7.3). De
  *    simulator (sim/sim1.py, class Node) is de referentie-implementatie
  *    van dat platformcontract.
  *  - Ack1 is de uitzondering: die gaat zonder wissel via tx() op het kanaal
- *    van de lopende uitwisseling, want de verzender wacht daar (7.1).
+ *    van de lopende exchange, want de verzender wacht daar (7.1).
  *
  * Logging: de printf-regels zijn bedoeld voor koppeltest en simulator.
  * Firmware kan ze dempen; later worden ze een platform-callback.
@@ -65,7 +65,7 @@ static uint64_t t_data_us(uint16_t l) { return l <= 40 ? 173000ull : l <= 150 ? 
  * Type-byte: lage nibble = type, hoge nibble = flags (6.1). Alle
  * multi-bytevelden little-endian (rd16/wr16). Layouts:
  *
- *   HELLO       5 B   type, node-id(2), state-versie buurtabel(2)     (4.1, 6.3)
+ *   HELLO       5 B   type, node-id(2), state-versie neighbor table(2)  (4.1, 6.3)
  *   HELLO_ACK   7 B   type, bestemmings-id(2) = hello-verzender,
  *                     afzender-id(2), state-versie(2) — directioneel:
  *                     het adres maakt de ack tot exact symmetriebewijs
@@ -90,7 +90,7 @@ enum {
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 
-/* ---------------- buurtabel en dedup ---------------- */
+/* ---------------- neighbor table en dedup ---------------- */
 
 /* Buur opzoeken op id. Lineair zoeken: MC_MAX_NEIGHBORS is klein en de
  * tabel wordt alleen geraakt bij ontvangst of verzendkeuze. */
@@ -109,7 +109,7 @@ static uint8_t quality_of(int8_t rssi) {
  * aanroeper gaat daarmee door zonder de buur. Een nieuwe entry begint als
  * "gezien": één richting, sym = 0 (4.2). my_state_ver verhoogt bij elke
  * mutatie: de hello draagt die versie mee, zodat buren zien dat een
- * tabelpull nodig is (4.3). */
+ * tablepull nodig is (4.3). */
 static mimeshi_neighbor *nbr_add(mimeshi_node *n, uint16_t id) {
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
         if (!n->nbr[i].alive) {
@@ -135,7 +135,7 @@ static bool dedup_fresh(mimeshi_node *n, uint16_t msg_id, uint16_t src) {
     return true; /* volle cache: ontvang maar (LRU komt later) */
 }
 
-/* ---------------- gebonden zending (wisselregel, sectie 2) ---------
+/* ---------------- exchange (wisselregel, sectie 2) ---------
  * bound_send() is de enige weg voor alles wat op een vreemd kanaal
  * verstuurd moet worden: hello's, hello-acks, ack2, ack3, data. De kern
  * kopieert het pakket in een vaste pool en vraagt de platformlaag om te
@@ -144,7 +144,7 @@ static bool dedup_fresh(mimeshi_node *n, uint16_t msg_id, uint16_t src) {
  * per node serialiseren (één radio) en na de zending thuiskomen.
  *
  * De pool heeft evenveel slots als pending-records: elk actief bericht
- * houdt hooguit één gebonden zending tegelijk aan, want een retry start
+ * houdt hooguit één exchange tegelijk aan, want een retry start
  * pas na de ack1-timeout. Geen heap (13b); len == 0 markeert een vrij slot.
  * Op firmware draait één node per proces, dus MC_MAX_PENDING volstaat;
  * de simulator deelt de kern tussen alle nodes van het scenario — bouw de
@@ -219,7 +219,7 @@ static void hello_tick(mimeshi_node *n, void *ud) {
 
 /* Hello-ack afgeven op het THUISkanaal van de hello-verzender (2): de
  * verzender is na zijn ronde daar en vangt alle antwoorden binnen het
- * responstijdvenster op. Eén gebonden zending, daarna thuis.
+ * responstijdvenster op. Eén exchange, daarna thuis.
  *
  * Directioneel formaat (7 B): de bestemming is de hello-verzender. Alleen
  * daardoor bewijst de ack symmetrie — de responder ontving ónze hello
@@ -253,23 +253,23 @@ static void hello_ack_fire(mimeshi_node *n, void *ud) {
  *     dan strikte volgorde (2).
  *
  * Ack op behoefte (4.1, okt 2026): een bevestigde buur (sym, 4.2) krijgt
- * nog twee hoffelijkheids-acks na onze eigen bevestiging en daarna geen
+ * nog twee courtesy acks na onze eigen bevestiging en daarna geen
  * enkele meer — snooping onderhoudt liveness, versie en kwaliteit al.
  * De twee extra acks zijn nodig omdat bevestiging vrijwel altijd
  * asymmetrisch verloopt: als één richting eerst slaagt, stoppen de acks
  * van die kant, terwijl de búúr zijn bewijs nog uit onze ack moet
  * halen (in de simulatie: capture verloor N's richting terwijl de
- * tegenzijde al bevestigd was — zonder hoffelijkheid verhongert dat
- * bewijs tot een eventuele tabelpull).
+ * tegenzijde al bevestigd was — zonder courtesy verhongert dat
+ * bewijs tot een eventuele tablepull).
  * Een onbevestigde buur blijf in de tabel, maar de ack-kans dunnet uit
- * met de tijd: elke GEHOORDE hello telt (zichtingteller), en alleen
- * zichtingen 1, 2, 4, 8, 16 leveren een poging, daarna een druppel van
- * gemiddeld 1 op 16 zichtingen. Zo lost een ack-storm rond een toren-
+ * met de tijd: elke GEHOORDE zending van de buur telt (teller per buur),
+ * en alleen de tellerstanden 1, 2, 4, 8, 16 leveren een poging, daarna
+ * een druppel van gemiddeld 1 op 16 zendingen. Zo lost een ack-storm rond een toren-
  * site zichzelf op: de druk op het venster daalt, de overgebleven
  * pogingen gaan ván door, geslaagde bewijzen stoppen de acks (na de
- * hoffelijkheid) volledig — en eenzijdige links kosten hooguit een
+ * courtesy) volledig — en eenzijdige links kosten hooguit een
  * druppel. Reset van de teller bij bevestiging of hernieuwd contact
- * (nbr_add); tellen bij zichtingen, niet bij pogingen — anders raken
+ * (nbr_add); tellen bij zendingen, niet bij pogingen — anders raken
  * verloren pogingen vast zonder derde kans.
  */
 static void hello_ack_wait(mimeshi_node *n, uint16_t from, int8_t rssi) {
@@ -277,13 +277,13 @@ static void hello_ack_wait(mimeshi_node *n, uint16_t from, int8_t rssi) {
     int ack = 1;                                 /* onbekende zender: altijd ack */
     if (nb) {
         if (nb->sym) {
-            if (nb->ack_try >= 3) return;       /* hoffelijkheid op (na 2) */
+            if (nb->ack_try >= 3) return;       /* courtesy op (na 2) */
             nb->ack_try++;
         } else {
-            if (nb->ack_try < 255) nb->ack_try++;   /* zichtingteller */
+            if (nb->ack_try < 255) nb->ack_try++;   /* teller per buur */
             uint32_t c = nb->ack_try;
-            ack = c <= 16 && (c & (c - 1)) == 0;    /* pogingen op zichting 1,2,4,8,16 */
-            if (!ack && c > 16) ack = (n->rand(n) % 16u) == 0;  /* druppelvloer */
+            ack = c <= 16 && (c & (c - 1)) == 0;    /* pogingen op tellerstand 1,2,4,8,16 */
+            if (!ack && c > 16) ack = (n->rand(n) % 16u) == 0;  /* druppel: gemiddeld 1 op 16 zendingen */
         }
     }
     if (!ack) return;
@@ -345,7 +345,7 @@ static void ack1_timeout(mimeshi_node *n, void *ud) {
 }
 
 /* Eén zendpoging: budget in de header bijwerken (offset 9, 6.1/9), de
- * gebonden zending richting next_hop, en de ack1-timeout plannen.
+ * exchange richting next_hop, en de ack1-timeout plannen.
  * De timeout is (7.3) S + t_data + t_ack + marge, gemeten vanaf het
  * moment van opgeven. Aanname: de platformlaag levert de zending snel
  * af (wachtrij kort); duurt de wissel langer, dan valt de timeout te
@@ -357,15 +357,15 @@ static void pending_try(mimeshi_node *n, mimeshi_pending *p) {
 }
 
 /* Unicast opgeven. Retourcodes (core.h): 0 = geaccepteerd, -1 = bestemming
- * niet in de buurtabel (10.2: niet flooden, afwachten tot de kaart ze
+ * niet in de neighbor table (10.2: niet flooden, afwachten tot de kaart ze
  * kent), -2 = geen pending-slot vrij, -3 = payload te groot.
  * Bouwsteen 1 kiest als volgende hop de bestemming zelf (directe buur);
  * vanaf bouwsteen 2 kiest een router hier de beste hop op de 2-hop-kaart.
  *
- * Eénrichtingsbewijs: elke buurtabel-entry ontstond door een ontvangst
+ * Eénrichtingsbewijs: elke neighbor-table-entry ontstond door een ontvangst
  * (hello of hello-ack) en bewijst dus alleen de richting buur->wij. De
  * tegenrichting (wij->buur) wordt pas bewezen door de buur zelf: via zijn
- * tabelpull (4.3) of via een geslaagde ack1-uitwisseling. Routering
+ * tablepull (4.3) of via een geslaagde unicast met ack1. Routering
  * (bouwsteen 2, 10.1) moet die bevestiging eisen vóór doorsturen; tot
  * die tijd is dit directe sturen begrensd door retries+budget en faalt
  * het zichtbaar op de ack1-timeout. */
@@ -401,7 +401,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
     case PKT_HELLO: {
         /* buur bijwerken of toevoegen, daarna ack plannen. quality is de
          * RSSI-meting van deze ontvangst; de state-versie van de buur wordt
-         * bijgehouden voor toekomstige tabelpulls (4.3); last_seen is
+         * bijgehouden voor toekomstige tablepulls (4.3); last_seen is
          * nu nog een stub — echt verouderingsbeleid (4.4) volgt. */
         uint16_t from = rd16(pkt + 1);
         mimeshi_neighbor *nb = nbr_find(n, from);
@@ -447,7 +447,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
          * De afzender van deze ack1 ontving ons bericht én zijn ack bereikte
          * ons: de link is hiermee bewezen symmetrisch (4.2). Dit is het
          * eerste exacte symmetriebewijs dat de kern kent; het tweede is de
-         * tabelpull van de buur (4.3, bouwsteen 2). Een hello-ack bewijst
+         * tablepull van de buur (4.3, bouwsteen 2). Een hello-ack bewijst
          * geen symmetrie — onadresseerd op een gedeeld thuiskanaal. */
         uint16_t msg_id = rd16(pkt + 1);
         for (int i = 0; i < MC_MAX_PENDING; i++) {

@@ -83,7 +83,7 @@ int main(void) {
     mimeshi_rx(&B, 1, -60, helloA, 5);
     pump_until(1000000);
 
-    /* hello-ack van A richting B: gebonden zending naar B's thuiskanaal (1). */
+    /* hello-ack van A richting B: exchange naar B's thuiskanaal (1). */
     assert(mimeshi_send_data(&B, 0x0102, (const uint8_t *)"hallo mesh", 10, true) == 0);
     pump_until(100000); /* wissel (5 ms) + tx; niet tot de ack1-timeout */
     /* B zendt data op A's thuiskanaal 0. */

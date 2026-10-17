@@ -12,7 +12,7 @@ De simulator op simpy (meshsim.py) hergebruikt Node/Wire/CCCore hier.
 Radiomodel (wisselregel, ontwerp 2):
 - Elke node heeft EEN radio. Wisselverzoeken worden per node geserialiseerd
   (FIFO); een zending start pas als de radio vrij is.
-- Een gebonden uitwisseling = wissel (S) + zending (airtime) + eventueel
+- Een exchange = wissel (S) + zending (airtime) + eventueel
   ack1-venster (data op een vreemd kanaal), daarna automatisch terug naar het
   thuiskanaal. De zending die bij een wissel hoort volgt direct op de wissel.
 - Een node hoort een pakket alleen op zijn huidige kanaal, en niet terwijl
@@ -248,7 +248,7 @@ class Node:
     def tx(self, ch, pkt, airtime, wait=None):
         """Zending op het huidige kanaal; wait>0 houdt de node op het kanaal
         voor de terugkeer. Standaard: data krijgt een ack1-venster
-        (t_ack + marge, ontwerp 7.3) op het uitwisselingskanaal."""
+        (t_ack + marge, ontwerp 7.3) op het exchangekanaal."""
         if wait is None:
             wait = T_ACK + ACK1_MARGIN if (pkt[0] & 0x0F) == 5 else 0
         start = max(self.radio.now, self.busy_until)
@@ -291,7 +291,7 @@ class Node:
             if ch == HOME(self.id) or self.ch == ch:
                 if hello: self.hello_missed += 1
                 reden = ("bezig met eigen zending" if start < self.deaf_until
-                         else "van huis (gebonden uitwisseling)")
+                         else "van huis (exchange)")
                 radio_log(f"[{self.radio.now/1e6:8.3f}s] node {self.id:#06x} hoort niets "
                           f"op kanaal {ch} ({reden})")
         self.radio.schedule(delay, deliver)
@@ -442,7 +442,7 @@ def main():
     a.core.start()
     radio.schedule(500_000, b.core.start)   # echte nodes starten nooit op dezelfde
     # microseconde; 0,5 s houdt de eerste rondes vrij van overlap zodat de
-    # unicast op 1,5 s op een echte buurtabel kan steunen (overlap tussen
+    # unicast op 1,5 s op een echte neighbor table kan steunen (overlap tussen
     # rondes meten de sweeps onderaan).
     radio.run(until_us=1_500_000)           # eerste hello-ronde + acks
 
