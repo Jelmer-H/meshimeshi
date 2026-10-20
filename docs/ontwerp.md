@@ -169,6 +169,17 @@ De oplossing is de **bewijslijst**: een klein pakket met de node-ID's van buren 
 - Bij het opstarten worden verzoeken met een willekeurige vertraging verstuurd, zodat antwoorden niet op het thuiskanaal botsen.
 - Tabellen groter dan één pakket gaan in chunks van circa 200 bytes, met volgnummers. Ontbrekende chunks worden opnieuw opgevraagd. Elke chunk krijgt een ack1.
 
+**Chunkformaat (okt 2026): zelfstandige, node-centrische chunks.** Elke chunk is in zijn geheel verwerkbaar zonder informatie uit andere chunks; de volgorde doet er niet toe en de ontvanger hoeft niet te weten of en wanneer de rest komt.
+
+- **Node-centrisch.** Een chunk bevat een klein aantal volledige node-entries (8 B: node-ID, kwaliteit, leeftijd, geo), en direct na elke entry de links van die node: `(buur-ID 2 B, kwaliteit 2 bits per richting)` = 18 bits per link, gepakt op bytegrens (vier links per 9 bytes, gemiddeld 2,25 B). Elke link staat onder precies één eindpunt (de eigenaar kiest), dus elke link reist één keer per tabel.
+- **Absolute ID's, geen indices.** Link-verwijzingen zijn node-ID's, geen posities in de tabel van de verzender. Daarmee is geen mapping tussen de tabellen van verzender en ontvanger nodig, en is geen tijdelijke scratch-buffer of reassembly nodig: elke chunk wordt direct verwerkt tegen de eigen tabel (256 nodes, 13.2).
+- **Chunkheader** (circa 10 B): type, state-versie, chunknummer, aantal nodes, en de eigenaar-geo met firmwareversie (4.3). De header herhaalt per chunk, zodat elke chunk zelfstandig is.
+- **Kwaliteit in 4 klassen per richting** (2 bits): slecht (onder −2,5 dB SNR), matig, goed (boven +3,5 dB), uitstekend, volgens de NL-kalibratie (14.2). Asymmetrie blijft zichtbaar doordat de twee klassen kunnen verschillen. Routering rangschikt op deze klassen; de lokale penalty (10.4) houdt de fijnkorreling bij. Leeftijd per link bestaat niet: de leeftijd van een link is de leeftijd van zijn bron, en die reist per node-entry mee.
+- **Statusvlaggen reizen niet mee.** Gezien/bevestigd, de kwaliteitsdrempel en het Gabriel-memberschap zijn afgeleid: de eigenaar stuurt alleen links die hij in beide richtingen gemeten heeft, en elke ontvanger berekent drempel en Gabriel-graaf zelf uit klasse en geo's (10.1, 10.3).
+- **Kadans.** Tussen de chunks zit een vaste, plannbare pauze (rustige momenten, open punt 15), geen burst. Elke chunk is een eigen exchange met ack1; daarmee werkt de symmetrie-afmaker (hierboven) per chunk.
+- **Verlies.** Een ontbrekende chunk wordt zelfstandig opnieuw opgevraagd; er is geen volgorde- of reassembly-afhankelijkheid. De reassembly-buffer uit 13.2 vervalt.
+- **Budget.** Volle tabel: 256 nodes × 8 B + 1536 links × 2,25 B plus headers ≈ 5,7 KB, dus 28 tot 30 chunks van de 200 B-klasse (869 ms), binnen de 32 van het geheugenbudget. De ontvanger slaat links die hij al heeft niet dubbel op; een pull levert alleen het verschil.
+
 **Status:** besloten.
 
 ### 4.4 Verval, tombstones en verouderde entries
@@ -533,7 +544,7 @@ Threads kunnen met een kortere limiet werken, bijvoorbeeld drie bits. Dat levert
 | Dedup-cache (512 entries van 4 bytes) | 2 KB | 2 KB |
 | Neighbor table en 2-hop-kaart (ca. 200 nodes van 12 bytes) | 3 KB | 3 KB |
 | Linklijst (ca. 1000 links van 5 bytes) | 5 KB | 5 KB |
-| Chunk-reassembly (één per buur) | 4 KB | 8 KB |
+| Vrij (chunk-reassembly vervalt met de zelfstandige chunks, 4.3) | 0 | 4 KB |
 | Wachtrijen en zendbuffers | rest | rest |
 
 ### 13.3 Ontwerpregels
