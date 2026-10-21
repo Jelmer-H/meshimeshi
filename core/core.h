@@ -29,8 +29,9 @@
 #define MC_MAX_ROUTE_NBR  3             /* neighbours tried per hop (7.4) */
 #define MC_MAX_KNOWN     256            /* known map entries (10.1) */
 #define MC_CHUNK_PERIOD_US 120000000ull /* 2 min: the chunk check tick (4.3) */
-#define MC_CHUNK_REPEAT_TICKS 10         /* slow tail repetition: a full slice every
+#define MC_CHUNK_REPEAT_TICKS 10         /* slow tail repetition: slices every
                                             ~20 min even in a stable net (4.3) */
+#define MC_CHUNK_SLICES     2             /* slices per repetition in the stable phase (4.3) */
 #define MC_CHUNK_ENTRIES 17             /* entries per chunk: 4 + 17 x 7 = 123 B (4.3) */
 #define MC_GEO_UNKNOWN   0x7fff         /* int16 sentinel: geo not known (10.2) */
 
@@ -137,6 +138,8 @@ struct mimeshi_node {
                                          chunk push (4.3): mutation trigger */
     uint8_t  chunk_ticks;              /* ticks since the last push (4.3):
                                          the slow tail repetition counter */
+    uint8_t  chunk_rr;                  /* round-robin cursor over the known map
+                                         (4.3): every entry gets its turn */
     uint8_t  proof_wait[MC_N_CHANNELS];/* countdown to the flush moment
                                          per channel (4.2), staggered 20
                                          min apart; restarts at 1 h on

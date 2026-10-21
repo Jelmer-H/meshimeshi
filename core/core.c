@@ -337,7 +337,7 @@ static mimeshi_2hop *known_upsert(mimeshi_node *n, uint16_t id, uint16_t via,
  * its 2-hop map (10.1): entry X heard via sender. Self-contained, no
  * order, no version (dropped, 4.3) -- freshness travels via last_seen.
  */
-static void chunk_send(mimeshi_node *n) {
+static void chunk_send(mimeshi_node *n, uint8_t ch) {
     uint8_t p[8 + 7 * MC_CHUNK_ENTRIES];
     p[0] = PKT_TABLE_CHUNK; wr16(p + 1, n->id);
     wr16(p + 3, (uint16_t)n->geox); wr16(p + 5, (uint16_t)n->geoy);  /* owner geo (4.3) */
@@ -353,26 +353,26 @@ static void chunk_send(mimeshi_node *n) {
         wr16(e + 3, (uint16_t)nb->geox); wr16(e + 5, (uint16_t)nb->geoy);
         cnt++;
     }
-    /* then the best known-map entries (10.1): knowledge diffuses outward,
-     * bounded by the chunk size. Highest eviction score first; advertised
-     * entries are damped so the next round carries others. */
-    while (cnt < MC_CHUNK_ENTRIES) {
-        int best = -1; uint8_t bs = 0;
-        for (int i = 0; i < MC_MAX_KNOWN; i++)
-            if (n->known[i].alive && n->known[i].score > bs) { bs = n->known[i].score; best = i; }
-        if (best < 0 || bs == 0) break;
-        mimeshi_2hop *h = &n->known[best];
-        if (nbr_find(n, h->id)) { h->score = 0; continue; }
+    /* then known-map entries, round-robin over the map (4.3): every
+     * repetition carries the NEXT slice, no evaporation -- every entry
+     * gets its turn per cycle. Direct neighbours are already above. */
+    for (int i = 0; i < MC_MAX_KNOWN && cnt < MC_CHUNK_ENTRIES; i++) {
+        mimeshi_2hop *h = &n->known[(n->chunk_rr + i) % MC_MAX_KNOWN];
+        if (!h->alive || nbr_find(n, h->id)) continue;
         uint8_t *e = p + 8 + 7 * cnt;
         wr16(e, h->id);
         e[2] = h->quality;
         wr16(e + 3, (uint16_t)h->geox); wr16(e + 5, (uint16_t)h->geoy);
         cnt++;
-        h->score = 0;
     }
+    n->chunk_rr = (uint8_t)((n->chunk_rr + cnt) % MC_MAX_KNOWN);   /* next round continues where this one stopped */
     p[7] = cnt;
-    n->tx(n, n->home_ch, p, (uint16_t)(8 + 7 * cnt), t_data_us((uint16_t)(8 + 7 * cnt)));
-    ka_called(n, n->home_ch);                /* own call on the home channel (4.1) */
+    if (ch == n->home_ch) {
+        n->tx(n, ch, p, (uint16_t)(8 + 7 * cnt), t_data_us((uint16_t)(8 + 7 * cnt)));
+    } else {
+        bound_send(n, ch, p, (uint16_t)(8 + 7 * cnt), t_data_us((uint16_t)(8 + 7 * cnt)));
+    }
+    ka_called(n, ch);                        /* own call on that channel (4.1) */
 }
 
 static void chunk_tick(mimeshi_node *n, void *ud) {
@@ -385,10 +385,25 @@ static void chunk_tick(mimeshi_node *n, void *ud) {
      * tail cadence. */
     n->chunk_ticks++;
     uint8_t mutated = n->chunk_ctr_last != n->local_tbl_ctr;
-    if (mutated || n->chunk_ticks >= MC_CHUNK_REPEAT_TICKS) {
+    /* the tail cadence rises with the number of direct neighbours n
+     * (4.3: per doubling of n the pause doubles) -- the marginal
+     * airtime of a slice rises with n, and hub sites carry most of it.
+     * Base 10 ticks (~20 min) at n<=8; every doubling halves the rate. */
+    uint32_t nbrs = 0;
+    for (int i = 0; i < MC_MAX_NEIGHBORS; i++) if (n->nbr[i].alive) nbrs++;
+    uint32_t repeat_ticks = MC_CHUNK_REPEAT_TICKS;
+    while (nbrs > 8) { repeat_ticks *= 2; nbrs >>= 1; }
+    if (repeat_ticks > 250) repeat_ticks = 250;
+    if (mutated || n->chunk_ticks >= repeat_ticks) {
         n->chunk_ctr_last = n->local_tbl_ctr;
         n->chunk_ticks = 0;
-        chunk_send(n);
+        if (n->hello_interval_us < MC_HELLO_MAX_US) {
+            for (uint8_t ch = 0; ch < MC_N_CHANNELS; ch++)
+                chunk_send(n, ch);          /* startup: across the channel communities (4.3) */
+        } else {
+            for (uint8_t s = 0; s < MC_CHUNK_SLICES; s++)
+                chunk_send(n, n->home_ch);   /* stable: multiple slices on the home channel */
+        }
     }
     n->timer(n, MC_CHUNK_PERIOD_US + (n->rand(n) % 1000000ull), chunk_tick, 0);
 }
