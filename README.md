@@ -1,4 +1,4 @@
-# Meshimeshi — protocol core for a rural LoRa mesh (NL, ~3000 nodes)
+# Meshimeshi — protocol core for a LoRa mesh
 
 Protocol core in C for repeaters/companions + Python simulator. See
 `docs/design.md` for the full design document (status per component).
