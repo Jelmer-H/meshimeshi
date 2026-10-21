@@ -612,7 +612,10 @@ def multihop(mk, jitter):
         if cand:
             a, b = rng.choice(cand)
             r = route_confirmed(by_id[a], b)
-            rc = by_id[a].core.send_data(b, payload, ack3=False)
+            # client geo (11): the end user points at the map -- the true
+            # position of the destination, as a client would approximate it
+            gx, gy = int(pos[b][0]), int(pos[b][1])
+            rc = by_id[a].core.send_data_geo(b, gx, gy, payload, ack3=False)
             if rc == 0:
                 pend = [p for p in by_id[a].core.mn.pend if p.active and p.dst == b]
                 if pend:

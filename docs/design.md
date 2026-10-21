@@ -544,6 +544,8 @@ Threads could use a shorter limit, for example three bits. That provides some ex
 | Destination a confirmed direct neighbour | Direct hop, best quality | Decided |
 | Destination in the known map (via entries) | Route via the best confirmed direct neighbour toward the destination | Decided |
 | Destination outside the map | Greedy on the destination geo from the header (6.1): the confirmed neighbour closest to the geo that is closer than we are | Decided |
+
+The destination geo originates from the client (11) when the map does not know the destination; from then on it travels in the header. Near the destination a local node knows the target in its table and routes on the ID -- the tandem closes itself.
 | No neighbour closer (gap, "void") | Fallback: waypoint or perimeter (see 10.3) | Proposal |
 | Destination unknown (ID only) | Do not flood. Wait until the map contains the destination, or return a negative report | Decided |
 
@@ -586,6 +588,7 @@ Threads could use a shorter limit, for example three bits. That provides some ex
 
 ## 11. Clients and ack3
 
+- **Destination geo from the end user (decided):** a client addresses a message by pointing at a map (a city, an area) and giving a node ID. That geo goes into the header as the destination geo (6.1). The message travels greedy toward the geo, and near the destination a local node knows the target in its table and routes on the ID. The geo needs not be exact, and the source needs no map knowledge of the destination: the tandem starts at the client.
 - Ack3 is a client function. Routers forward it only as routed data.
 - Ack3 is sent only when the flag is set.
 - Broadcast and thread messages do not request ack3.

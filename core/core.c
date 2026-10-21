@@ -648,8 +648,8 @@ static void ack2_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint16_t p
 static void pending_try(mimeshi_node *n, mimeshi_pending *p);
 static void record_fail(mimeshi_node *n, mimeshi_pending *p);
 static void pending_retry_timer(mimeshi_node *n, void *ud);
-static int send_data_internal(mimeshi_node *n, uint16_t dst, const uint8_t *payload,
-                              uint16_t len, bool ack3, uint8_t no_report);
+static int send_data_internal(mimeshi_node *n, uint16_t dst, int16_t cgx, int16_t cgy,
+                              const uint8_t *payload, uint16_t len, bool ack3, uint8_t no_report);
 
 /* Failed delivery report (10.5): a routed message back to the source,
  * flagged so it never triggers a report of its own. Payload: msg-id,
@@ -659,7 +659,7 @@ static void fail_report(mimeshi_node *n, uint16_t orig_msg, uint16_t orig_src) {
     if (orig_src == n->id) return;           /* we are the source: it stays here */
     uint8_t rpt[6];
     wr16(rpt, orig_msg); wr16(rpt + 2, n->id); rpt[4] = MC_FAIL_NOACK1; rpt[5] = 0;
-    int rc = send_data_internal(n, orig_src, rpt, 5, false, 1);
+    int rc = send_data_internal(n, orig_src, MC_GEO_UNKNOWN, MC_GEO_UNKNOWN, rpt, 5, false, 1);
     (void)rc;
     printf("[core] node %u: FAIL-RPT for msg %u back to %u (rc=%d)\n",
            n->id, orig_msg, orig_src, rc);
@@ -748,12 +748,16 @@ static void pending_try(mimeshi_node *n, mimeshi_pending *p) {
  * is chosen per 10.2 at every hop, also at the source; the header can
  * carry the source geo (6.1) so intermediate hops can route greedily
  * even when the source is outside their map. */
-static int send_data_internal(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uint16_t len, bool ack3, uint8_t no_report) {
+static int send_data_internal(mimeshi_node *n, uint16_t dst, int16_t cgx, int16_t cgy,
+                              const uint8_t *payload, uint16_t len, bool ack3, uint8_t no_report) {
     if (len > MC_MAX_PAYLOAD) return -3;
     int16_t dgx, dgy;
     route_dst_geo(n, dst, &dgx, &dgy);
-    if (dgx == MC_GEO_UNKNOWN) return -1;  /* no geo for dst: the tandem has nothing
-                                              to fall back on (10.2); do not flood */
+    if (dgx == MC_GEO_UNKNOWN && cgx != MC_GEO_UNKNOWN) {
+        dgx = cgx; dgy = cgy;       /* client geo (11): the tandem has its starting point */ 
+    }
+    if (dgx == MC_GEO_UNKNOWN) return -1;  /* no geo from map or client: nothing to
+                                              fall back on (10.2); do not flood */
     mimeshi_neighbor *nx = route_next(n, dst, dgx, dgy, 0);
     if (!nx) {
         /* geo known but void (10.3): refused here, waypoint/perimeter follow later */
@@ -783,7 +787,12 @@ static int send_data_internal(mimeshi_node *n, uint16_t dst, const uint8_t *payl
 }
 
 int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uint16_t len, bool ack3) {
-    return send_data_internal(n, dst, payload, len, ack3, 0);
+    return send_data_internal(n, dst, MC_GEO_UNKNOWN, MC_GEO_UNKNOWN, payload, len, ack3, 0);
+}
+
+int mimeshi_send_data_geo(mimeshi_node *n, uint16_t dst, int16_t geox, int16_t geoy,
+                          const uint8_t *payload, uint16_t len, bool ack3) {
+    return send_data_internal(n, dst, geox, geoy, payload, len, ack3, 0);
 }
 
 /* ---------------- reception (platform -> core) ----------------
@@ -964,7 +973,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                 wr16(a + 1, (uint16_t)n->rand(n)); wr16(a + 3, n->id);
                 wr16(a + 5, src); wr16(a + 7, n->id);
                 a[10] = MC_BUDGET_INIT; wr16(a + 11, msg_id);
-                int rc2 = send_data_internal(n, src, a + 11, 4, false, 1);
+                int rc2 = send_data_internal(n, src, MC_GEO_UNKNOWN, MC_GEO_UNKNOWN, a + 11, 4, false, 1);
                 if (rc2 != 0)
                     printf("[core] node %u: ack3 for msg %u not submittable (rc=%d)\n", n->id, msg_id, rc2);
             }

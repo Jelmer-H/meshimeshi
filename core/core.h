@@ -158,10 +158,18 @@ void mimeshi_start(mimeshi_node *n);
 
 /* Unicast to dst. 0 = accepted, -1 = dst not in the map and no geo known
  * (10.2: do not flood, wait for the map), -2 = no free pending slot,
- * -3 = payload too large. Greedy routing uses the destination geo when
- * dst is not in the 2-hop map (10.2). */
+ * -3 = payload too large. The destination geo comes from the own map. */
 int  mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload,
                      uint16_t len, bool want_ack3);
+
+/* Unicast to dst with an explicit destination geo from the client (11):
+ * the end user points at a map (a city, an area) and gives a node ID.
+ * The message travels greedy toward the geo; near the destination a
+ * local node knows the target in its table and routes on the ID. The
+ * geo needs not be exact. MC_GEO_UNKNOWN = no geo given: falls back to
+ * the own map. Return codes as above. */
+int  mimeshi_send_data_geo(mimeshi_node *n, uint16_t dst, int16_t geox, int16_t geoy,
+                         const uint8_t *payload, uint16_t len, bool want_ack3);
 
 /* Packet received (from radio or simulator). ch = channel of reception. */
 void mimeshi_rx(mimeshi_node *n, uint8_t channel, int8_t rssi_db,

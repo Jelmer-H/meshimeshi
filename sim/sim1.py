@@ -402,6 +402,10 @@ def load_lib(path):
     lib.mimeshi_send_data.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint16,
                                       ctypes.c_char_p, ctypes.c_uint16, ctypes.c_bool]
     lib.mimeshi_send_data.restype = ctypes.c_int
+    lib.mimeshi_send_data_geo.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint16,
+                                          ctypes.c_int16, ctypes.c_int16,
+                                          ctypes.c_char_p, ctypes.c_uint16, ctypes.c_bool]
+    lib.mimeshi_send_data_geo.restype = ctypes.c_int
     return lib
 
 class CCore:
@@ -421,6 +425,16 @@ class CCore:
     def send_data(self, dst, data, ack3=True):
         payload = data.encode() if isinstance(data, str) else bytes(data)
         rc = self.lib.mimeshi_send_data(ctypes.byref(self.mn), dst, payload, len(payload), ack3)
+        if rc != 0:
+            out(f"[sim] node {self.n.id:#06x}: transmission refused (rc={rc})")
+        return rc
+
+    def send_data_geo(self, dst, geox, geoy, data, ack3=False):
+        """Destination geo from the client (11): the tandem starts even
+        without map knowledge of the destination."""
+        payload = data.encode() if isinstance(data, str) else bytes(data)
+        rc = self.lib.mimeshi_send_data_geo(ctypes.byref(self.mn), dst, geox, geoy,
+                                            payload, len(payload), ack3)
         if rc != 0:
             out(f"[sim] node {self.n.id:#06x}: transmission refused (rc={rc})")
         return rc
