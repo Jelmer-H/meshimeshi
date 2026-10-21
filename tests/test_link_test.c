@@ -172,8 +172,11 @@ int main(void) {
     /* identifying traffic for A on channel 1 (ack1 + ack2 there):
      * resets only channel 1 of A; 0 and 2 keep counting from the round
      * at 3810 s. */
-    uint8_t data[11] = { 5, 7,0, 0x00,0x01, 0x02,0x01, 0x00,0x01, 32, 'x' };
-    mimeshi_rx(&A, 1, -60, data, 11);
+    /* 15 B header: type, msg-id(2), src(2), dst(2), prev(2), next(2),
+     * budget, dst-geo(4); next-hop = A so A accepts the exchange. */
+    uint8_t data[17] = { 5, 7,0, 0x00,0x01, 0x02,0x01, 0x00,0x01,
+                          0x02,0x01, 32, 0,0, 0,0, 'x' };
+    mimeshi_rx(&A, 1, -60, data, 17);
     pump_until(7500000000ull);            /* ~1 h of silence: channels 0 and 2 of A (since 3810 s) */
     assert(hello_cnt_A[0] == rA[0]);       /* the hello is gone: no keepalive hello anymore */
     assert(hello_cnt_A[2] == rA[2]);

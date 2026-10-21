@@ -240,7 +240,7 @@ def newcomer_traffic(mk, jitter):
     def phase(): return 0 if radio.now <= join_at_us else 1
     def rx(self, arg):
         ch, rssi, pkt = arg
-        if pkt and (pkt[0] & 0x0F) == 5 and len(pkt) > 10:
+        if pkt and (pkt[0] & 0x0F) == 5 and len(pkt) > 15:
             dst = pkt[5] | (pkt[6] << 8)
             if dst == self.n.id:
                 p = phase()
@@ -450,7 +450,7 @@ def traffic(mk, jitter):
     base_rx = CCore.rx
     def rx(self, arg):
         ch, rssi, pkt = arg
-        if pkt and (pkt[0] & 0x0F) == 5 and len(pkt) > 10:
+        if pkt and (pkt[0] & 0x0F) == 5 and len(pkt) > 15:
             dst = pkt[5] | (pkt[6] << 8)
             if dst == self.n.id:          # only the destination counts
                 src = pkt[3] | (pkt[4] << 8)
@@ -559,7 +559,7 @@ def multihop(mk, jitter):
     base_rx = CCore.rx
     def rx(self, arg):
         ch, rssi, pkt = arg
-        if pkt and (pkt[0] & 0x0F) == 5 and len(pkt) > 11:
+        if pkt and (pkt[0] & 0x0F) == 5 and len(pkt) > 15:
             # only payload messages: fail reports (F_NO_REPORT, 10.5) and
             # ack3 (11) are routed DATA but not end-to-end payload
             if (pkt[0] & 0x20) == 0:
@@ -600,13 +600,14 @@ def multihop(mk, jitter):
             if vd: return True
         return False
 
+    all_pairs = _ARGS.all_pairs
     submitted = {}      # (mid, src) -> routable-at-submission (True/False)
     refused = [0]
     def gen():
-        # non-direct pair; routable pairs (fully confirmed 2-hop route)
-        # must be delivered -- that is the building block 2 guarantee
+        # --all-pairs: any confirmed node to any other (direct included);
+        # default: only non-direct pairs (the routing case)
         cand = [(a, b) for a in ids for b in ids
-                if a < b and (a, b) not in direct
+                if a != b and (all_pairs or (a, b) not in direct)
                 and sym_count(by_id[a]) and sym_count(by_id[b])]
         if cand:
             a, b = rng.choice(cand)
@@ -663,6 +664,8 @@ def main():
                     help='unicast payload size in bytes (traffic/newcomer-traffic, default 20)')
     ap.add_argument('--join-at', type=int, default=5400, metavar='SECONDS',
                     help='newcomer start time in seconds (newcomer-traffic, default 5400)')
+    ap.add_argument('--all-pairs', action='store_true',
+                    help='multihop: any node to any node (direct pairs included)')
     args = ap.parse_args()
     global _ARGS
     _ARGS = args

@@ -319,8 +319,12 @@ The solution is the **proof list**: a small packet with the node IDs of neighbou
 | Source ID | 2 bytes |
 | Destination ID | 2 bytes |
 | Previous hop ID | 2 bytes |
-| Budget | 1 byte (section 9), at offset 9 of the header |
-| **Total** | **10 bytes** |
+| Next hop ID | 2 bytes (building block 2: only that node forwards and acks, overhearers snoop only) |
+| Budget | 1 byte (section 9), at offset 10 of the header |
+| Destination geo | 4 bytes (section 5), always present (decided) |
+| **Total** | **15 bytes** |
+
+**Destination geo (decided):** always in the header. The geo needs not be exact; it works in tandem with the link state (10.2): a known destination ID routes directly, and otherwise the packet moves toward the nearest node in the direction of the geo. Node ID conflicts thereby lose their sting: the packet keeps moving on geo even when the ID is ambiguous.
 
 Optional: source geo (4 bytes, section 5), present when the flag is set. This is needed when the source falls outside the destination's map and the destination must send an ack3 back.
 
@@ -539,7 +543,7 @@ Threads could use a shorter limit, for example three bits. That provides some ex
 |---|---|---|
 | Destination a confirmed direct neighbour | Direct hop, best quality | Decided |
 | Destination in the known map (via entries) | Route via the best confirmed direct neighbour toward the destination | Decided |
-| Destination outside the map, geo known | Greedy: the neighbour with the best quality that is closer to the destination | Decided |
+| Destination outside the map | Greedy on the destination geo from the header (6.1): the confirmed neighbour closest to the geo that is closer than we are | Decided |
 | No neighbour closer (gap, "void") | Fallback: waypoint or perimeter (see 10.3) | Proposal |
 | Destination unknown (ID only) | Do not flood. Wait until the map contains the destination, or return a negative report | Decided |
 

@@ -80,10 +80,11 @@ static uint64_t t_data_us(uint16_t l) { return l <= 40 ? 173000ull : l <= 150 ? 
  *   PROOF       3+2n B type, node-id(2), n x neighbour-id(2), n <= 17 (4.2).
  *                     Reactionless keepalive + symmetry flush; an empty list
  *                     is the minimal keepalive beacon (type + node-id).
- *   DATA      11+n B  type+F_ACK3_REQ, msg-id(2), source(2), destination(2),
+ *   DATA      15+n B  type+F_ACK3_REQ, msg-id(2), source(2), destination(2),
  *                     previous-hop(2), next-hop(2, routing: only that node
- *                     forwards and acks), budget(1, offset 10), payload(n)
- *                     (6.1 + building block 2)
+ *                     forwards and acks), budget(1, offset 10),
+ *                     dst-geo(4, always present, 6.1: routing tandem 10.2),
+ *                     payload(n)
  *   ACK1        7 B   type, msg-id(2), source of the message(2), sender(2) (6.2)
  *                     -- the sender is the next hop that received it
  *   ACK2        7 B   same as ACK1; F_NEG_ACK2 makes it negative       (6.2, 7.2)
@@ -751,9 +752,10 @@ static int send_data_internal(mimeshi_node *n, uint16_t dst, const uint8_t *payl
     if (len > MC_MAX_PAYLOAD) return -3;
     int16_t dgx, dgy;
     route_dst_geo(n, dst, &dgx, &dgy);
+    if (dgx == MC_GEO_UNKNOWN) return -1;  /* no geo for dst: the tandem has nothing
+                                              to fall back on (10.2); do not flood */
     mimeshi_neighbor *nx = route_next(n, dst, dgx, dgy, 0);
     if (!nx) {
-        if (dgx == MC_GEO_UNKNOWN && !known_find(n, dst)) return -1;  /* unknown: do not flood (10.2) */
         /* geo known but void (10.3): refused here, waypoint/perimeter follow later */
         return -1;
     }
@@ -773,8 +775,9 @@ static int send_data_internal(mimeshi_node *n, uint16_t dst, const uint8_t *payl
     wr16(k + 1, p->msg_id); wr16(k + 3, n->id); wr16(k + 5, dst); wr16(k + 7, n->id);
     k[10] = p->budget_left;                /* header: budget at offset 10 */
     wr16(k + 8, nx->id);                   /* next hop: only that node forwards/acks */
-    memcpy(k + 11, payload, len);
-    p->pkt_len = (uint16_t)(11 + len);
+    wr16(k + 11, (uint16_t)dgx); wr16(k + 13, (uint16_t)dgy);  /* dst geo: always (6.1) */
+    memcpy(k + 15, payload, len);
+    p->pkt_len = (uint16_t)(15 + len);
     pending_try(n, p);
     return 0;
 }
@@ -951,7 +954,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
             /* final destination: ack1 on the exchange channel, ack2
              * positive to the previous hop (7.1), optionally ack3 back
              * to the source (11). */
-            printf("[core] node %u: DATA from %u: '%.*s'\n", n->id, src, (int)(len - 11), (const char *)(pkt + 11));
+            printf("[core] node %u: DATA from %u: '%.*s'\n", n->id, src, (int)(len - 15), (const char *)(pkt + 15));
             ack1_send(n, msg_id, src, ch);             /* same channel */
             ack2_send(n, msg_id, src, prev, false);   /* positive: home channel of previous hop */
             if (flags & F_ACK3_REQ) {
@@ -969,13 +972,15 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         }
         /* forwarding (7.1): we are an intermediate hop. ack1 goes back
          * on the exchange channel, then the message is routed further
-         * per 10.2 -- the same choice as at the source. The pending
-         * record carries fwd=1: on failure a negative ack2 goes to
-         * prev_hop (7.2) and a failed delivery report to the source
-         * (10.5), unless this message IS a report (no_report). */
+         * per 10.2 -- the dst geo travels in the header (6.1), so every
+         * hop can greedy-route even without its own map entry. The
+         * own map wins when it knows the destination: fresher, with
+         * quality (10.2 tandem). */
         ack1_send(n, msg_id, src, ch);
-        int16_t dgx, dgy;
-        route_dst_geo(n, dst, &dgx, &dgy);
+        int16_t dgx = (int16_t)rd16(pkt + 11), dgy = (int16_t)rd16(pkt + 13);
+        int16_t mgx, mgy;
+        route_dst_geo(n, dst, &mgx, &mgy);
+        if (mgx != MC_GEO_UNKNOWN) { dgx = mgx; dgy = mgy; }  /* own map beats the header when it knows dst */
         mimeshi_neighbor *nx = route_next(n, dst, dgx, dgy, nbr_find(n, prev));
         if (!nx) {
             /* no route from here (void or unknown, 10.2/10.3): negative
