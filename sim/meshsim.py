@@ -181,6 +181,134 @@ def newcomer(mk, jitter):
     radio.run(until_us=100_000_000)
     report(radio)
 
+
+@scenario("newcomer-traffic", "local-net + traffic: newcomer joins a loaded running network")
+def newcomer_traffic(mk, jitter):
+    """Variant on the traffic scenario (14.1 scenario 2, plus the risk
+    from 4.1): the whole net runs with unicast load; a newcomer with
+    its own links joins at --join-at seconds and has to discover the
+    net under that load. Measures per newcomer: the time to the first
+    confirmed symmetric neighbor (startup hellos + hello-acks), the
+    time to full confirmation, how much of the running load it missed
+    (missed hellos), and whether its arrival disturbs the running
+    delivery (ratio before/after). CLI: --nodes --duration --rate
+    --payload --join-at (seconds, default 5400 = 1.5 h)."""
+    nodes_list = load_nodes_csv(_ARGS.nodes)
+    duration_us = _ARGS.duration * 3_600_000_000
+    rate_per_h, payload_b = _ARGS.rate, _ARGS.payload
+    join_at_us = _ARGS.join_at * 1_000_000
+    radio = Radio()
+    radio.wire.open = False
+    lat0 = sum(n['lat'] for n in nodes_list) / len(nodes_list)
+    lon0 = sum(n['lon'] for n in nodes_list) / len(nodes_list)
+    pos = {n['id']: (*project(n['lat'], n['lon'], lat0, lon0), n['h']) for n in nodes_list}
+    # one extra id at the centre of the map: the newcomer, with a few
+    # links into the net (fading via the same rule as the rest).
+    nid = max(n['id'] for n in nodes_list) + 1
+    pos[nid] = (0.0, 0.0, 25)
+    ids = [n['id'] for n in nodes_list] + [nid]
+    links = {}
+    for a in ids:
+        for b in ids:
+            if a == b: continue
+            raw = linkbudget(pos[a], pos[b])
+            if raw is None: continue
+            fade = ((a * 31 + b * 17) % 11) - 5
+            r = raw + fade
+            if r >= RX_MIN_DBM:
+                links[(a, b)] = max(-128, min(120, round(r)))
+    radio.wire.links = links
+    nodes = []
+    for i, nd in enumerate(nodes_list):
+        kn = Node(radio, nd['id'])
+        kn.core = set_jitter(mk(kn), jitter)
+        nodes.append(kn)
+        radio.schedule(i * 250_000, kn.core.start)
+
+    newcomer = [None]
+    def start_newcomer():
+        kn = Node(radio, nid)
+        kn.core = set_jitter(mk(kn), jitter)
+        kn.core.start()
+        newcomer[0] = kn
+        out(f"[newcomer] node {nid:#06x} starts at t={radio.now/1e6:.0f} s")
+    radio.schedule(join_at_us, start_newcomer)
+
+    # delivery bookkeeping (as in the traffic scenario), split around
+    # the join moment to see whether the newcomer disturbs the run.
+    attempted = [0, 0]; delivered = [0, 0]      # [before, after]
+    def phase(): return 0 if radio.now <= join_at_us else 1
+    def rx(self, arg):
+        ch, rssi, pkt = arg
+        if pkt and (pkt[0] & 0x0F) == 5 and len(pkt) > 10:
+            dst = pkt[5] | (pkt[6] << 8)
+            if dst == self.n.id:
+                p = phase()
+                src = pkt[3] | (pkt[4] << 8)
+                mid = pkt[1] | (pkt[2] << 8)
+                key = (mid, src)
+                if not hasattr(rx, '_seen'): rx._seen = set()
+                if key not in rx._seen:
+                    rx._seen.add(key)
+                    delivered[p] += 1
+                else:
+                    pass
+        base_rx_global(self, arg)
+    base_rx_global = CCore.rx
+    CCore.rx = rx
+
+    payload = bytes(range(payload_b % 221))[:payload_b] if payload_b else b'x' * 8
+    rng = random.Random(2027)
+    interval = 3_600_000_000 // max(rate_per_h, 1)
+    def gen():
+        cand = [kn for kn in nodes if sym_count(kn)]
+        if newcomer[0] and newcomer[0] not in cand and sym_count(newcomer[0]):
+            cand.append(newcomer[0])           # from confirmation the newcomer also sends
+        if cand:
+            kn = rng.choice(cand)
+            peers = [e.id for e in kn.core.mn.nbr if e.alive and e.sym]
+            if peers:
+                rc = kn.core.send_data(rng.choice(peers), bytes(payload), ack3=False)
+                if rc == 0: attempted[phase()] += 1
+        radio.schedule(interval, gen)
+    radio.schedule(600_000_000, gen)         # from 10 min: load before the join
+
+    # newcomer milestones: time per new confirmed-neighbor level
+    milestones = []          # (level, t_us); one entry per level
+    def check():
+        kn = newcomer[0]
+        if kn:
+            s = sym_count(kn) or 0
+            while s > len(milestones):
+                milestones.append(radio.now)
+                out(f"[newcomer] confirmed neighbors {len(milestones)} "
+                    f"at t={radio.now/1e6:.0f} s "
+                    f"({(radio.now-join_at_us)/1e6:.0f} s after start)")
+        radio.schedule(1_000_000, check)
+    radio.schedule(join_at_us + 1_000_000, check)
+    radio.run(until_us=duration_us)
+
+    out("\n=== Measurements ===")
+    for i, lbl in enumerate(("before the join", "after the join")):
+        att, dlv = attempted[i], delivered[i]
+        out(f"unicast {lbl}: attempts {att}, delivered {dlv} "
+            f"({100*dlv/max(att,1):.1f}%)")
+    kn = newcomer[0]
+    if kn:
+        s = sym_count(kn) or 0
+        t1 = (milestones[0]-join_at_us)/1e6 if milestones else None
+        full = (milestones[-1]-join_at_us)/1e6 if milestones else None
+        out(f"newcomer {kn.id:#06x}: first confirmed after {t1 if t1 is None else f'{t1:.0f} s'}, "
+            f"now {s} confirmed, missed hellos {kn.hello_missed}, "
+            f"collisions {kn.collided}")
+    out(f"running nodes: confirmed symmetric avg "
+        f"{sum(nbr_counts(kn)[1] for kn in nodes)/len(nodes):.1f}")
+    usage = {(n, c): radio.duty.usage(n, c, radio.now) for n in ids for c in range(N_CH)}
+    top = sorted(usage.values(), reverse=True)[:5]
+    out(f"duty (sliding hour, limit 360 s): max {top[0]/1e6:.1f} s, "
+        f"top 5 {[f'{u/1e6:.1f}' for u in top]} s, "
+        f"above limit: {sum(1 for u in usage.values() if u > 360_000_000)}")
+
 _ARGS = None   # CLI context for scenarios (local-net reads --nodes/--duration)
 
 @scenario("local-net", "GPS node list (position+height) -> link budget; hello/ack measurement")
@@ -356,7 +484,7 @@ def traffic(mk, jitter):
                 kn.core.send_data(rng.choice(peers), data, ack3=False)
                 attempted[0] += 1
         radio.schedule(interval, gen)
-    radio.schedule(4_000_000_000, gen)      # from ~1 h: everyone confirmed
+    radio.schedule(600_000_000, gen)         # from 10 min: first confirmed pairs exist
     radio.run(until_us=duration_us)
 
     out("\n=== Measurements ===")
@@ -397,7 +525,9 @@ def main():
     ap.add_argument('--rate', type=int, default=6, metavar='PERHOUR',
                     help='unicasts per hour per node (traffic, default 6)')
     ap.add_argument('--payload', type=int, default=20, metavar='BYTES',
-                    help='unicast payload size in bytes (traffic, default 20)')
+                    help='unicast payload size in bytes (traffic/newcomer-traffic, default 20)')
+    ap.add_argument('--join-at', type=int, default=5400, metavar='SECONDS',
+                    help='newcomer start time in seconds (newcomer-traffic, default 5400)')
     args = ap.parse_args()
     global _ARGS
     _ARGS = args
