@@ -38,7 +38,8 @@ This document uses a number of terms that build on each other. Read this glossar
 - **ANN (announcement):** a short 5-byte message that tells the network a large thread message is available. (Section 8.5.)
 - **FULL:** the large thread message itself, which is fetched after an ANN. (Sections 6.5, 8.5.)
 - **Courtesy ack:** after a node has confirmed a link, it sends two more hello acks so that the other side can complete its own evidence, then stays silent. (Section 4.1.)
-- **Tablepull:** a request for a neighbour's neighbor table, sent in chunks. (Section 4.3.)
+- **Table chunks:** a part of a node's own neighbor table, broadcast unsolicited on the home channel. (Section 4.3.)
+- **Proof list:** a small packet with the node IDs of neighbours whose reverse-direction evidence expires soon. (Section 4.2.)
 - **Failed delivery report:** a routed message sent back to the source when a message could not be forwarded after all retries. (Section 10.5.)
 - **Budget:** a counter in the header that limits how many forwards and retries a message may use. (Section 9.)
 - **Pending record:** the small record a forwarding node keeps for a message until its ack2 window closes. (Section 7.2.)
@@ -119,7 +120,7 @@ This document uses a number of terms that build on each other. Read this glossar
 
 Each node listens continuously on its own home channel. It switches channels only for an **exchange** with a known partner (known packet size and a short, known timeout), and then returns to its home channel immediately. If a node is waiting for something of unknown or long duration, it stays on, or returns to, its own home channel; the reply arrives there by itself.
 
-- **Direct replies on the same channel:** ack1 for data and acks for tablepull chunks are awaited on the channel where the exchange takes place. The sender is already there, and the receiver is at home or has already switched.
+- **Direct replies on the same channel:** ack1 for data is awaited on the channel where the exchange takes place. The sender is already there, and the receiver is at home or has already switched.
 - **Hello acks:** these go to the home channel of the hello sender. After a hello, several neighbours respond, and their replies are spread out over time. For a keepalive hello on channel c there are two options (open point 18):
   - (a) the sender stays on c for a short time and the responders reply there without switching. **Preferred**, because the responders then do not need to switch, and the snooping benefit of the acks falls exactly on the intended audience of the hello.
   - (b) the acks switch to the home channel of the sender.
@@ -128,12 +129,13 @@ Each node listens continuously on its own home channel. It switches channels onl
 - **Jitter above the ack airtime (decided, Oct 2026):** the jitter within a slot is window/16 ≈ 187 ms. That is well above the airtime of an ack (78 ms) plus the switch. The old window/64 (≈ 47 ms) let acks of equal rank collide; this was demonstrated in simulation. Now acks collide only by chance. The cost: the ranking becomes "soft". Responders that differ by less than about 16 dB may swap order. This was accepted, because avoiding collisions is the most important goal.
 - **Unicast data:** the sender switches to the home channel of the receiver, transmits, waits there for ack1, and returns. Per hop the sender makes at most two switches (out and back), and the receiver makes none.
 - **Ack2:** the next hop switches to the home channel of the previous hop, transmits, and returns directly. One exchange.
-- **Tablepulls:** unicast to the home channel of the partner. This is an exchange, so switching is allowed.
+- **Table chunks (push, 4.3):** broadcast on the own home channel, in the fixed cadence. No exchange, no switch, no ack; neighbours snoop along.
+- **Proof list (4.2):** a small packet with the node IDs of neighbours whose reverse-direction evidence expires soon. Only the sub-list of neighbours that are at home on that channel; each channel has one flush moment per node per hour (20-minute rotation), so at most one proof-list packet per channel per hour. The packet is an own call on that channel and resets its keepalive counter (4.1). A receiver that appears in it refreshes its evidence and does not react; a receiver that does not appear in it processes the sender the way snooping does (liveness, version, quality, "seen").
 - **Announcements (ANN):** on all three channels in a fixed order. A FULL fetch is an exchange (`T_full`), so the fetcher switches to the channel of the announcer and returns.
 - **Shared chat channels** (#public, #test) are dropped.
 - **Simulation metric:** the time per node spent outside its own home channel, the "home deafness". Every moment outside its own channel is missed reception on its own channel.
 - **Ack eligibility (decided, Oct 2026):** a transmission leads to an ack only when three independent conditions are met:
-  1. **Need:** the link is at "seen" rather than "confirmed symmetric", the reverse-direction evidence is stale (after `T_sym`), or a courtesy ack is still pending. At rest this condition is false, which limits the number of acks even when a neighbour transmits a lot.
+  1. **Need:** the link is at "seen" rather than "confirmed symmetric", or a courtesy ack is still pending. Stale reverse evidence is not an ack reason: that is maintained by the proof list (4.2). At rest this condition is false, which limits the number of acks even when a neighbour transmits a lot.
   2. **Pace:** the counter per neighbour (section 4.1) and the cooldown after an own ack.
   3. **Spacing:** the RSSI-based ranking with jitter (see above), so that acks from several responders do not collide.
 
@@ -165,16 +167,16 @@ The distinction between the two types follows from the published geo (section 5)
 ### 4.1 Hello
 
 - **Size:** 5 bytes. Contents: type (1), node ID (2), state version of the neighbor table (2). A geo change increments the state version; there is no separate geo version.
-- **Frequency (adaptive):** at startup every 30 s, then rising to 5 minutes, and eventually 1 hour in a stable state. Nodes that have been present longer therefore send less often.
+- **Frequency (startup phase, adaptive):** at startup every 30 s, then doubling per round (30 → 60 → 120 → 240 → 480 → 960 → 1920 s). At the 1-hour interval the round stops; after that the hello only exists as per-channel keepalive (below). Nodes that have been present longer therefore disturb less and less during startup.
 - **Random phase and jitter (decided, coupling test Oct 2026):** each hello is scheduled with a random delay. Without jitter, nodes that start at the same time (for example after a power outage in a region) keep synchronous rounds, and never hear each other, because during their own round they are on a different channel. The solution now lives in the protocol core.
-- **Per-channel keepalive (proposal, Oct 2026; to be tested in scenarios 2 and 5):** the hello serves two purposes: keeping known neighbours fresh, and discoverability for unknown nodes. Liveness can also come from other traffic. Every received transmission refreshes `last_seen` of the sender: the sender appears in `prev_hop` for data/ack3 and in `afzender` for ack1, ack2 and hello-ack. `src` never counts, because a forwarded message does not prove that the original source is in range.
-  - For each channel c, a node records when it was last "addressed" there. Every identifying transmission on c counts (hello, hello-ack, ack1, ack2, data as `prev_hop`, pull traffic). ANN and FULL do not count, because they are anonymous.
+- **Per-channel keepalive (proposal, Oct 2026; minimal form implemented; to be tested in scenarios 2 and 5):** the hello serves two purposes: keeping known neighbours fresh, and discoverability for unknown nodes. Liveness can also come from other traffic. Every received transmission refreshes `last_seen` of the sender: the sender appears in `prev_hop` for data/ack3 and in `afzender` for ack1, ack2 and hello-ack. `src` never counts, because a forwarded message does not prove that the original source is in range.
+  - For each channel c, a node records when it was last "addressed" there. Every identifying transmission on c counts (hello, hello-ack, ack1, ack2, data as `prev_hop`, table chunks). ANN and FULL do not count, because they are anonymous.
   - When the timer has expired (`T_keepalive`, starting value 1 hour), exactly one hello is sent on c.
   - During the startup phase the round across all three channels still applies (30 s interval). After that the hello exists only as a keepalive.
   - Benefit: nationwide, the hello is the largest load. With 3000 nodes and a 1-hour interval, that is about 5.8% per channel, and the hello acks come on top of that. The round shrinks to the channels that are needed: fewer switches, and a node whose stale neighbours are on its own home channel alone sends without any switch.
-  - Newcomers do not suffer from this: their startup hellos provide discovery, and the response to them (hello ack plus startup pull, 4.3) gives both sides their symmetry evidence.
+  - Newcomers do not suffer from this: their startup hellos provide discovery, and their first table push (4.3) provides both sides their symmetry evidence.
   - Risks: discovery between two nodes that are both still unknown is postponed until the keepalive, and version propagation becomes dependent on existing traffic.
-  - To measure: hellos per hour per node per channel, hello and ack airtime per channel, discovery latency of newcomers, and the delay in version refresh. `T_keepalive` is a parameter (starting value 1 hour, linked to `T_expire`, 4.4).
+  - To measure: hellos per hour per node per channel, hello and ack airtime per channel, discovery latency of newcomers, and the delay in version refresh. `T_keepalive` is a parameter (starting value 1 hour, linked to `T_expire`, 4.4). First measurement after implementation (local-net, 40 nodes, 8 h): stable hello airtime 0.09% → 0.06% per channel, missed hellos 4690 → 3582, confirmed symmetric on average 6.9 → 8.4 — a node that acked on a channel (own call) does not need to send a keepalive hello there.
 - **Hello ack on demand (proposal, Oct 2026; minimal form implemented):** unconfirmed links stay stored, but the chance of an ack decreases over time. Every identifying transmission from the neighbour increments a counter (hellos and home-channel transmissions, section 2; retries count as one). Only counter values 1, 2, 4, 8 and 16 produce an ack attempt. After that, on average one ack per 16 transmissions still occurs, with a minimum time threshold per neighbour. This means that a permanently asymmetric link on a busy hub does not cause unbounded ack traffic.
   - After our own confirmation, two more "courtesy acks" follow, and then definitive silence. Snooping (section 2) keeps liveness, version and quality in order by then.
   - Courtesy acks are needed because confirmation almost always happens asymmetrically: when one direction succeeds first, those acks stop, while the neighbour still has to retrieve its evidence from our ack.
@@ -210,34 +212,57 @@ Confirmation comes exclusively from the neighbour itself:
 
 - (a) a hello ack addressed to us, the evidence channel of the hello process. This is available before the first unicast.
 - (b) a successful unicast exchange with ack1.
-- (c) later, a tablepull from the neighbour in which we appear (4.3), with its own measurement of our signal.
+- (c) a table chunk from the neighbour in which we appear (4.3), with its own measurement of our signal.
+- (d) a proof list of the neighbour in which we appear (below).
 
-An overheard hello ack addressed to someone else does not prove symmetry. Routing chooses the next hop only via confirmed symmetric neighbours (10.1). Direct replies in exchanges are always allowed (4.3). Advertising this status in the neighbor table comes with the tablepull of building block 2.
+An overheard hello ack addressed to someone else does not prove symmetry. Routing chooses the next hop only via confirmed symmetric neighbours (10.1). Direct replies in exchanges are always allowed (4.3). Advertising this status in the neighbor table happens via the table chunks (4.3): a chunk containing our entry is itself already the reverse-direction evidence.
 
-**Long-term symmetry (proposal, Oct 2026).** The confirmed status is not valid forever. For each neighbour, a node records how old the reverse-direction evidence is ("last proven"). It is refreshed by a hello ack addressed to us, a successful unicast with ack1, or a tablepull from the neighbour in which we appear.
+**Long-term symmetry (proposal, Oct 2026).** The confirmed status is not valid forever. For each neighbour, a node records how old the reverse-direction evidence is ("last proven"). It is refreshed by a hello ack addressed to us, a successful unicast with ack1, a table chunk from the neighbour in which we appear (4.3), or by appearing in its proof list.
 
 Without maintenance there is a deadlock: the neighbour that acks first again (the drop, 4.1) only refreshes its receiver. The sender learns nothing from its own transmission, so its evidence ages indefinitely, even though the link is healthy.
 
-The solution is the flag "confirm this" in the hello ack (section 2). When the evidence age reaches `T_sym/2`, a node sends its next hello ack with the flag set. The receiver replies exactly once; its own evidence is already fresh from the reception, and without the flag it would stay silent.
+The solution is the **proof list**: a small packet with the node IDs of neighbours whose reverse-direction evidence expires soon. The working principle: evidence about the direction neighbour→us can only come from US, because we are the only source of their unmeasurable direction, and vice versa. When a node publishes "I hear X", then at X, in a single reception, the direction X→node is confirmed (the claim of the node itself) and the direction node→X is freshly measured (the reception itself). No reply is needed: each side maintains the other via its own lists, independently and symmetrically.
 
-- Cost: two packets of 7 bytes per link per period. This occurs almost only in a quiet network, because with traffic, ack1s and tablepulls usually refresh the evidence sooner.
-- The margin between `T_sym/2` and `T_sym` absorbs lost exchanges. At `T_sym` the link degrades to "seen", and routing (10.1) then no longer selects it.
-- Parameter: `T_sym`, starting value 6 hours, to be tested in scenario 5.
+- **Trigger.** For each neighbour, the node records when it last confirmed it (hello ack addressed to it, ack1 on its data, a table chunk in which it appeared, or an earlier list) — that is the own transmission log, so exactly locally computable. When the confirmation age exceeds `T_sym − 2 h`, the neighbour enters the list. The margin gives every link two more flush moments before expiry; at `T_sym` the link degrades to "seen", and routing (10.1) then no longer selects it.
+- **Cadence and cap.** Flush check every 20 minutes, rotating per channel (`slot mod 3`). Each channel thereby has one flush moment per hour: at most one proof-list packet per channel per hour per node, the same frequency as the keepalive itself (4.1). A node's three channels lie 20 minutes apart, so no self-congestion.
+- **Channel.** Only the sub-list of neighbours that are at home on that channel; every receiver listens at home. The packet is an own call on that channel and resets the keepalive counter (4.1).
+- **Reactionless.** Appearing in the list refreshes the evidence; not appearing in the list is snooping ("seen", liveness, version, quality). No reception triggers a reply; the ack-on-request regression stays cut off, without flag semantics or a reply rule.
+- **Cost.** Per link per `T_sym` period two list entries, one per side — with loose entries as much air as the earlier flag-bit solution (2 × 78 ms), but the entries bundle (2 through 17 IDs in one packet of the 173 ms class), the schedule plans itself (no dependence on ack chances) and on hubs the packet count drops. Almost only in a quiet network, because with traffic, ack1s and table chunks usually refresh the evidence sooner.
+- **Mass events.** After regional silence, many proofs expire in sync. The wave spreads itself out: every node has its own rotation and its own confirmation ages (the last traffic per link, no shared clock), and the little lists bundle what expires simultaneously.
+- **Parameters.** `T_sym` starting value 6 hours (to be tested in scenario 5); flush margin 2 hours; cadence 20 minutes (rotation).
 
-**Status:** decided.
+**Status:** symmetry status (seen/confirmed) decided; proof list proposal, to be tested in scenario 5.
 
-### 4.3 Fetching tables
+### 4.3 Sharing tables (push)
 
-- A node fetches the neighbor table only from direct neighbours, and only when the state version in the hello changes. First contact (no stored table yet for that neighbour) counts as a version change.
-- **Pulls complete the symmetry (decided, Oct 2026).** When a new node starts up, its hello round provides the symmetry evidence for itself (the acks addressed to it, sections 2 and 4.2). At the responders, the newcomer remains "seen" afterwards. Their reverse-direction evidence arises by two routes:
-  - (a) from the hello process: the newcomer acks the responder's next own round. With a stable responder this can take up to one hello interval (at most 1 hour). With the generalised hello ack (section 2) this often happens sooner, because every home-channel transmission of the responder is an ack trigger for the newcomer.
-  - (b) from the startup pull: the puller confirms every chunk with ack1. The responder sees its own transmission arriving and marks the newcomer as symmetric after the first chunk ack. Besides building the map, this is also the fast symmetry closer, and an additional reason not to postpone the startup pull.
-- **Forwarding versus direct replies (decided, Oct 2026).** The symmetry requirement applies to choosing a next hop for data (routing, 10.1). A direct reply within an exchange (ack1, pull chunks, ack2) may also be sent by the responder if it has the partner only as "seen". The received request proves the partner→responder direction, the partner is already waiting on the channel, and the ack1s on the reply supply the missing evidence afterwards. Refusing would block the startup of new nodes.
-- The table header contains the absolute geo of the owner and a firmware version of 1 byte. The version thus travels with every tablepull, without extra bytes per packet.
-- The table also contains the links between the owner's neighbours. The owner already knows these from its neighbours' tables, so no extra pull is needed. Per link: two index bytes within the neighbour list, and the quality in both directions. This way a node knows all links within its 2-hop set, and the Gabriel graph around a gap becomes complete. Nodes three hops away are unknown by default. They only come in through maintenance during quiet periods (section 12, point 15).
-- Pulls of tables from second-hop nodes do **not** happen by default. Strategically expanding the routing table during quiet periods can be considered later.
-- At startup, requests are sent with a random delay, so that replies do not collide on the home channel.
-- Tables larger than one packet are sent in chunks of about 200 bytes, with sequence numbers. Missing chunks are requested again. Each chunk receives an ack1.
+- **Push, no pull (decided, Oct 2026).** The table information is the same for all neighbours, so the owner shares its table unasked: every chunk is a broadcast on its own home channel, in the fixed cadence (below). Neighbours snoop along. There is no pull request, no repair pull and no ack on chunks; missed chunks are not requested but return by themselves at the next mutation or the next round.
+- **Table chunks are themselves symmetry evidence (decided, Oct 2026).** When a node publishes "I hear X" (its entry for X with quality), then at X, in a single reception, the direction X→node is confirmed (the claim of the node) and the direction node→X is freshly measured (the reception itself) — the same working principle as the proof list (4.2). The startup pull thereby lapses as symmetry closer: with a new node, its startup hellos provide the acks addressed to it (its own evidence), and its first table push provides the responders their counter-evidence. The route via the hello process (the newcomer acks a later home-channel transmission of the responder, section 2) remains standing as an extra source.
+- **Forwarding versus direct replies (decided, Oct 2026).** The symmetry requirement applies to choosing a next hop for data (routing, 10.1). A direct reply within an exchange (ack1, ack2) may also be sent by the responder if it has the partner only as "seen". The received request proves the partner→responder direction, the partner is already waiting on the channel, and the ack1 on the reply supplies the missing evidence afterwards. Refusing would block the startup of new nodes.
+- The table header contains the absolute geo of the owner and a firmware version of 1 byte. The version thus travels with every table push, without extra bytes per packet.
+- The table also contains the links between the owner's neighbours. The owner already knows these from its neighbours' tables, so no extra pull is needed. Per link, the node IDs of both endpoints travel along (absolute IDs, no indices; see the chunk format below), with the quality in both directions. This way a node knows all links within its 2-hop set, and the Gabriel graph around a gap becomes complete. Nodes three hops away are unknown by default. They only come in through maintenance during quiet periods (section 12, point 15).
+- Sharing tables from second-hop nodes does **not** happen (that information already travels along via the tables of direct neighbours). Strategically expanding the routing table during quiet periods can be considered later.
+- At startup, the first table chunks are scheduled with a random delay, so that they do not collide with the hello round and other newcomers.
+- Tables larger than one packet go in chunks of about 200 bytes, with sequence numbers.
+
+**Chunk format (Oct 2026: self-contained, node-centric chunks).** Every chunk is processable in its entirety without information from other chunks; the order does not matter and the receiver does not need to know whether and when the rest comes.
+
+- **Node-centric.** A chunk contains a small number of complete node entries (8 B: node ID, quality, age, geo), and directly after each entry the links of that node: `(neighbour ID 2 B, quality bits per direction)` — width depending on the chunk type, see the quality width below. Every link stands under exactly one endpoint (the owner chooses), so every link travels once per table.
+- **Absolute IDs, no indices.** Link references are node IDs, not positions in the sender's table. No mapping between the tables of sender and receiver is needed, and no temporary scratch buffer or reassembly: every chunk is processed directly against the own table (256 nodes, 13.2).
+- **Chunk header** (about 10 B): type, state version, chunk number, number of nodes, and the owner geo with firmware version (4.3). The header repeats per chunk, so every chunk is self-contained.
+- **Quality measurement (decided, Oct 2026): long-term average per direction.** The first measurement initialises the stored value; every subsequent reception updates it with an EWMA: `stored = (31 × stored + new value) / 32` (weight 1/32, a window of roughly half an hour of traffic). Small quality excursions are thereby damped automatically. There is no age per link: the age of a link is the age of its source, and that travels along per node entry.
+- **Quality on air (decided, Oct 2026): hybrid width per chunk.** The advertised link quality is the upper bits of the long-term average: 3 bits per direction in the prefix chunks (direct neighbours and their mutual threshold links — the links where fine-grained route choices are determined; 8 levels), 2 bits per direction in the tail chunks (2-hop links serve greedy direction and Gabriel witnesses, not hop selection; 4 classes per the NL calibration 14.2: bad below −2.5 dB SNR, moderate, good above +3.5 dB, excellent). The chunk header gets a flag bit for the quality width, so every chunk stays independently decodable. With 3 bits per direction (prefix) a link is 22 bits wide; with 2 bits (tail) 20 bits — both packed on a byte boundary (8 links per 22 B and 4 links per 9 B respectively). Budget: the full table thereby stays around 30 to 31 chunks, within the 32.
+- **Advertisement hysteresis (decided, Oct 2026): share only on difference ≥ 2.** A change in the advertised quality is only passed on when the new advertised value differs from the previous one by at least 2 steps. The average may swash over a class boundary without triggering a single packet; the advertisement hysteresis is independent of the measurement hysteresis for the neighbor table limit (10.4) — two dampers with two goals.
+- **Status flags do not travel along.** Seen/confirmed, the quality threshold and Gabriel membership are derived: the owner only sends links it has measured in both directions, and every receiver calculates threshold and Gabriel graph itself from class and geos (10.1, 10.3).
+- **Broadcast per chunk.** Every chunk is its own broadcast on the own home channel; no exchange, no ack, no switch. Snooping processes it as liveness + version + quality for the sender (the chunk is an own call and resets the keepalive counter of that channel, 4.1).
+- **Loss (decided: no repair pull).** A missed chunk is not requested. Recovery consists of the regularity of the push itself: the prefix is shared at the next direct-neighbour mutation or when the window expires (the whole prefix again), the tail is periodically repeated in full in the cadence. Because every chunk is self-contained processable, there is no order or reassembly dependence and no extra state. The price: the receiver does not know THAT a chunk was missed (no ack), so the age of its stored copy is the only measure — older information loses automatically against fresh.
+- **Prefix: the routing core first (decided, Oct 2026).** The fixed table layout starts with the direct neighbours and their mutual threshold links (above the quality threshold, 10.1). The first k chunks contain that routing core (typically 8 to 16 neighbours in one chunk; a hub with 64 neighbours has a prefix of several chunks). Chunks remain independently processable; the prefix property is about the layout of the sender. A receiver with only the prefix can already route fully; the tail is best-effort.
+- **Cadence (proposal, Oct 2026): three speeds, driven by the kind of mutation.** The distinction between direct neighbours and other nodes determines how fast a change is shared:
+  1. **Prefix on direct-neighbour mutation (fastest):** new neighbour, death detection (`T_expire`), limit churn (tombstone), or a quality-class change that survives the hysteresis (10.4) — the prefix follows directly behind it, within the short window. These are the events that touch routing: a new or dead direct neighbour changes the possible hop selection for everyone in the area. Delaying there is withholding route information.
+  2. **Prefix otherwise:** mutations that only affect the edge (new 2-hop node at a neighbour, geo change) follow the normal short window (at most once per 5 to 10 min).
+  3. **Tail:** exclusively the rising cadence (below).
+  Mutations within the window bundle automatically, because only the current version goes on air — intermediate versions do not exist on air. The kind of mutation is exactly known locally (the node knows itself what it just changed), so no protocol field is needed. The state version in the hello (4.1) remains the only trigger visible on air. The tail is shared more slowly, with a pause between chunks that rises with the number of direct neighbours n (per doubling of n the pause doubles): the marginal airtime cost of a chunk rises with n, most table mutations sit at hub sites, and no node has to do a busyness measurement (open point 15). Guideline (Oct 2026): order of magnitude 32 hours before a tower site (n = 64, about 30 chunks) has shared its full table — base pause about 8 min, doubling per bucket (n ≤ 8 → 8 min, ≤ 16 → 16 min, ≤ 32 → 32 min, ≤ 64 → 64 min per tail chunk). Parameters: window length, base pause and bucket boundaries — to be measured in scenario 2.
+- **The slowness is sharing delay, not aging at the source (Oct 2026).** The knowledge of the sender is fresh at the moment of sending: it hears its own neighbours directly, and its 2-hop edge is supplied to it by the prefixes of its neighbours (every 5 to 10 min) plus everything it snoops. A tower with many neighbours snoops more sources and thereby on average has a *fresher* edge than a small node; the rising pause only delays the sharing, not the knowledge. The receiver can subtract the sharing delay locally, because the sender's n is in its prefix. Every receiver computes: actual age = travelled age (sender timestamp, 4.4) + expected sharing delay f(n). No protocol field, no clock, no synchronisation — only the bucket table in the firmware. Tail entries are thereby not filtered away but weighed: routing uses them for direction (greedy, Gabriel), not for hop selection; the symmetry requirement (10.1) already restricts hop selection to confirmed direct neighbours anyway.
+- **Budget.** Full table: 256 nodes × 8 B plus links (prefix 22 bits, tail 20 bits, see the quality width above) plus headers ≈ 5.7 to 6.0 KB, so 28 to 31 chunks of the 200 B class (869 ms), within the 32 of the memory budget. A full push round of a tower (about 30 chunks) is thereby about 26 s of air per 32 hours — negligible. The receiver does not store links it already has; only the difference counts.
 
 **Status:** decided.
 
@@ -246,14 +271,14 @@ The solution is the flag "confirm this" in the hello ack (section 2). When the e
 **Death detection (proposal, Oct 2026).** For each direct neighbour, a node locally records when it last heard it. Every identifying transmission that is overheard counts. The clock is local, so no synchronisation is needed. After `T_expire` (starting value 4 hours) without reception, the neighbour is considered dead and the entry disappears, without a tombstone.
 
 - `T_expire` is at least three to four times `T_keepalive` (4.1). A living, quiet node sends at least its keepalive hello once per hour. Four hours therefore means four missed keepalive rounds, on top of all traffic that is overheard.
-- In a mass outage (for example a power failure in a region), hundreds of entries expire at the same time. Every mutation increments the state version, and the pull wave that follows must stay spread out through the existing random delay (4.3).
+- In a mass outage (for example a power failure in a region), hundreds of entries expire at the same time. Every mutation increments the state version, and the push wave that follows must stay spread out through the existing random delay and the cadence (4.3).
 - The age per entry remains the measure of what a receiver trusts.
 
-**Age encoding (proposal, Oct 2026).** The age byte per entry encodes minutes; 255 = 4 hours or older, hence expired. Receivers of tablepulls thereby filter out expired entries automatically.
+**Age encoding (proposal, Oct 2026).** The age byte per entry encodes minutes; 255 = 4 hours or older, hence expired. For direct neighbours (prefix chunks), receivers thereby filter out expired entries automatically. For tail entries the rule is weighing, not discarding (4.3): link qualities of expired entries are not used for routing, but the node information (ID, geo) stays standing as map material.
 
 **Why death detection needs no tombstone.** A dead neighbour disappears from every advertised table no later than `T_expire`, because every owner applies the same rule. The age encoding ensures that receivers ignore expired entries. A neighbour that lives only in the 2-hop map (Y hears him, we do not) is not a zombie but legitimate information with a fresh age. A tombstone covering the whole table would wrongly block him.
 
-**Tombstone, limited to its actual task (Oct 2026).** The tombstone exists for removal by the neighbor table limit on hub sites (10.4). That affects a living neighbour that keeps transmitting. Without a tombstone, the neighbour would return within the keepalive interval, the neighbor table limit would oscillate, and every mutation would cause a version increment and a pull wave.
+**Tombstone, limited to its actual task (Oct 2026).** The tombstone exists for removal by the neighbor table limit on hub sites (10.4). That affects a living neighbour that keeps transmitting. Without a tombstone, the neighbour would return within the keepalive interval, the neighbor table limit would oscillate, and every mutation would cause a version increment and a push wave.
 
 - The tombstone blocks entries that arrive indirectly via tables. A direct hello from the node itself lifts it.
 - Duration: 5 times the maximum keepalive interval, so 5 hours at `T_keepalive` = 1 hour.
@@ -307,7 +332,8 @@ Optional: source geo (4 bytes, section 5), present when the flag is set. This is
 | ack1 | 7 bytes | Next hop → previous hop | Same channel as the data exchange; the sender waits there according to the switching rule |
 | ack2 | 7 bytes | Next hop → previous hop | Home channel of the previous hop |
 | ack3 | Routed message, payload 4 bytes | Destination → source | Via routing |
-| hello ack | 7 bytes, directional: type (including the "confirm this" flag, 4.2), destination ID (the triggered sender), sender ID, state version (section 2) | Responder → triggered sender | During a hello round: home channel of the hello sender. For a home-channel transmission of the trigger (ANN, FULL, or ack1 on its own channel): that channel itself, because the triggering sender listens there by definition. |
+| hello ack | 7 bytes, directional: type, destination ID (the triggered sender), sender ID, state version (section 2) | Responder → triggered sender | During a hello round: home channel of the hello sender. For a home-channel transmission of the trigger (ANN, FULL, or ack1 on its own channel): that channel itself, because the triggering sender listens there by definition. |
+| proof list | 7 + 2n bytes (n neighbour IDs, n ≤ 17): type, node ID (2), state version (2), then n × 2 B | Node → all neighbours at home on that channel | Only the sub-list of neighbours at home on channel c; at most one per channel per hour (4.2). In the list = evidence refreshed, no reaction; not in the list = snooping. |
 
 Ack1 contains the identity of the original message and the sender of ack1.
 
@@ -500,7 +526,7 @@ Threads could use a shorter limit, for example three bits. That provides some ex
 - Links are used only if they are above a quality threshold and work in both directions.
 - Each direction must be proven by the receiver of that direction:
   - A hello or an overheard hello ack proves only sender→receiver ("seen").
-  - The reverse direction comes exclusively from the neighbour itself: via a hello ack addressed to us, via its tablepull (4.3), or via a successful unicast with ack1 ("confirmed").
+  - The reverse direction comes exclusively from the neighbour itself: via a hello ack addressed to us, via its table chunks (4.3), or via a successful unicast with ack1 ("confirmed").
 - Routing chooses the next hop only via confirmed links. Direct replies in exchanges are exempt from this requirement (4.3).
 
 **Status:** decided.
@@ -578,7 +604,7 @@ Threads could use a shorter limit, for example three bits. That provides some ex
 | 14 | SF8 fallback for remote nodes. A receiver listens on one SF, so the choice applies per link or per region, not per node. Estimated gain: 25–30% range at about 2× airtime. | Radio design, possibly per region |
 | 15 | Local load measurement (channel occupancy via CAD, own duty cycle, ack failure rate) to schedule maintenance in quiet moments. Tasks: (a) local computation without airtime: recalculate the Gabriel graph, recompute routes, clean up tombstones, compress the dedup cache; (b) small unicast tasks: fetch routing information from 2-hop neighbours, refresh neighbours' neighbor tables; (c) probes to penalised links, and measuring quality in both directions; (d) measurement work for the SF8 question. Not allowed in quiet periods: floods, broad pulls, and anything that changes the hello. Knowledge from neighbours gets an age and a source, and weighs more heavily the more recent it is. This way the map's knowledge reaches beyond two hops, without one node having to fetch everything. | Maintenance without extra network load |
 | 16 | Trigger generalisation (section 2): the hello ack follows every identifying home-channel transmission of a neighbour. To be measured in scenario 2: the steady-state ack load must not exceed the schedule (0.12–0.17% per channel). Also: ack collisions on ANN/FULL triggers and the rank spreading there. | Determines whether the keepalive hello and the generalised ack together carry the resting traffic |
-| 17 | `T_sym` for re-confirming symmetry (4.2, starting value 6 hours), and the ratio `T_keepalive : T_expire = 1 : 4` (starting values 1 hour / 4 hours, 4.4). | Route stability versus airtime; to be tested in scenario 5 |
+| 17 | `T_sym` and the flush margin of the proof list (4.2; starting values 6 hours / 2 hours), and the ratio `T_keepalive : T_expire = 1 : 4` (starting values 1 hour / 4 hours, 4.4). | Route stability versus airtime; to be tested in scenario 5 |
 | 18 | Ack channel for a keepalive hello on channel c: (a) the sender stays on c for a short window, responders do not switch (preferred, section 2); or (b) the current rule: acks switch to the home channel of the sender. | (a) concentrates home deafness on one node per keepalive hello; (b) spreads switches across all responders |
 
 ---
@@ -600,9 +626,9 @@ Threads could use a shorter limit, for example three bits. That provides some ex
 | Available for the protocol | 48 KB | 128 KB |
 | Thread cache (LRU, section 8.6) | 24 KB | 64 KB |
 | Dedup cache (512 entries of 4 bytes) | 2 KB | 2 KB |
-| Neighbor table and 2-hop map (about 200 nodes of 12 bytes) | 3 KB | 3 KB |
-| Link list (about 1000 links of 5 bytes) | 5 KB | 5 KB |
-| Chunk reassembly (one per neighbour) | 4 KB | 8 KB |
+| Neighbor table and 2-hop map (256 nodes of 12 bytes) | 3 KB | 3 KB |
+| Link list (1536 links of 5 bytes, local format) | 7.5 KB | 7.5 KB |
+| Free (chunk reassembly lapses with the self-contained chunks, 4.3) | 0 | 4 KB |
 | Queues and transmit buffers | remainder | remainder |
 
 ### 13.3 Design rules
@@ -641,7 +667,7 @@ Threads could use a shorter limit, for example three bits. That provides some ex
 - Budget consumption per message.
 - Latency (for information).
 - Duplicate work in threads: ratio of FULL transmissions to the number of nodes.
-- Keepalive hellos per node per channel, delay in version refresh, and re-confirmation exchanges (`T_sym`, 4.2).
+- Keepalive hellos per node per channel, delay in version refresh, and proof-list packets per channel per hour (`T_sym`, 4.2).
 
 **Topology:** real repeater locations where available, otherwise synthetic with the same density per region. Water is excluded (for example via OpenStreetMap).
 
@@ -679,7 +705,7 @@ Roughly calibrated: masts of 20–40 m reach about 12–14 km; tall masts (300�
 
 **Scenarios (in increasing order):**
 
-1. **Coupling test:** 2 nodes, hello, tablepull and one unicast. Checks that the C core and the simulator agree on packet sizes, airtimes and ack order.
+1. **Link test:** 2 nodes, hello, table push and one unicast. Checks that the C core and the simulator agree on packet sizes, airtimes and ack order.
 2. **Local network:** 30–50 nodes at one density, from a node list with GPS position and height. Measures hello airtime and ack collisions on hello acks (RSSI spreading), keepalive hellos per node per channel, and the steady-state ack load on generalised triggers (ANN/FULL) against the schedule (0.12–0.17%).
 3. **Density limit:** 200, 500, 1000 and 3000 nodes, synthetic Dutch distribution. Airtime per channel, duty cycle peaks, and delivery ratio.
 4. **Sparse area and gap:** IJsselmeer/Flevoland pattern. Radius k, waypoints, failed reports.
@@ -703,10 +729,12 @@ Roughly calibrated: masts of 20–40 m reach about 12–14 km; tall masts (300�
 | Flood as fallback | Dropped | Does not scale |
 | Path in the header | Dropped | Costs more than it gives |
 | Single-hop ack for failure reports | Replaced | Routed report is better |
-| Tablepull from second-hop nodes | Dropped (default) | Too much traffic; possibly off-peak later |
+| Complete tablepull mechanism (pull request, repair pull, ack per chunk, startup pull as symmetry closer) | Replaced (Oct 2026) | Push to all neighbours: the information is the same for everyone, a hub transmits its table once instead of n times. Chunks are themselves symmetry evidence (same principle as the proof list, 4.2); recovery runs via the regularity of the cadence, not via requests |
 | Encrypted geo | Dropped | Relays need the geo |
 | Repeater WiFi on by default | Dropped | Power consumption on solar; now off by default |
 | Repeater storage for companions | Dropped | Companions retrieve threads from their repeater's thread cache |
 | "Hello on demand", rules 1 and 2 (stale-neighbour and version triggers) | Replaced (Oct 2026) | Snooping and the generalised hello ack cover liveness and version. The per-channel keepalive (4.1) remains. |
-| Hello ack only after a hello | Replaced (Oct 2026) | Generalised to every identifying home-channel transmission, with the ack eligibility condition, cooldown and re-confirmation flag (sections 2 and 4.2) |
+| Hello ack only after a hello | Replaced (Oct 2026) | Generalised to every identifying home-channel transmission, with the ack eligibility condition and cooldown; at the time including a re-confirmation flag, later replaced itself (row above) |
+| Flag bit "confirm this" + reply rule | Replaced (Oct 2026) | The proof list (4.2) maintains the evidence without a flag, without a reply and without dependence on ack chances; same air per link, fewer packets on hubs |
+| Full neighbour ID list in the keepalive | Dropped (Oct 2026) | Airtime is superlinear (5 B = 70 ms, 133 B = 459 ms) and the packet goes to everyone on every channel every hour; the "last hour" filter filters nothing, because through the keepalive every living neighbour is by definition heard within the last hour; routing needs quality/geo/direction. The delta variant (proof list) covers the maintenance; the table chunks (4.3) cover the full information |
 | Removal by silence with tombstone | Replaced (Oct 2026) | Silence is death detection (4 hours, 4.4) without a tombstone. The tombstone stays for neighbor table limit churn on hub sites (10.4). |
