@@ -25,6 +25,12 @@
 #define MC_MAX_PAYLOAD  230
 #define MC_T_SYM_US      21600000000ull  /* 6 h: validity of confirmed symmetry (4.2) */
 #define MC_SYM_MARGIN_US  7200000000ull  /* 2 h flush margin (4.2) */
+#define MC_T_ACK2_US      7000000ull    /* ack2 wait window at the sender (7.3, proposal) */
+#define MC_MAX_ROUTE_NBR  3             /* neighbours tried per hop (7.4) */
+#define MC_MAX_2HOP      128            /* 2-hop map entries (10.1) */
+#define MC_CHUNK_PERIOD_US 120000000ull /* 2 min: one table-chunk slice on air (4.3) */
+#define MC_CHUNK_ENTRIES 17             /* entries per chunk: 4 + 17 x 7 = 123 B (4.3) */
+#define MC_GEO_UNKNOWN   0x7fff         /* int16 sentinel: geo not known (10.2) */
 
 /* ---------------- internal types (visible for fixed allocation) ---- */
 typedef struct {
@@ -41,6 +47,10 @@ typedef struct {
                                addressed to us, a proof list in which we
                                appear, an ack1 on our data; aged in the
                                proof tick; >= T_sym - margin = flush */
+    int16_t  geox, geoy;    /* position of the neighbor (10.2), from table
+                              chunks; MC_GEO_UNKNOWN = not known */
+    uint8_t  penalty;       /* local penalty on failures (10.4): +1 per failed
+                              attempt, decays on success */
     uint8_t  alive;
     uint8_t  sym;           /* 1 = confirmed symmetric (hello-ack addressed
                                to us, proof list in which we appear, ack1
@@ -48,10 +58,32 @@ typedef struct {
                                0 = only seen, one direction (4.2, 10.1) */
 } mimeshi_neighbor;
 
+/* 2-hop map entry (10.1): node X heard via neighbor N. Filled from the
+ * table chunks of N (4.3): an entry for X in N's chunk proves N hears X
+ * and gives X's geo. Routing uses these for the 2-hop case and greedy. */
 typedef struct {
-    uint8_t  active, tries_left, budget_left;
-    uint16_t msg_id, src, dst, prev_hop, next_hop;
-    uint8_t  pkt[10 + MC_MAX_PAYLOAD];
+    uint16_t id, via;       /* X, and the direct neighbor N that hears X */
+    uint8_t  quality;       /* N's advertised quality of X */
+    int16_t  geox, geoy;    /* position of X (10.2); MC_GEO_UNKNOWN = not known */
+    uint8_t  alive;
+    uint8_t  sym;           /* reserved: 2-hop symmetry needs N's claim + our
+                              reception; routing demands only via confirmed */
+} mimeshi_2hop;
+
+typedef struct {
+    uint8_t  active, state;  /* state: 0 = attempts running, 1 = ack1 done,
+                                waiting for ack2 (7.1/7.3) */
+    uint8_t  tries_left, series;   /* attempts per neighbor / neighbor index
+                                in the series (max MC_MAX_ROUTE_NBR, 7.4) */
+    uint16_t msg_id, src, dst, prev_hop, next_hop, last_hop;
+    uint8_t  budget_left;
+    uint8_t  fwd;            /* 1 = forwarding record (7.2): after the own ack1,
+                                ack2 goes to prev_hop */
+    uint8_t  no_report;      /* 1 = failed-delivery report itself (10.5): never
+                                generates a new report */
+    int16_t  dst_geox, dst_geoy;   /* destination geo for greedy (10.2);
+                                     MC_GEO_UNKNOWN = not known */
+    uint8_t  pkt[14 + MC_MAX_PAYLOAD];  /* header incl. optional source geo (6.1) */
     uint16_t pkt_len;
 } mimeshi_pending;
 
@@ -76,7 +108,11 @@ struct mimeshi_node {
     uint16_t local_tbl_ctr;           /* internal table counter (glossary):
                                          drives push-window bundling (4.3);
                                          never transmitted */
+    int16_t  geox, geoy;              /* own position (10.2); MC_GEO_UNKNOWN =
+                                         not set; the simulator sets it before
+                                         start, firmware from GPS */
     mimeshi_neighbor nbr[MC_MAX_NEIGHBORS];
+    mimeshi_2hop    hop2[MC_MAX_2HOP]; /* 2-hop map (10.1), via table chunks */
     mimeshi_pending  pend[MC_MAX_PENDING];
     mimeshi_dedup    dedup[MC_MAX_DEDUP];
     uint64_t hello_interval_us;       /* adaptive: 30 s -> 1 h */
@@ -90,6 +126,9 @@ struct mimeshi_node {
                                          (= T_keepalive, core.c) of silence the
                                          next proof list on c is pulled
                                          forward (4.2) */
+    uint32_t chunk_ctr_last;          /* local table counter at the last
+                                         chunk push (4.3): push only on
+                                         mutation, not periodically */
     uint8_t  proof_wait[MC_N_CHANNELS];/* countdown to the flush moment
                                          per channel (4.2), staggered 20
                                          min apart; restarts at 1 h on
@@ -112,8 +151,10 @@ void mimeshi_init(mimeshi_node *n, uint16_t id, mimeshi_tx_fn tx, mimeshi_timer_
  * keepalive role (4.1, 4.2). */
 void mimeshi_start(mimeshi_node *n);
 
-/* Unicast to dst. 0 = accepted, -1 = dst not in the map (no flood),
- * -2 = no free pending slot, -3 = payload too large. */
+/* Unicast to dst. 0 = accepted, -1 = dst not in the map and no geo known
+ * (10.2: do not flood, wait for the map), -2 = no free pending slot,
+ * -3 = payload too large. Greedy routing uses the destination geo when
+ * dst is not in the 2-hop map (10.2). */
 int  mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload,
                      uint16_t len, bool want_ack3);
 

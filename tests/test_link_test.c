@@ -105,22 +105,26 @@ int main(void) {
     mimeshi_rx(&B, 1, -60, helloA, 3);
     pump_until(1000000);
 
-    /* hello-ack from A toward B: exchange to B's home channel (1). The
-     * hello-ack is 5 B (6.2). */
-    assert(mimeshi_send_data(&B, 0x0102, (const uint8_t *)"hello mesh", 10, true) == 0);
-    pump_until(100000); /* switch (5 ms) + tx; not up to the ack1 timeout */
-    /* B transmits data on A's home channel 0. */
-    assert(last_ch == 0 && (last_type & 0x0F) == 5);
-
     /* Assert 4: a neighbor learned via hello stands at "seen": one
      * direction, symmetry not yet proven (4.2). B knew A from the
-     * injected hello. */
+     * injected hello. Routing (10.1) therefore refuses the unicast. */
     {
         int seen = 0;
         for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
             if (B.nbr[i].alive && B.nbr[i].id == 0x0102) seen = B.nbr[i].sym;
         assert(seen == 0);
+        assert(mimeshi_send_data(&B, 0x0102, (const uint8_t *)"hello mesh", 10, true) == -1);
     }
+
+    /* B receives a hello-ack addressed to it from A: the link is
+     * confirmed symmetric from B's side (4.2) -- routing (10.1)
+     * demands this before a unicast is submitted. */
+    uint8_t hack_for_b[5] = { 2, 0x00,0x01, 0x02,0x01 };  /* from A, for B */
+    mimeshi_rx(&B, 1, -70, hack_for_b, 5);
+    assert(mimeshi_send_data(&B, 0x0102, (const uint8_t *)"hello mesh", 10, true) == 0);
+    pump_until(100000); /* switch (5 ms) + tx; not up to the ack1 timeout */
+    /* B transmits data on A's home channel 0. */
+    assert(last_ch == 0 && (last_type & 0x0F) == 5);
 
     /* Assert 5: a received ack1 confirms the symmetry of the sender
      * (4.2): the neighbor received our message and its ack reached us.

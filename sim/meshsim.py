@@ -507,6 +507,141 @@ def traffic(mk, jitter):
         f"top 5 {[f'{u/1e6:.1f}' for u in top]} s, "
         f"above limit: {sum(1 for u in usage.values() if u > 360_000_000)}")
 
+
+@scenario("multihop", "utrecht40 end-to-end: unicast between far node pairs via routing")
+def multihop(mk, jitter):
+    """Building block 2 measurement: end-to-end unicaists between node
+    pairs that are NOT direct neighbours, routed via the 2-hop map +
+    greedy on geo (10.2). Uses the same topology and link budget as
+    local-net; the geo of every node is in the core before start (the
+    table chunks carry them further, 4.3). Measures per message: hop
+    count, delivery, ack2/negative-ack2 traffic, and the failed
+    delivery reports (10.5). CLI: --nodes --duration --rate --payload."""
+    nodes_list = load_nodes_csv(_ARGS.nodes)
+    duration_us = _ARGS.duration * 3_600_000_000
+    radio = Radio()
+    radio.wire.open = False
+    lat0 = sum(n['lat'] for n in nodes_list) / len(nodes_list)
+    lon0 = sum(n['lon'] for n in nodes_list) / len(nodes_list)
+    pos = {}
+    nodes = []
+    for i, nd in enumerate(nodes_list):
+        kn = Node(radio, nd['id'])
+        kn.core = set_jitter(mk(kn), jitter)
+        x, y = project(nd['lat'], nd['lon'], lat0, lon0)
+        pos[nd['id']] = (x, y)
+        kn.core.mn.geox = int(x); kn.core.mn.geoy = int(y)   # 10.2: own geo
+        nodes.append(kn)
+        radio.schedule(i * 250_000, kn.core.start)
+    ids = list(pos)
+    for a in ids:
+        for b in ids:
+            if a == b: continue
+            raw = linkbudget((*pos[a], 25), (*pos[b], 25))
+            if raw is None: continue
+            fade = ((a * 31 + b * 17) % 11) - 5
+            r = raw + fade
+            if r >= RX_MIN_DBM:
+                radio.wire.links[(a, b)] = max(-128, min(120, round(r)))
+    direct = set()
+    for (a, b) in radio.wire.links:
+        if (b, a) in radio.wire.links:
+            direct.add((min(a, b), max(a, b)))
+    # pairs that are NOT direct neighbours but reach each other in a few
+    # hops: greedy needs the destination geo to be known (10.2), which
+    # after startup is only true within the 2-hop map. The pairs are
+    # therefore chosen AFTER the map has been built (see below).
+    out(f"{len(nodes_list)} nodes, {len(direct)} direct bidirectional pairs")
+
+    # bookkeeping: delivery at the final destination + hop count
+    delivered = {}
+    hops = {}
+    base_rx = CCore.rx
+    def rx(self, arg):
+        ch, rssi, pkt = arg
+        if pkt and (pkt[0] & 0x0F) == 5 and len(pkt) > 11:
+            # only payload messages: fail reports (F_NO_REPORT, 10.5) and
+            # ack3 (11) are routed DATA but not end-to-end payload
+            if (pkt[0] & 0x20) == 0:
+                dst = pkt[5] | (pkt[6] << 8)
+                src = pkt[3] | (pkt[4] << 8)
+                mid = pkt[1] | (pkt[2] << 8)
+                if dst == self.n.id and (mid, src) not in delivered:
+                    delivered[(mid, src)] = radio.now
+        base_rx(self, arg)
+    CCore.rx = rx
+
+    rng = random.Random(2028)
+    payload = bytes(_ARGS.payload)
+    interval = 3_600_000_000 // max(_ARGS.rate, 1)
+    by_id = {kn.id: kn for kn in nodes}
+
+    def in_2hop(kn, x):
+        """x lies in the 2-hop map of kn (learned via chunks, 4.3)."""
+        core = kn.core
+        if not isinstance(core, CCore): return False
+        return any(h.alive and h.id == x for h in core.mn.hop2)
+
+    def route_confirmed(kn, x):
+        """x is reachable from kn over fully confirmed links: a confirmed
+        direct neighbour, or a 2-hop entry whose via is a confirmed
+        neighbour of kn AND a confirmed neighbour of x (the route that
+        10.1/10.2 guarantees)."""
+        core = kn.core
+        if not isinstance(core, CCore): return False
+        nb = [e for e in core.mn.nbr if e.alive and e.id == x and e.sym]
+        if nb: return True
+        for h in core.mn.hop2:
+            if not h.alive or h.id != x: continue
+            via = [e for e in core.mn.nbr if e.alive and e.id == h.via and e.sym]
+            if not via: continue
+            vcore = by_id[h.via].core
+            vd = [e for e in vcore.mn.nbr if e.alive and e.id == x and e.sym]
+            if vd: return True
+        return False
+
+    submitted = {}      # (mid, src) -> routable-at-submission (True/False)
+    refused = [0]
+    def gen():
+        # non-direct pair; routable pairs (fully confirmed 2-hop route)
+        # must be delivered -- that is the building block 2 guarantee
+        cand = [(a, b) for a in ids for b in ids
+                if a < b and (a, b) not in direct
+                and sym_count(by_id[a]) and sym_count(by_id[b])]
+        if cand:
+            a, b = rng.choice(cand)
+            r = route_confirmed(by_id[a], b)
+            rc = by_id[a].core.send_data(b, payload, ack3=False)
+            if rc == 0:
+                pend = [p for p in by_id[a].core.mn.pend if p.active and p.dst == b]
+                if pend:
+                    submitted[(pend[0].msg_id, a)] = r
+            else: refused[0] += 1
+        radio.schedule(interval, gen)
+    radio.schedule(600_000_000, gen)
+    radio.run(until_us=duration_us)
+
+    out("\n=== Measurements ===")
+    nsub = len(submitted)
+    routable = [k for k, r in submitted.items() if r]
+    dr = sum(1 for k in routable if k in delivered)
+    out(f"end-to-end submitted {nsub} (refused at submission: "
+        f"{refused[0]} -- void or unknown, 10.2/10.3), delivered at the "
+        f"final destination {len(delivered)} "
+        f"({100*len(delivered)/max(nsub,1):.1f}%)")
+    out(f"fully-confirmed 2-hop routes: {len(routable)} submitted, "
+        f"{dr} delivered ({100*dr/max(len(routable),1):.1f}%) -- this is "
+        f"the building block 2 guarantee")
+    for c in range(N_CH):
+        out(f"channel {c}: airtime {radio.airtime[c]/1e6:.3f} s, "
+            f"lost receptions {radio.wire.collided[c]}")
+    away = [kn.away_total for kn in nodes]
+    out(f"home-deafness: avg {sum(away)/len(away)/1e6:.1f} s, max {max(away)/1e6:.1f} s")
+    usage = {(n, c): radio.duty.usage(n, c, radio.now) for n in ids for c in range(N_CH)}
+    top = sorted(usage.values(), reverse=True)[:5]
+    out(f"duty (sliding hour, limit 360 s): max {top[0]/1e6:.1f} s, "
+        f"above limit: {sum(1 for u in usage.values() if u > 360_000_000)}")
+
 # ---------------- CLI -------------------------------------------------------
 
 def main():

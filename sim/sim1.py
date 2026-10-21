@@ -306,20 +306,33 @@ class Node:
 # Struct layout verified against sizeof/offsetof of core.h
 # (neighbor 12, pending 256, node 5448 B).
 # ---------------------------------------------------------------------------
-MC_MAX_NEIGHBORS, MC_MAX_PENDING, MC_MAX_DEDUP, MC_MAX_PAYLOAD = 64, 16, 128, 230
+MC_MAX_NEIGHBORS, MC_MAX_PENDING, MC_MAX_DEDUP, MC_MAX_PAYLOAD, MC_MAX_2HOP = 64, 16, 128, 230, 128
 
 class CNeighbor(ctypes.Structure):
     _fields_ = [("id", ctypes.c_uint16), ("quality", ctypes.c_uint8),
                 ("ack_try", ctypes.c_uint8), ("last_seen", ctypes.c_uint32),
-                ("proven_age_us", ctypes.c_uint64), ("alive", ctypes.c_uint8),
-                ("sym", ctypes.c_uint8)]
+                ("proven_age_us", ctypes.c_uint64),
+                ("geox", ctypes.c_int16), ("geoy", ctypes.c_int16),
+                ("penalty", ctypes.c_uint8),
+                ("alive", ctypes.c_uint8), ("sym", ctypes.c_uint8)]
+
+class C2Hop(ctypes.Structure):
+    _fields_ = [("id", ctypes.c_uint16), ("via", ctypes.c_uint16),
+                ("quality", ctypes.c_uint8),
+                ("geox", ctypes.c_int16), ("geoy", ctypes.c_int16),
+                ("alive", ctypes.c_uint8), ("sym", ctypes.c_uint8)]
 
 class CPending(ctypes.Structure):
-    _fields_ = [("active", ctypes.c_uint8), ("tries_left", ctypes.c_uint8),
-                ("budget_left", ctypes.c_uint8), ("msg_id", ctypes.c_uint16),
+    _fields_ = [("active", ctypes.c_uint8), ("state", ctypes.c_uint8),
+                ("tries_left", ctypes.c_uint8), ("series", ctypes.c_uint8),
+                ("msg_id", ctypes.c_uint16),
                 ("src", ctypes.c_uint16), ("dst", ctypes.c_uint16),
                 ("prev_hop", ctypes.c_uint16), ("next_hop", ctypes.c_uint16),
-                ("pkt", ctypes.c_uint8 * (10 + MC_MAX_PAYLOAD)),
+                ("last_hop", ctypes.c_uint16),
+                ("budget_left", ctypes.c_uint8), ("fwd", ctypes.c_uint8),
+                ("no_report", ctypes.c_uint8),
+                ("dst_geox", ctypes.c_int16), ("dst_geoy", ctypes.c_int16),
+                ("pkt", ctypes.c_uint8 * (14 + MC_MAX_PAYLOAD)),
                 ("pkt_len", ctypes.c_uint16)]
 
 class CDedup(ctypes.Structure):
@@ -339,7 +352,9 @@ RAND_FN = ctypes.CFUNCTYPE(ctypes.c_uint32, ctypes.POINTER(CNode))
 
 CNode._fields_ = [
     ("id", ctypes.c_uint16), ("home_ch", ctypes.c_uint8), ("local_tbl_ctr", ctypes.c_uint16),
-    ("nbr", CNeighbor * MC_MAX_NEIGHBORS), ("pend", CPending * MC_MAX_PENDING),
+    ("geox", ctypes.c_int16), ("geoy", ctypes.c_int16),
+    ("nbr", CNeighbor * MC_MAX_NEIGHBORS), ("hop2", C2Hop * MC_MAX_2HOP),
+    ("pend", CPending * MC_MAX_PENDING),
     ("dedup", CDedup * MC_MAX_DEDUP), ("hello_interval_us", ctypes.c_uint64),
     ("hello_jitter_us", ctypes.c_uint64),
     ("ka_idle", ctypes.c_uint8 * 3),   # keepalive counters per channel (4.1)

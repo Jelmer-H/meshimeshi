@@ -80,9 +80,12 @@ static uint64_t t_data_us(uint16_t l) { return l <= 40 ? 173000ull : l <= 150 ? 
  *   PROOF       3+2n B type, node-id(2), n x neighbour-id(2), n <= 17 (4.2).
  *                     Reactionless keepalive + symmetry flush; an empty list
  *                     is the minimal keepalive beacon (type + node-id).
- *   DATA      10+n B  type+F_ACK3_REQ, msg-id(2), source(2), destination(2),
- *                     previous-hop(2), budget(1, offset 9), payload(n)  (6.1)
+ *   DATA      11+n B  type+F_ACK3_REQ, msg-id(2), source(2), destination(2),
+ *                     previous-hop(2), next-hop(2, routing: only that node
+ *                     forwards and acks), budget(1, offset 10), payload(n)
+ *                     (6.1 + building block 2)
  *   ACK1        7 B   type, msg-id(2), source of the message(2), sender(2) (6.2)
+ *                     -- the sender is the next hop that received it
  *   ACK2        7 B   same as ACK1; F_NEG_ACK2 makes it negative       (6.2, 7.2)
  *   ACK3       14 B   DATA format, payload 4 B: the original msg-id (6.2, 11)
  *
@@ -94,6 +97,8 @@ enum {
     PKT_DATA, PKT_ACK1, PKT_ACK2, PKT_ACK3, PKT_FAIL_RPT
 };
 #define F_ACK3_REQ 0x10   /* requested by the source of the message (11) */
+#define F_NO_REPORT 0x20  /* this message is a failed-delivery report:
+                              never trigger a report of its own (10.5) */
 #define F_NEG_ACK2 0x40   /* next hop could not forward (7.2) */
 
 /* little-endian reading/writing of 16-bit fields (6.1) */
@@ -126,6 +131,17 @@ static mimeshi_neighbor *nbr_find(mimeshi_node *n, uint16_t id) {
  * RSSI leaves room for a future SNR component in the same byte. */
 static uint8_t quality_of(int8_t rssi) {
     return (uint8_t)(rssi < 0 ? (rssi + 128) >> 1 : 63);
+}
+
+/* Update the quality of a neighbour. A change of at least 2 steps
+ * (advertisement hysteresis, 4.3) is a table mutation: it moves the
+ * local table counter, so the next chunk push carries it. */
+static void nbr_set_quality(mimeshi_node *n, mimeshi_neighbor *nb, int8_t rssi) {
+    uint8_t q = quality_of(rssi);
+    int diff = (int)q - (int)nb->quality;
+    if (diff < 0) diff = -diff;
+    nb->quality = q;
+    if (diff >= 2) n->local_tbl_ctr++;
 }
 
 /* Add a neighbor (from a hello, hello-ack or proof list). Full = return 0;
@@ -307,6 +323,95 @@ static void proof_tick(mimeshi_node *n, void *ud) {
     n->timer(n, MC_KEEPALIVE_TICK_US, proof_tick, 0);
 }
 
+static mimeshi_2hop *hop2_find(mimeshi_node *n, uint16_t id);
+
+/* ---------------- table chunks (4.3) ----------------
+ * Push, no pull, no ack (4.3): every slice of the own neighbor table
+ * goes unsolicited on the own HOME channel; neighbours snoop along.
+ * Minimal slice format (building block 2): type, node-id(2), entry
+ * count(1), then per entry: neighbour-id(2), quality(1), geox(2),
+ * geoy(2) = 7 B per entry, max MC_CHUNK_ENTRIES. The receiver fills
+ * its 2-hop map (10.1): entry X heard via sender. Self-contained, no
+ * order, no version (dropped, 4.3) -- freshness travels via last_seen.
+ */
+static void chunk_send(mimeshi_node *n) {
+    uint8_t p[8 + 7 * MC_CHUNK_ENTRIES];
+    p[0] = PKT_TABLE_CHUNK; wr16(p + 1, n->id);
+    wr16(p + 3, (uint16_t)n->geox); wr16(p + 5, (uint16_t)n->geoy);  /* owner geo (4.3) */
+    uint8_t cnt = 0;
+    for (int i = 0; i < MC_MAX_NEIGHBORS && cnt < MC_CHUNK_ENTRIES; i++) {
+        mimeshi_neighbor *nb = &n->nbr[i];
+        if (!nb->alive || !nb->sym) continue;   /* only confirmed links (10.1):
+                                                   a chunk entry promises a
+                                                   usable route, and routing
+                                                   may only use confirmed
+                                                   links */
+        uint8_t *e = p + 8 + 7 * cnt;
+        wr16(e, nb->id);
+        e[2] = nb->quality;
+        wr16(e + 3, (uint16_t)nb->geox); wr16(e + 5, (uint16_t)nb->geoy);
+        cnt++;
+    }
+    p[7] = cnt;
+    n->tx(n, n->home_ch, p, (uint16_t)(8 + 7 * cnt), t_data_us((uint16_t)(8 + 7 * cnt)));
+    ka_called(n, n->home_ch);                /* own call on the home channel (4.1) */
+}
+
+static void chunk_tick(mimeshi_node *n, void *ud) {
+    (void)ud;
+    /* push only on mutation (4.3): the local table counter moved since
+     * the last push. In a stable net nothing goes on air; a newcomer or
+     * a quality change triggers exactly one slice. The cadence is the
+     * bundling window: mutations within it share one slice. */
+    if (n->chunk_ctr_last != n->local_tbl_ctr) {
+        n->chunk_ctr_last = n->local_tbl_ctr;
+        chunk_send(n);
+    }
+    n->timer(n, MC_CHUNK_PERIOD_US + (n->rand(n) % 1000000ull), chunk_tick, 0);
+}
+
+/* Process a received chunk: every entry is a 2-hop node heard via the
+ * sender (10.1). Also refreshes the sender itself (snooping, 2). */
+static void chunk_recv(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, uint16_t len) {
+    (void)ch;
+    uint16_t from = rd16(pkt + 1);
+    if (len < 8) return;
+    uint8_t cnt = pkt[7];
+    if ((uint16_t)(8 + 7 * cnt) > len) return;        /* malformed: ignore */
+    /* owner geo from the header (4.3): the position of the direct
+     * neighbour -- the only geo source for direct neighbours, because
+     * the hello carries none. */
+    int16_t ogx = (int16_t)rd16(pkt + 3), ogy = (int16_t)rd16(pkt + 5);
+    mimeshi_neighbor *snb = nbr_find(n, from);
+    if (snb) {
+        nbr_set_quality(n, snb, rssi); snb->last_seen = 0;
+        if (ogx != MC_GEO_UNKNOWN) { snb->geox = ogx; snb->geoy = ogy; }
+    }
+    for (uint8_t i = 0; i < cnt; i++) {
+        const uint8_t *e = pkt + 8 + 7 * i;
+        uint16_t x = rd16(e);
+        if (x == n->id || x == from) continue;        /* ourselves or the sender: no 2-hop entry */
+        mimeshi_2hop *h = hop2_find(n, x);
+        if (!h) {
+            for (int j = 0; j < MC_MAX_2HOP; j++)
+                if (!n->hop2[j].alive) { h = &n->hop2[j]; break; }
+        }
+        if (!h) continue;                             /* map full: entry skipped */
+        h->alive = 1; h->id = x; h->via = from;
+        h->quality = e[2];
+        h->geox = (int16_t)rd16(e + 3); h->geoy = (int16_t)rd16(e + 5);
+    }
+    /* an entry for US in the neighbour's chunk is reverse evidence
+     * (4.3): "I hear X" confirms at X, in a single reception, both
+     * directions of the link X-sender. */
+    for (uint8_t i = 0; i < cnt; i++) {
+        const uint8_t *e = pkt + 4 + 7 * i;
+        if (rd16(e) == n->id && snb) {
+            snb->sym = 1; snb->ack_try = 0; snb->proven_age_us = 0;  /* 4.3 */
+        }
+    }
+}
+
 /* Deliver a hello-ack on the HOME channel of the hello sender (2): the
  * sender is there after its round and catches all answers within the
  * response window. One exchange, then home.
@@ -386,11 +491,87 @@ static void hello_ack_wait(mimeshi_node *n, uint16_t from, int8_t rssi) {
     n->timer(n, slot + jitter, hello_ack_fire, (void *)(size_t)from);
 }
 
-/* ---------------- unicast + acks (7) ---------------- */
+/* ---------------- routing and forwarding (7, 10) ----------------
+ * Building block 2. The next hop is chosen per 10.2:
+ *  1. dst is a confirmed direct neighbour: direct hop;
+ *  2. dst is in the 2-hop map (10.1): via the neighbour that hears dst,
+ *     if that neighbour is confirmed symmetric;
+ *  3. dst outside the map but a geo known (own table or source geo in
+ *     the header): greedy — the confirmed neighbour closest to dst
+ *     that is closer than we are (10.2);
+ *  4. no neighbour closer (void): fail this attempt series — waypoint
+ *     and perimeter follow later (10.3);
+ *  5. nothing known about dst: refuse (do not flood, 10.2).
+ * Only confirmed links are used for the choice (10.1); direct replies
+ * in an exchange are exempt (4.3) and run via the normal ack path.
+ */
 
-/* Ack1: immediately, on the channel of the ongoing data exchange — the
- * sender waits there for the answer (switch rule, 2). The sender-id
- * travels along so the sender knows who has been heard. */
+/* squared distance on the geo grid (10.2); unknown geo never wins */
+static int32_t geo_dist2(int16_t ax, int16_t ay, int16_t bx, int16_t by) {
+    int32_t dx = (int32_t)ax - bx, dy = (int32_t)ay - by;
+    return dx * dx + dy * dy;
+}
+
+/* Look up a 2-hop entry: node id -> via which direct neighbour. */
+static mimeshi_2hop *hop2_find(mimeshi_node *n, uint16_t id) {
+    for (int i = 0; i < MC_MAX_2HOP; i++)
+        if (n->hop2[i].alive && n->hop2[i].id == id) return &n->hop2[i];
+    return 0;
+}
+
+/* Candidate for the next hop: quality, penalised on failures (10.4). */
+static int route_score(mimeshi_node *n, mimeshi_neighbor *nb) {
+    (void)n;
+    int q = nb->sym ? nb->quality : -1;      /* only confirmed links (10.1) */
+    return q - (nb->penalty << 3);          /* penalty weighs heavily (10.4) */
+}
+
+/* Choose the next hop toward dst (10.2). dst_geo: the destination geo if
+ * known (own map or source geo). Returns the neighbour or 0. */
+static mimeshi_neighbor *route_next(mimeshi_node *n, uint16_t dst,
+                                     int16_t dgx, int16_t dgy, mimeshi_neighbor *excl) {
+    /* 1. direct, confirmed */
+    mimeshi_neighbor *best = 0;
+    int best_score = -1;
+    for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
+        mimeshi_neighbor *nb = &n->nbr[i];
+        if (!nb->alive || nb == excl) continue;
+        if (nb->id == dst && nb->sym) return nb;
+    }
+    /* 2. two-hop via a confirmed neighbour */
+    mimeshi_2hop *h = hop2_find(n, dst);
+    if (h) {
+        mimeshi_neighbor *via = nbr_find(n, h->via);
+        if (via && via->sym && via != excl) {
+            best = via; best_score = route_score(n, via) + 64;   /* 2-hop wins over greedy */
+        }
+    }
+    /* 3. greedy on geo (10.2): the confirmed neighbour closest to dst */
+    if (dgx != MC_GEO_UNKNOWN && n->geox != MC_GEO_UNKNOWN) {
+        int32_t own = geo_dist2(n->geox, n->geoy, dgx, dgy);
+        for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
+            mimeshi_neighbor *nb = &n->nbr[i];
+            if (!nb->alive || !nb->sym || nb == excl) continue;
+            if (nb->geox == MC_GEO_UNKNOWN) continue;
+            if (geo_dist2(nb->geox, nb->geoy, dgx, dgy) >= own) continue;  /* not closer: void guard */
+            int s = route_score(n, nb);
+            if (s > best_score) { best_score = s; best = nb; }
+        }
+    }
+    return best;                              /* 0 = void or unknown (10.2/10.3) */
+}
+
+/* destination geo for dst: the 2-hop map first, then the direct table */
+static void route_dst_geo(mimeshi_node *n, uint16_t dst, int16_t *gx, int16_t *gy) {
+    mimeshi_2hop *h = hop2_find(n, dst);
+    if (h && h->geox != MC_GEO_UNKNOWN) { *gx = h->geox; *gy = h->geoy; return; }
+    mimeshi_neighbor *nb = nbr_find(n, dst);
+    if (nb && nb->geox != MC_GEO_UNKNOWN) { *gx = nb->geox; *gy = nb->geoy; return; }
+    *gx = MC_GEO_UNKNOWN; *gy = MC_GEO_UNKNOWN;
+}
+
+/* Ack1: immediately, on the channel of the ongoing data exchange --
+ * the sender waits there for the answer (switch rule, 2). */
 static void ack1_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint8_t ch) {
     uint8_t p[7] = { PKT_ACK1, 0,0, 0,0, 0,0 };
     wr16(p + 1, msg_id); wr16(p + 3, src); wr16(p + 5, n->id);
@@ -399,9 +580,9 @@ static void ack1_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint8_t ch
 }
 
 /* Ack2 to the previous hop, on ITS home channel (2, 7.1): the previous
- * hop listens there without its own window. Positive = received (not
- * necessarily forwarded, 7.2); negative = forwarding failed, via
- * F_NEG_ACK2. */
+ * hop listens there without its own window. Positive = the message has
+ * come two hops (received, not necessarily forwarded, 7.2); negative =
+ * forwarding failed, via F_NEG_ACK2. */
 static void ack2_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint16_t prev, bool neg) {
     uint8_t p[7] = { (uint8_t)(PKT_ACK2 | (neg ? F_NEG_ACK2 : 0)), 0,0, 0,0, 0,0 };
     wr16(p + 1, msg_id); wr16(p + 3, src); wr16(p + 5, n->id);
@@ -410,81 +591,142 @@ static void ack2_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint16_t p
 }
 
 static void pending_try(mimeshi_node *n, mimeshi_pending *p);
+static void record_fail(mimeshi_node *n, mimeshi_pending *p);
+static void pending_retry_timer(mimeshi_node *n, void *ud);
+static int send_data_internal(mimeshi_node *n, uint16_t dst, const uint8_t *payload,
+                              uint16_t len, bool ack3, uint8_t no_report);
 
-/* Ack1 stayed out (7.3/7.4). structure of the retries:
- *  - tries_left > 0:  next attempt toward THE SAME next hop,
- *                      tries and budget decrease by 1 per attempt;
- *  - tries exhausted: new attempt series (toward a different neighbor,
- *                      as soon as routing exists — 10.2), budget first
- *                      checks whether there is still room;
- *  - budget exhausted: drop the message. The real failed delivery
- *                      report (10.5, routed message to the source) comes
- *                      with building block 2; for now only the message
- *                      on stdout. */
+/* Failed delivery report (10.5): a routed message back to the source,
+ * flagged so it never triggers a report of its own. Payload: msg-id,
+ * reporter, cause. Routed like normal data with half the budget. */
+enum { MC_FAIL_NOACK1 = 1, MC_FAIL_VOID = 2, MC_FAIL_NEGACK2 = 3 };
+static void fail_report(mimeshi_node *n, uint16_t orig_msg, uint16_t orig_src) {
+    if (orig_src == n->id) return;           /* we are the source: it stays here */
+    uint8_t rpt[6];
+    wr16(rpt, orig_msg); wr16(rpt + 2, n->id); rpt[4] = MC_FAIL_NOACK1; rpt[5] = 0;
+    int rc = send_data_internal(n, orig_src, rpt, 5, false, 1);
+    (void)rc;
+    printf("[core] node %u: FAIL-RPT for msg %u back to %u (rc=%d)\n",
+           n->id, orig_msg, orig_src, rc);
+}
+
+/* Ack1 timeout (7.3/7.4). Retry structure per hop:
+ *  - tries_left > 0: next attempt toward the SAME neighbour (7.4: two
+ *    attempts per neighbour, random wait in between);
+ *  - attempts toward this neighbour exhausted: next neighbour in the
+ *    series (max MC_MAX_ROUTE_NBR per hop, 7.4);
+ *  - series exhausted or no route: the record fails. Forwarding
+ *    records send a negative ack2 to the previous hop (7.2) and --
+ *    unless the message itself is a report -- a failed delivery report
+ *    to the source (10.5). Own records only report. */
 static void ack1_timeout(mimeshi_node *n, void *ud) {
     mimeshi_pending *p = (mimeshi_pending *)ud;
-    if (!p->active) return;
+    if (!p->active || p->state != 0) return;
+    mimeshi_neighbor *nb = nbr_find(n, p->next_hop);
+    if (nb && nb->penalty < 255) nb->penalty++;               /* 10.4 */
     if (p->tries_left > 0) {
         p->tries_left--; p->budget_left--;
-        pending_try(n, p);
-    } else {
-        p->tries_left = MC_RETRY_TX;      /* next attempt series */
-        if (p->budget_left == 0) {
-            p->active = 0;
-            printf("[core] node %u: FAIL msg %u (budget exhausted, no ack1)\n", n->id, p->msg_id);
-        } else {
+        if (p->budget_left == 0) { record_fail(n, p); return; }
+        n->timer(n, (n->rand(n) % 500000ull) + 100000ull, pending_retry_timer, p);  /* wait > airtime (7.4) */
+        return;
+    }
+    /* neighbour exhausted: next neighbour in the series (7.4) */
+    if (p->series + 1 < MC_MAX_ROUTE_NBR) {
+        p->series++;
+        p->tries_left = MC_RETRY_TX;
+        mimeshi_neighbor *excl = nbr_find(n, p->next_hop);
+        int16_t dgx, dgy;
+        if (p->dst_geox == MC_GEO_UNKNOWN) route_dst_geo(n, p->dst, &dgx, &dgy);
+        else { dgx = p->dst_geox; dgy = p->dst_geoy; }
+        mimeshi_neighbor *nx = route_next(n, p->dst, dgx, dgy, excl);
+        if (nx) {
+            p->next_hop = nx->id;
             p->budget_left--;
-            pending_try(n, p);            /* neighbor choice: real core ETX-driven (10.2) */
+            if (p->budget_left == 0) { record_fail(n, p); return; }
+            pending_try(n, p);
+            return;
         }
     }
+    record_fail(n, p);
+}
+
+/* The record has definitively failed (all neighbours/budget). */
+static void record_fail(mimeshi_node *n, mimeshi_pending *p) {
+    p->active = 0;
+    printf("[core] node %u: FAIL msg %u toward %u\n", n->id, p->msg_id, p->next_hop);
+    if (p->fwd) {
+        ack2_send(n, p->msg_id, p->src, p->prev_hop, true);    /* negative ack2 (7.2) */
+        if (!p->no_report) fail_report(n, p->msg_id, p->src);  /* 10.5 */
+    } else if (!p->no_report) {
+        fail_report(n, p->msg_id, p->src);
+    }
+}
+
+/* Ack2 timeout at the sender (7.3): T_ack2 after the ack1, the record
+ * ends -- positive ack2 has not come. The hop counts as succeeded (the
+ * next hop DID receive it), the deeper chain is now the responsibility
+ * of the next hop (7.2). */
+static void ack2_timeout(mimeshi_node *n, void *ud) {
+    mimeshi_pending *p = (mimeshi_pending *)ud;
+    if (!p->active) return;
+    p->active = 0;
+    printf("[core] node %u: ack2 window expired for msg %u (hop done)\n", n->id, p->msg_id);
+}
+
+static void pending_retry_timer(mimeshi_node *n, void *ud) {
+    pending_try(n, (mimeshi_pending *)ud);
 }
 
 /* One transmit attempt: update the budget in the header (offset 9,
  * 6.1/9), the exchange toward next_hop, and schedule the ack1 timeout.
- * The timeout is (7.3) S + t_data + t_ack + margin, measured from the
- * moment of submission. Assumption: the platform layer delivers the
- * transmission quickly (queue short); if the switch takes longer, the
- * timeout fires too early and the attempt counts as failed. */
+ * The timeout is (7.3) S + t_data + t_ack + margin. */
 static void pending_try(mimeshi_node *n, mimeshi_pending *p) {
-    p->pkt[9] = p->budget_left;
+    p->pkt[10] = p->budget_left;
+    wr16(p->pkt + 7, n->id);            /* previous hop: we (6.1) */
+    wr16(p->pkt + 8, p->next_hop);       /* next hop: only that node forwards/acks */
     bound_send(n, (uint8_t)(p->next_hop % MC_N_CHANNELS), p->pkt, p->pkt_len, t_data_us(p->pkt_len));
     ka_called(n, (uint8_t)(p->next_hop % MC_N_CHANNELS));   /* data as prev_hop (4.1) */
     n->timer(n, MC_S_SWITCH_US + t_data_us(p->pkt_len) + t_ack_us() + MC_ACK1_MARGIN_US, ack1_timeout, p);
 }
 
-/* Submit a unicast. Return codes (core.h): 0 = accepted, -1 =
- * destination not in the neighbor table (10.2: do not flood, wait until
- * the map knows it), -2 = no free pending slot, -3 = payload too large.
- * Building block 1 chooses the destination itself as next hop (direct
- * neighbor); from building block 2 a router here chooses the best hop
- * on the 2-hop map.
- *
- * One-direction proof: every neighbor table entry originated from a
- * reception (hello or hello-ack) and therefore only proves the
- * direction neighbor->us. The opposite direction (us->neighbor) is only
- * proven by the neighbor itself: via its tablepull (4.3) or via a
- * successful unicast with ack1. Routing (building block 2, 10.1) must
- * demand that confirmation before forwarding; until then this direct
- * sending is bounded by retries+budget and fails visibly on the ack1
- * timeout. */
-int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uint16_t len, bool ack3) {
-    if (!nbr_find(n, dst)) return -1;          /* not in the map: do not flood (10.2) */
+/* Submit a unicast (own message). Return codes: see core.h. The route
+ * is chosen per 10.2 at every hop, also at the source; the header can
+ * carry the source geo (6.1) so intermediate hops can route greedily
+ * even when the source is outside their map. */
+static int send_data_internal(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uint16_t len, bool ack3, uint8_t no_report) {
     if (len > MC_MAX_PAYLOAD) return -3;
+    int16_t dgx, dgy;
+    route_dst_geo(n, dst, &dgx, &dgy);
+    mimeshi_neighbor *nx = route_next(n, dst, dgx, dgy, 0);
+    if (!nx) {
+        if (dgx == MC_GEO_UNKNOWN && !hop2_find(n, dst)) return -1;  /* unknown: do not flood (10.2) */
+        /* geo known but void (10.3): refused here, waypoint/perimeter follow later */
+        return -1;
+    }
     mimeshi_pending *p = 0;
     for (int i = 0; i < MC_MAX_PENDING; i++) if (!n->pend[i].active) { p = &n->pend[i]; break; }
     if (!p) return -2;
     memset(p, 0, sizeof(*p));
-    p->active = 1; p->tries_left = MC_RETRY_TX; p->budget_left = MC_BUDGET_INIT;
+    p->active = 1; p->state = 0; p->tries_left = MC_RETRY_TX; p->series = 0;
+    p->budget_left = MC_BUDGET_INIT;
     p->msg_id = (uint16_t)n->rand(n);
-    p->src = n->id; p->dst = dst; p->prev_hop = n->id; p->next_hop = dst;
+    p->src = n->id; p->dst = dst; p->prev_hop = n->id; p->next_hop = nx->id;
+    p->no_report = no_report;
+    p->dst_geox = dgx; p->dst_geoy = dgy;
     uint8_t *k = p->pkt;
-    k[0] = (uint8_t)(PKT_DATA | (ack3 ? F_ACK3_REQ : 0));
+    k[0] = (uint8_t)(PKT_DATA | (ack3 ? F_ACK3_REQ : 0)
+                     | (no_report ? F_NO_REPORT : 0));
     wr16(k + 1, p->msg_id); wr16(k + 3, n->id); wr16(k + 5, dst); wr16(k + 7, n->id);
-    k[9] = p->budget_left;                 /* header: budget at offset 9 (section 6.1) */
-    memcpy(k + 10, payload, len);
-    p->pkt_len = (uint16_t)(10 + len);
+    k[10] = p->budget_left;                /* header: budget at offset 10 */
+    wr16(k + 8, nx->id);                   /* next hop: only that node forwards/acks */
+    memcpy(k + 11, payload, len);
+    p->pkt_len = (uint16_t)(11 + len);
     pending_try(n, p);
     return 0;
+}
+
+int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uint16_t len, bool ack3) {
+    return send_data_internal(n, dst, payload, len, ack3, 0);
 }
 
 /* ---------------- reception (platform -> core) ----------------
@@ -506,7 +748,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         if (!nb) nb = nbr_add(n, from);
         if (nb) {
             nb->last_seen = 0;
-            nb->quality = quality_of(rssi);
+            nbr_set_quality(n, nb, rssi);
             nb->proven_age_us = 0;      /* fresh reception: reverse direction freshly measured */
         }
         hello_ack_wait(n, from, rssi);
@@ -530,7 +772,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         if (!nb) nb = nbr_add(n, from);
         if (nb) {
             nb->last_seen = 0;
-            nb->quality = quality_of(rssi);
+            nbr_set_quality(n, nb, rssi);
             nb->proven_age_us = 0;      /* fresh reception of an identifying transmission */
             if (dst == n->id) { nb->sym = 1; nb->ack_try = 0; }   /* confirmed symmetric (4.2) */
         }
@@ -551,7 +793,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         if (!nb) nb = nbr_add(n, from);
         if (nb) {
             nb->last_seen = 0;
-            nb->quality = quality_of(rssi);
+            nbr_set_quality(n, nb, rssi);
         }
         /* appearing in the list = reverse evidence refreshed (4.2) */
         for (uint16_t i = 0; i < ids; i++) {
@@ -562,65 +804,153 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         break;
     }
     case PKT_ACK1: {
-        /* our own outstanding transmission has arrived at the next hop:
-         * free the pending record. The hop is done; ack2 arrives on its
-         * own on our home channel (7.1). Matching on msg-id suffices in
-         * building block 1 (ids are random per transmission); with
-         * routing added, the source should be counted along.
+        /* our own outstanding transmission has arrived at the next hop
+         * (7.1). The record stays active in state 1: the ack2 window
+         * (7.3) now runs -- a positive ack2 closes the hop, the window
+         * expiring also closes it (the next hop did receive it, 7.2).
          *
          * The sender of this ack1 received our message AND its ack
-         * reached us: the link is hereby proven symmetric (4.2). This
-         * is the first exact symmetry proof the core knows; the second
-         * is the tablepull of the neighbor (4.3, building block 2). A
-         * hello-ack proves no symmetry — unaddressed on a shared home
-         * channel. */
+         * reached us: the link is hereby proven symmetric (4.2, 10.1).
+         * Success decays the penalty (10.4). */
         uint16_t msg_id = rd16(pkt + 1);
         for (int i = 0; i < MC_MAX_PENDING; i++) {
             mimeshi_pending *p = &n->pend[i];
-            if (p->active && p->msg_id == msg_id) {
-                p->active = 0;                     /* hop succeeded; ack2 arrives on its own on our home channel */
+            if (p->active && p->state == 0 && p->msg_id == msg_id) {
+                p->state = 1;                          /* ack1 done: ack2 window (7.3) */
+                n->timer(n, MC_T_ACK2_US, ack2_timeout, p);
                 mimeshi_neighbor *nb = nbr_find(n, rd16(pkt + 5));
-                if (nb) { nb->sym = 1; nb->ack_try = 0; nb->proven_age_us = 0; }  /* confirmed symmetric (4.2, 10.1) */
-                printf("[core] node %u: ACK1 for msg %u\n", n->id, msg_id);
+                if (nb) {
+                    nb->sym = 1; nb->ack_try = 0; nb->proven_age_us = 0;
+                    if (nb->penalty > 0) nb->penalty--;               /* 10.4 */
+                }
+                printf("[core] node %u: ACK1 for msg %u (ack2 window up)\n", n->id, msg_id);
                 return;
             }
         }
         break;
     }
     case PKT_ACK2: {
-        /* confirmation of the next hop toward the previous one (7.2).
-         * For now only visible; the T_ack2 window and the pending
-         * handling on the sender (7.3) belong to building block 2. */
+        /* reply of the next hop toward the previous hop (7.2).
+         *  - Positive: the message has come two hops; the record at the
+         *    sender closes (7.1).
+         *  - Negative: the next hop could not forward. The sender
+         *    immediately tries the next neighbour in the series,
+         *    without waiting (7.4). */
+        uint16_t msg_id = rd16(pkt + 1);
+        bool neg = (flags & F_NEG_ACK2) != 0;
         printf("[core] node %u: ACK2 %s for msg %u\n", n->id,
-               (flags & F_NEG_ACK2) ? "NEGATIVE" : "positive", rd16(pkt + 1));
+               neg ? "NEGATIVE" : "positive", msg_id);
+        for (int i = 0; i < MC_MAX_PENDING; i++) {
+            mimeshi_pending *p = &n->pend[i];
+            if (p->active && p->state == 1 && p->msg_id == msg_id) {
+                p->active = 0;                          /* positive: hop done */
+                if (!neg) return;
+                /* negative: next neighbour, immediately (7.4) */
+                p->active = 1; p->state = 0;
+                p->tries_left = MC_RETRY_TX;
+                if (p->series + 1 < MC_MAX_ROUTE_NBR) p->series++;
+                mimeshi_neighbor *excl = nbr_find(n, p->next_hop);
+                int16_t dgx, dgy;
+                if (p->dst_geox == MC_GEO_UNKNOWN) route_dst_geo(n, p->dst, &dgx, &dgy);
+                else { dgx = p->dst_geox; dgy = p->dst_geoy; }
+                mimeshi_neighbor *nx = route_next(n, p->dst, dgx, dgy, excl);
+                if (nx && p->budget_left > 0) {
+                    p->next_hop = nx->id;
+                    p->budget_left--;
+                    pending_try(n, p);
+                } else {
+                    record_fail(n, p);
+                }
+                return;
+            }
+        }
         break;
     }
     case PKT_ACK3: {
-        /* final destination has had the message delivered (11): routed
-         * back to the source, here still without routing logic. */
-        printf("[core] node %u: ACK3 — delivered at destination\n", n->id);
+        /* the final destination has delivered the message to its client
+         * (11): routed back to the source. Until clients exist, the
+         * ack3 is visibility only. */
+        printf("[core] node %u: ACK3 - delivered at destination\n", n->id);
+        break;
+    }
+    case PKT_TABLE_CHUNK: {
+        chunk_recv(n, ch, rssi, pkt, len);
         break;
     }
     case PKT_DATA: {
         uint16_t msg_id = rd16(pkt + 1), src = rd16(pkt + 3), dst = rd16(pkt + 5), prev = rd16(pkt + 7);
-        if (dst != n->id) return;                  /* forwarding: next building block */
+        uint16_t nhop = rd16(pkt + 8);
         /* dedup before the acks: a retry of the same hop must not
          * yield ack1/ack2/ack3 again. */
         if (!dedup_fresh(n, msg_id, src)) return;
-        printf("[core] node %u: DATA from %u: '%.*s'\n", n->id, src, (int)(len - 10), (const char *)(pkt + 10));
-        ack1_send(n, msg_id, src, ch);             /* same channel */
-        ack2_send(n, msg_id, src, prev, false);    /* home channel previous hop */
-        if (flags & F_ACK3_REQ) {
-            /* ack3 as a routed message (6.2): DATA format, payload = the
-             * original msg-id (4 B incl. reservation), back toward the
-             * previous hop — until there is real routing (building
-             * block 2). */
-            uint8_t a[14] = { PKT_ACK3, 0,0, 0,0, 0,0, 0,0, 0, 0,0, 0,0 };
-            wr16(a + 1, (uint16_t)n->rand(n)); wr16(a + 3, n->id);
-            wr16(a + 5, src); wr16(a + 7, n->id); a[9] = MC_BUDGET_INIT; wr16(a + 10, msg_id);
-            bound_send(n, (uint8_t)(prev % MC_N_CHANNELS), a, 14, t_data_us(14));
-            ka_called(n, (uint8_t)(prev % MC_N_CHANNELS));   /* own call (4.1) */
+        /* snooping (2): the sender of the data is a direct neighbour
+         * candidate -- quality and liveness, never symmetry. */
+        mimeshi_neighbor *snb = nbr_find(n, prev);
+        if (snb) { nbr_set_quality(n, snb, rssi); snb->last_seen = 0; }
+        if (nhop != n->id) {
+            /* not addressed to us: the exchange runs between prev and
+             * nhop. Overhearing yields liveness/quality only (2);
+             * forwarding would duplicate the message at every listener. */
+            break;
         }
+        if (dst == n->id) {
+            /* final destination: ack1 on the exchange channel, ack2
+             * positive to the previous hop (7.1), optionally ack3 back
+             * to the source (11). */
+            printf("[core] node %u: DATA from %u: '%.*s'\n", n->id, src, (int)(len - 11), (const char *)(pkt + 11));
+            ack1_send(n, msg_id, src, ch);             /* same channel */
+            ack2_send(n, msg_id, src, prev, false);   /* positive: home channel of previous hop */
+            if (flags & F_ACK3_REQ) {
+                /* ack3 as a routed message (6.2): DATA format, payload
+                 * = the original msg-id, routed back to the source. */
+                uint8_t a[15] = { PKT_ACK3 };
+                wr16(a + 1, (uint16_t)n->rand(n)); wr16(a + 3, n->id);
+                wr16(a + 5, src); wr16(a + 7, n->id);
+                a[10] = MC_BUDGET_INIT; wr16(a + 11, msg_id);
+                int rc2 = send_data_internal(n, src, a + 11, 4, false, 1);
+                if (rc2 != 0)
+                    printf("[core] node %u: ack3 for msg %u not submittable (rc=%d)\n", n->id, msg_id, rc2);
+            }
+            break;
+        }
+        /* forwarding (7.1): we are an intermediate hop. ack1 goes back
+         * on the exchange channel, then the message is routed further
+         * per 10.2 -- the same choice as at the source. The pending
+         * record carries fwd=1: on failure a negative ack2 goes to
+         * prev_hop (7.2) and a failed delivery report to the source
+         * (10.5), unless this message IS a report (no_report). */
+        ack1_send(n, msg_id, src, ch);
+        int16_t dgx, dgy;
+        route_dst_geo(n, dst, &dgx, &dgy);
+        mimeshi_neighbor *nx = route_next(n, dst, dgx, dgy, nbr_find(n, prev));
+        if (!nx) {
+            /* no route from here (void or unknown, 10.2/10.3): negative
+             * ack2 immediately; the previous hop re-routes. */
+            ack2_send(n, msg_id, src, prev, true);
+            printf("[core] node %u: no route for msg %u toward %u: negative ack2\n", n->id, msg_id, dst);
+            break;
+        }
+        mimeshi_pending *p = 0;
+        for (int i = 0; i < MC_MAX_PENDING; i++) if (!n->pend[i].active) { p = &n->pend[i]; break; }
+        if (!p) {
+            ack2_send(n, msg_id, src, prev, true);      /* no slot: refuse the hop */
+            break;
+        }
+        memset(p, 0, sizeof(*p));
+        p->active = 1; p->state = 0; p->fwd = 1;
+        p->no_report = (flags & F_NO_REPORT) ? 1 : 0;   /* reports never report (10.5) */
+        p->tries_left = MC_RETRY_TX; p->series = 0;
+        p->budget_left = pkt[10];                      /* budget from the header (10) */
+        if (p->budget_left > 8) p->budget_left = 8;    /* half of the standard: the way back must stay possible */
+        p->msg_id = msg_id; p->src = src; p->dst = dst;
+        p->prev_hop = prev; p->next_hop = nx->id;
+        p->dst_geox = dgx; p->dst_geoy = dgy;
+        memcpy(p->pkt, pkt, len);                      /* the message itself is not stored, only the
+                                                          header copy for the next hop (7.2) */
+        p->pkt_len = len;
+        printf("[core] node %u: FWD msg %u from %u via %u toward %u\n",
+               n->id, msg_id, src, nx->id, dst);
+        pending_try(n, p);
         break;
     }
     default: break;
@@ -662,4 +992,6 @@ void mimeshi_start(mimeshi_node *n) {
     n->timer(n, n->hello_interval_us + hello_jitter(n), hello_tick, 0);
     /* proof tick: time base for keepalive + symmetry flush (4.1, 4.2) */
     n->timer(n, MC_KEEPALIVE_TICK_US, proof_tick, 0);
+    /* table chunks: push the own table on the home channel (4.3) */
+    n->timer(n, MC_CHUNK_PERIOD_US / 2 + (n->rand(n) % 1000000ull), chunk_tick, 0);
 }
