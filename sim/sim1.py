@@ -24,8 +24,9 @@ Measurements: airtime per channel, home-deafness per node, delivery outcome.
 import argparse, ctypes, heapq, math, os, random, sys
 from collections import deque
 
-T_HELLO = 70_000          # us, SF7/62.5k/CR4_5
-T_ACK   = 78_000
+T_HELLO = 62_000          # us, hello 3 B (6.3)
+T_HACK  = 70_000          # hello-ack 5 B (6.2)
+T_ACK   = 78_000          # ack1/ack2 7 B (6.2)
 T_DATA  = lambda l: 173_000 if l <= 40 else 459_000 if l <= 150 else 869_000
 S_SWITCH = 5_000          # channel switch incl. settling (design 14.1)
 ACK1_MARGIN = 80_000      # margin on the ack1 wait time, equal to core.c
@@ -153,6 +154,7 @@ class Radio:  # virtual radio + clock
         self.airtime = [0]*N_CH
         self.hello_air = [0]*N_CH   # airtime of hellos (type 1) per channel
         self.ack_air = [0]*N_CH     # airtime of hello-acks (type 2) per channel
+        self.proof_air = [0]*N_CH   # airtime of proof lists (type 3) per channel
         self.duty = DutyLedger()
         self.wire = Wire()
         self.seq = 0
@@ -175,6 +177,7 @@ class Radio:  # virtual radio + clock
         ptype = pkt[0] & 0x0F
         if ptype == 1: self.hello_air[ch] += airtime
         elif ptype == 2: self.ack_air[ch] += airtime
+        elif ptype == 3: self.proof_air[ch] += airtime
         self.duty.add(node.id, ch, self.now, airtime)
         self.wire.begin(self.now, ch, node.id, airtime)
         for r in self.nodes.values():
@@ -308,7 +311,7 @@ MC_MAX_NEIGHBORS, MC_MAX_PENDING, MC_MAX_DEDUP, MC_MAX_PAYLOAD = 64, 16, 128, 23
 class CNeighbor(ctypes.Structure):
     _fields_ = [("id", ctypes.c_uint16), ("quality", ctypes.c_uint8),
                 ("ack_try", ctypes.c_uint8), ("last_seen", ctypes.c_uint32),
-                ("state_ver", ctypes.c_uint16), ("alive", ctypes.c_uint8),
+                ("proven_age_us", ctypes.c_uint64), ("alive", ctypes.c_uint8),
                 ("sym", ctypes.c_uint8)]
 
 class CPending(ctypes.Structure):
@@ -335,11 +338,12 @@ SWITCH_FN = ctypes.CFUNCTYPE(None, ctypes.POINTER(CNode), ctypes.c_uint8, ctypes
 RAND_FN = ctypes.CFUNCTYPE(ctypes.c_uint32, ctypes.POINTER(CNode))
 
 CNode._fields_ = [
-    ("id", ctypes.c_uint16), ("home_ch", ctypes.c_uint8), ("my_state_ver", ctypes.c_uint16),
+    ("id", ctypes.c_uint16), ("home_ch", ctypes.c_uint8), ("local_tbl_ctr", ctypes.c_uint16),
     ("nbr", CNeighbor * MC_MAX_NEIGHBORS), ("pend", CPending * MC_MAX_PENDING),
     ("dedup", CDedup * MC_MAX_DEDUP), ("hello_interval_us", ctypes.c_uint64),
     ("hello_jitter_us", ctypes.c_uint64),
     ("ka_idle", ctypes.c_uint8 * 3),   # keepalive counters per channel (4.1)
+    ("proof_wait", ctypes.c_uint8 * 3),  # flush countdown per channel (4.2)
     ("tx", TX_FN), ("timer", TIMER_FN), ("switch_ch", SWITCH_FN), ("rand", RAND_FN),
     ("user", ctypes.c_void_p),
 ]

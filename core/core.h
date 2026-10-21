@@ -23,21 +23,28 @@
 #define MC_MAX_PENDING   16
 #define MC_MAX_DEDUP    128
 #define MC_MAX_PAYLOAD  230
+#define MC_T_SYM_US      21600000000ull  /* 6 h: validity of confirmed symmetry (4.2) */
+#define MC_SYM_MARGIN_US  7200000000ull  /* 2 h flush margin (4.2) */
 
 /* ---------------- internal types (visible for fixed allocation) ---- */
 typedef struct {
     uint16_t id;
-    uint8_t  quality;      /* derived from RSSI, updated per hello/ack */
+    uint8_t  quality;      /* derived from RSSI, updated per hello/proof list */
     uint8_t  ack_try;      /* counter per neighbor (4.1): every identifying
                               transmission of the neighbor counts; ack
                               attempts at counter values 1, 2, 4, 8, 16,
                               then on average 1 in 16; reset on
                               confirmation or renewed contact */
     uint32_t last_seen;
-    uint16_t state_ver;    /* last seen state version of this neighbor (4.3) */
+    uint64_t proven_age_us;  /* age of the reverse-direction evidence
+                               ("last proven", 4.2): refreshed on a hello-ack
+                               addressed to us, a proof list in which we
+                               appear, an ack1 on our data; aged in the
+                               proof tick; >= T_sym - margin = flush */
     uint8_t  alive;
-    uint8_t  sym;           /* 1 = confirmed symmetric (successful unicast
-                               with ack1 or tablepull from the neighbor);
+    uint8_t  sym;           /* 1 = confirmed symmetric (hello-ack addressed
+                               to us, proof list in which we appear, ack1
+                               on our data, or table chunk naming us);
                                0 = only seen, one direction (4.2, 10.1) */
 } mimeshi_neighbor;
 
@@ -66,7 +73,9 @@ typedef uint32_t (*mimeshi_rand_fn)(mimeshi_node *n);
 struct mimeshi_node {
     uint16_t id;
     uint8_t  home_ch;                 /* id % MC_N_CHANNELS */
-    uint16_t my_state_ver;
+    uint16_t local_tbl_ctr;           /* internal table counter (glossary):
+                                         drives push-window bundling (4.3);
+                                         never transmitted */
     mimeshi_neighbor nbr[MC_MAX_NEIGHBORS];
     mimeshi_pending  pend[MC_MAX_PENDING];
     mimeshi_dedup    dedup[MC_MAX_DEDUP];
@@ -78,8 +87,13 @@ struct mimeshi_node {
                                          keepalive ticks (4.1): every own
                                          identifying transmission on channel c
                                          sets it to 0; after 64 ticks
-                                         (= T_keepalive, core.c) of silence
-                                         exactly one hello follows on c */
+                                         (= T_keepalive, core.c) of silence the
+                                         next proof list on c is pulled
+                                         forward (4.2) */
+    uint8_t  proof_wait[MC_N_CHANNELS];/* countdown to the flush moment
+                                         per channel (4.2), staggered 20
+                                         min apart; restarts at 1 h on
+                                         every fire: the hourly cap */
     mimeshi_tx_fn     tx;
     mimeshi_timer_fn  timer;
     mimeshi_switch_fn switch_ch;
@@ -93,8 +107,9 @@ void mimeshi_init(mimeshi_node *n, uint16_t id, mimeshi_tx_fn tx, mimeshi_timer_
                 mimeshi_switch_fn sw, mimeshi_rand_fn rnd, void *user);
 
 /* First hello round immediately, then startup rounds with random phase
- * (jitter); after the startup phase the hello only survives as
- * per-channel keepalive (4.1). */
+ * (jitter). After the startup phase the hello no longer exists:
+ * channel liveness is carried by traffic plus the proof list with the
+ * keepalive role (4.1, 4.2). */
 void mimeshi_start(mimeshi_node *n);
 
 /* Unicast to dst. 0 = accepted, -1 = dst not in the map (no flood),

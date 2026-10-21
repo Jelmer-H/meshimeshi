@@ -5,8 +5,8 @@ Protocol core in C for repeaters/companions + Python simulator. See
 
 ## Status (Oct 2026)
 
-- **Building block 1 complete**: hello (adaptive startup rounds + jitter,
-  then per-channel keepalive), directional hello-acks
+- **Building block 1 complete**: hello (adaptive startup rounds + jitter;
+  after the startup phase the hello no longer exists), directional hello-acks
   with snooping, symmetry status per neighbor (seen/confirmed), unicast
   with ack1/2/3, retries, budget, collision and capture model, GPS/height
   link budget.
