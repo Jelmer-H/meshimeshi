@@ -7,27 +7,31 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
-# Strenge kern: de protocolkern moet zonder waarschuwingen bouwen.
+# Strict core: the protocol core must build without warnings.
 add_compile_options(-Wall -Wextra -Werror)
 
-# ---- protocolkern als gedeelde bibliotheek ---------------------------------
-# De simulator (sim/sim1.py) roept deze aan via ctypes; firmware-platforms
-# linken dezelfde bron statisch. Geen dynamische allocatie in de kern (13b).
+# ---- protocol core as shared library ---------------------------------
+# The simulator (sim/sim1.py) calls this via ctypes; firmware platforms
+# link the same source statically. No dynamic allocation in the core (13b).
 add_library(mimeshi_shared SHARED core/core.c core/core.h)
 set_target_properties(mimeshi_shared PROPERTIES OUTPUT_NAME mimeshi)
 target_include_directories(mimeshi_shared PUBLIC ${CMAKE_SOURCE_DIR})
 
-# Statische variant voor firmware-builds.
+# Static variant for firmware builds.
 add_library(mimeshi_static STATIC core/core.c core/core.h)
 target_include_directories(mimeshi_static PUBLIC ${CMAKE_SOURCE_DIR})
 
-# ---- testprogramma's -------------------------------------------------------
-# Scenario 1 op de C-kern zelf (zonder Python):Compileer en draai met
+# ---- test programs ---------------------------------------------------------
+# Scenario 1 on the C core itself (without Python). Compile and run with
 #   ctest --test-dir build
 enable_testing()
-add_executable(test_koppeltest tests/test_koppeltest.c)
-target_link_libraries(test_koppeltest mimeshi_static)
-add_test(NAME koppeltest COMMAND test_koppeltest)
+add_executable(test_link_test tests/test_link_test.c)
+# Asserts are the actual test checks: keep them active even in
+# RelWithDebInfo (NDEBUG would compile them away and the test would
+# assert nothing).
+target_compile_options(test_link_test PRIVATE -UNDEBUG)
+target_link_libraries(test_link_test mimeshi_static)
+add_test(NAME link_test COMMAND test_link_test)
 
-# ---- platformlagen (stubs; per platform alleen de hardware-interface) -----
+# ---- platform layers (stubs; per platform only the hardware interface) ----
 add_subdirectory(platform/host)

@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
-sim1.py — Meshimeshi simulator, scenario 1 (koppeltest: 2 nodes).
+sim1.py — Meshimeshi simulator, scenario 1 (link test: 2 nodes).
 
-Architectuur (ontwerp 14.1): event-gestuurde discrete simulatie; de protocolkern
-is C en wordt via ctypes aangeroepen (default build/libmimeshi.so, gemaakt met
+Architecture (design 14.1): event-driven discrete simulation; the protocol
+core is C and is called via ctypes (default build/libmimeshi.so, built with
   gcc -O2 -fPIC -shared core/core.c -o build/libmimeshi.so).
-De C-kern is de enige protocolimplementatie (ontwerp 13b): dit bestand is
-uitsluitend platformlaag — klok, radio, RNG — en bevat geen protocollogica.
-De simulator op simpy (meshsim.py) hergebruikt Node/Wire/CCCore hier.
+The C core is the only protocol implementation (design 13b): this file is
+exclusively platform layer — clock, radio, RNG — and contains no protocol
+logic. The simpy-based simulator (meshsim.py) reuses Node/Wire/CCCore here.
 
-Radiomodel (wisselregel, ontwerp 2):
-- Elke node heeft EEN radio. Wisselverzoeken worden per node geserialiseerd
-  (FIFO); een zending start pas als de radio vrij is.
-- Een exchange = wissel (S) + zending (airtime) + eventueel
-  ack1-venster (data op een vreemd kanaal), daarna automatisch terug naar het
-  thuiskanaal. De zending die bij een wissel hoort volgt direct op de wissel.
-- Een node hoort een pakket alleen op zijn huidige kanaal, en niet terwijl
-  hij zelf aan het wisselen of zenden is.
+Radio model (switch rule, design 2):
+- Every node has ONE radio. Switch requests are serialized per node
+  (FIFO); a transmission only starts when the radio is free.
+- An exchange = switch (S) + transmission (airtime) + optionally the
+  ack1 window (data on a foreign channel), then automatically back to
+  the home channel. The transmission belonging to a switch follows
+  directly after the switch.
+- A node only hears a packet on its current channel, and not while it
+  is switching or transmitting itself.
 
-Metingen: airtime per kanaal, thuis-doofheid per node, leveringsuitkomst.
+Measurements: airtime per channel, home-deafness per node, delivery outcome.
 """
 import argparse, ctypes, heapq, math, os, random, sys
 from collections import deque
@@ -26,14 +27,14 @@ from collections import deque
 T_HELLO = 70_000          # us, SF7/62.5k/CR4_5
 T_ACK   = 78_000
 T_DATA  = lambda l: 173_000 if l <= 40 else 459_000 if l <= 150 else 869_000
-S_SWITCH = 5_000          # kanaalwissel incl. settling (ontwerp 14.1)
-ACK1_MARGIN = 80_000      # marge op de ack1-wachttijd, gelijk aan core.c
+S_SWITCH = 5_000          # channel switch incl. settling (design 14.1)
+ACK1_MARGIN = 80_000      # margin on the ack1 wait time, equal to core.c
 N_CH = 3
 HOME = lambda nid: nid % N_CH
-RSSI = -60                # linkkwaliteit default; per paar in te stellen (Wire.links)
-CAPTURE_DB = 6            # marge waarbij de sterkste wint (ontwerp 2/14.1)
+RSSI = -60                # link quality default; settable per pair (Wire.links)
+CAPTURE_DB = 6            # margin at which the strongest wins (design 2/14.1)
 
-VERBOSE = True             # False: radiologs (tx/hoort-niets) onderdrukken
+VERBOSE = True             # False: suppress radio logs (tx/hears-nothing)
 
 def out(*a):
     print(*a, flush=True)
@@ -43,31 +44,32 @@ def radio_log(*a):
         print(*a, flush=True)
 
 class Wire:
-    """Kanaalmodel gedeeld door beide motoren: lopende zendingen per kanaal,
-    link-RSSI per (zender, ontvanger), botsing en capture (ontwerp 2 en 14.1:
-    twee overlappende zendingen op hetzelfde kanaal botsen, tenzij de sterkste
-    met >= CAPTURE_DB marge wint)."""
+    """Channel model shared by both engines: ongoing transmissions per
+    channel, link RSSI per (sender, receiver), collision and capture
+    (design 2 and 14.1: two overlapping transmissions on the same channel
+    collide, unless the strongest wins with >= CAPTURE_DB margin)."""
     def __init__(self):
-        self.chan = [[] for _ in range(N_CH)]   # (start, eind, zender-id)
-        self.links = {}                          # (zender-id, ontvanger-id) -> dBm
-        self.collided = [0]*N_CH               # verloren ontvangsten per kanaal
-        self.open = True    # open wereld: onbekende paren ontvangen met de
-                           # default-RSSI (kleine scenario's zonder bereikmodel);
-                           # False = gesloten wereld: alleen paren in links
-                           # bestaan (linkbudget uit posities, lokaal-net)
+        self.chan = [[] for _ in range(N_CH)]   # (start, end, sender-id)
+        self.links = {}                          # (sender-id, receiver-id) -> dBm
+        self.collided = [0]*N_CH               # lost receptions per channel
+        self.open = True    # open world: unknown pairs are received with the
+                           # default RSSI (small scenarios without a range model);
+                           # False = closed world: only pairs in links exist
+                           # (link budget from positions, local-net)
     def link(self, tx_id, rx_id):
         if self.open:
             return self.links.get((tx_id, rx_id), RSSI)
-        return self.links.get((tx_id, rx_id))   # None = geen link
+        return self.links.get((tx_id, rx_id))   # None = no link
     def begin(self, now, ch, tx_id, airtime):
         self.chan[ch] = [w for w in self.chan[ch] if w[1] > now]
         self.chan[ch].append((now, now + airtime, tx_id))
     def check(self, now, rx_id, tx_id, ch, start, end):
-        """Verstoring van de ontvangst [start, end) op kanaal ch.
-        None = schoon; anders (reden, verstorende zender).
-        Opruimen mag pas ná het te beoordelen venster: bij de aflevercontrole
-        (op tx-eind) moeten zendingen die dit venster overlappen er nog in
-        staan, ook al zijn ze zelf al voorbij."""
+        """Disturbance of the reception [start, end) on channel ch.
+        None = clean; otherwise (reason, disturbing sender).
+        Cleanup may only happen AFTER the window under review: at the
+        delivery check (at tx-end), transmissions that overlap this
+        window must still be in there, even if they themselves are
+        already past."""
         self.chan[ch] = [w for w in self.chan[ch] if w[1] > start]
         s = self.link(tx_id, rx_id)
         for s0, e0, t0 in self.chan[ch]:
@@ -75,64 +77,64 @@ class Wire:
                 continue
             s1 = self.link(t0, rx_id)
             if s1 is None:
-                continue                     # verstoring buiten bereik stoort niet
+                continue                     # disturbance out of range does not interfere
             if s1 >= s + CAPTURE_DB:
-                return ("capture door", t0)
+                return ("capture by", t0)
             if s1 > s - CAPTURE_DB:
-                return ("botsing met", t0)
+                return ("collision with", t0)
         return None
 
 class DutyLedger:
-    """Zendtijd per (node, kanaal) in een schuivend venster — de 10% duty
-    per kanaal (ontwerp 2). Registreert alle zendingen van elke Radio."""
-    def __init__(self, venster_us=3_600_000_000):
-        self.venster = venster_us
-        self.log = {}                       # (node-id, kanaal) -> deque[(t, us)]
+    """Transmit time per (node, channel) in a sliding window — the 10%
+    duty per channel (design 2). Records all transmissions of every Radio."""
+    def __init__(self, window_us=3_600_000_000):
+        self.window = window_us
+        self.log = {}                       # (node-id, channel) -> deque[(t, us)]
     def add(self, nid, ch, nu, us):
         d = self.log.setdefault((nid, ch), deque())
         d.append((nu, us))
-        while d and d[0][0] <= nu - self.venster:
+        while d and d[0][0] <= nu - self.window:
             d.popleft()
-    def gebruik(self, nid, ch, nu):
-        return sum(us for t, us in self.log.get((nid, ch), ()) if t > nu - self.venster)
+    def usage(self, nid, ch, nu):
+        return sum(us for t, us in self.log.get((nid, ch), ()) if t > nu - self.window)
 
-# ---------------- knooppuntlijst en linkbudget (scenariolaag) -----------
-# Radiomodel (Voorstel; NL-kalibratie: Open, zie ontwerp 14.1):
-#   ontvangst = TX - FSPL(d) - 2 x clutter(h), begrensd door de radiohorizon.
-# clutter(h) = 30 - 14 log10(1+h) dB: lage masten verliezen veel aan
-# omgeving, hoge masten kijken er overheen. Per richting een fading-offset
-# van +-5 dB zodat links asymmetrisch zijn, zoals in de praktijk.
-TX_DBM = 27.0          # ERP in de 869,4-869,65 MHz sub-band (500 mW)
-RX_MIN_DBM = -110.0    # ontvangstdrempel incl. fade-marge
-FSPL_1KM_DB = 91.2    # vrije-ruimte verlies op 869 MHz over 1 km
+# ---------------- node list and link budget (scenario layer) -----------
+# Radio model (Proposal; NL calibration: Open, see design 14.1):
+#   reception = TX - FSPL(d) - 2 x clutter(h), bounded by the radio horizon.
+# clutter(h) = 30 - 14 log10(1+h) dB: low masts lose a lot to the
+# environment, high masts look over it. Per direction a fading offset of
+# +-5 dB so links are asymmetric, as in practice.
+TX_DBM = 27.0          # ERP in the 869.4-869.65 MHz sub-band (500 mW)
+RX_MIN_DBM = -110.0    # reception threshold incl. fade margin
+FSPL_1KM_DB = 91.2    # free-space loss at 869 MHz over 1 km
 
-def load_nodes_csv(pad):
-    """Knooppuntlijst met GPS-positie en hoogte. Formaat per regel:
-    id,lat,lon,hoogte_m,naam — '#' is commentaar."""
+def load_nodes_csv(path):
+    """Node list with GPS position and height. Format per line:
+    id,lat,lon,height_m,name — '#' is a comment."""
     nodes = []
-    with open(pad) as f:
-        for regel in f:
-            regel = regel.strip()
-            if not regel or regel.startswith('#'):
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
                 continue
-            d = [v.strip() for v in regel.split(',')]
+            d = [v.strip() for v in line.split(',')]
             nodes.append({'id': int(d[0], 0), 'lat': float(d[1]),
                           'lon': float(d[2]), 'h': float(d[3]),
-                          'naam': d[4] if len(d) > 4 else ''})
+                          'name': d[4] if len(d) > 4 else ''})
     return nodes
 
-def projecteer(lat, lon, lat0, lon0):
-    """Lokale vlakprojectie in meters rond (lat0, lon0): afstanden binnen
-    een regio zijn klein genoeg voor een benadering met cos(lat0)."""
+def project(lat, lon, lat0, lon0):
+    """Local flat projection in meters around (lat0, lon0): distances
+    within a region are small enough for an approximation with cos(lat0)."""
     x = math.radians(lon - lon0) * 6371000.0 * math.cos(math.radians(lat0))
     y = math.radians(lat - lat0) * 6371000.0
     return x, y
 
 def linkbudget(pa, pb):
-    """Ruwe ontvangststerkte in dBm van a naar b (posities in meters,
-    hoogte in meters), zonder fading en zonder drempel.
-    None = link fysiek onmogelijk: radiohorizon (breking meegerekend,
-    d <= 4,12 (wortel(h1) + wortel(h2)) km)."""
+    """Raw reception strength in dBm from a to b (positions in meters,
+    heights in meters), without fading and without threshold.
+    None = link physically impossible: radio horizon (refraction counted
+    in, d <= 4.12 (sqrt(h1) + sqrt(h2)) km)."""
     d_km = math.hypot(pa[0] - pb[0], pa[1] - pb[1]) / 1000.0
     if d_km <= 1e-3:
         return None
@@ -143,14 +145,14 @@ def linkbudget(pa, pb):
               (30.0 - 14.0 * math.log10(1.0 + pb[2]))
     return TX_DBM - fspl - clutter
 
-class Radio:  # virtuele radio + klok
+class Radio:  # virtual radio + clock
     def __init__(self):
         self.now = 0
         self.q = []          # (at, seq, fn, arg)
         self.nodes = {}      # id -> Node
         self.airtime = [0]*N_CH
-        self.hello_air = [0]*N_CH   # airtime van hello's (type 1) per kanaal
-        self.ack_air = [0]*N_CH     # airtime van hello-acks (type 2) per kanaal
+        self.hello_air = [0]*N_CH   # airtime of hellos (type 1) per channel
+        self.ack_air = [0]*N_CH     # airtime of hello-acks (type 2) per channel
         self.duty = DutyLedger()
         self.wire = Wire()
         self.seq = 0
@@ -159,7 +161,7 @@ class Radio:  # virtuele radio + klok
         heapq.heappush(self.q, (self.now + delay_us, self.seq, fn, arg))
     def run(self, until_us=None):
         while self.q:
-            at, _, fn, arg = self.q[0]              # peek: niet poppen vóór de until-check
+            at, _, fn, arg = self.q[0]              # peek: do not pop before the until-check
             if until_us and at > until_us: return False
             heapq.heappop(self.q)
             self.now = at
@@ -167,8 +169,8 @@ class Radio:  # virtuele radio + klok
             if until_us is None and not self.q: return True
         return True
     def tx(self, node, ch, pkt, airtime):
-        radio_log(f"[{self.now/1e6:8.3f}s] node {node.id:#06x} zendt type {pkt[0]:#04x} "
-                  f"({len(pkt)} B, {airtime//1000} ms) op kanaal {ch}")
+        radio_log(f"[{self.now/1e6:8.3f}s] node {node.id:#06x} transmits type {pkt[0]:#04x} "
+                  f"({len(pkt)} B, {airtime//1000} ms) on channel {ch}")
         self.airtime[ch] += airtime
         ptype = pkt[0] & 0x0F
         if ptype == 1: self.hello_air[ch] += airtime
@@ -177,27 +179,27 @@ class Radio:  # virtuele radio + klok
         self.wire.begin(self.now, ch, node.id, airtime)
         for r in self.nodes.values():
             if r is node: continue
-            r.schedule_recv(airtime, ch, bytes(pkt), node.id)   # hoorbaarheid checkt de ontvanger zelf
+            r.schedule_recv(airtime, ch, bytes(pkt), node.id)   # audibility is checked by the receiver itself
 
 class Node:
-    """Simulator-zijde van een node: radio-timing rondom de protocolkern."""
+    """Simulator side of a node: radio timing around the protocol core."""
     def __init__(self, radio, nid):
         self.radio, self.id = radio, nid
         self.core = None
-        self.ch = HOME(nid)        # huidig kanaal
-        self.busy_until = 0        # radio bezet (wissel/zending/ack-venster) tot
-        self.deaf_until = 0        # doof (wissel of eigen zending) tot
-        self.away_total = 0        # us buiten het eigen thuiskanaal
+        self.ch = HOME(nid)        # current channel
+        self.busy_until = 0        # radio busy (switch/transmission/ack window) until
+        self.deaf_until = 0        # deaf (switch or own transmission) until
+        self.away_total = 0        # us outside the own home channel
         self._away_since = None
-        self.hello_rx = 0          # gehoorde hellos (meting: ronde-sync, open punt 3)
-        self.hello_missed = 0      # gemiste hellos op het eigen kanaal (weg/bezig/botsing)
-        self.collided = 0          # ontvangsten verloren door botsing of capture
-        self._swq = deque()        # wachtende wisselverzoeken
+        self.hello_rx = 0          # heard hellos (measurement: round sync, open point 3)
+        self.hello_missed = 0      # missed hellos on the own channel (away/busy/collision)
+        self.collided = 0          # receptions lost to collision or capture
+        self._swq = deque()        # queued switch requests
         self._drain_at = None
         self.rng = random.Random(nid)
         radio.nodes[nid] = self
 
-    # ---- kanaaltoestand en meting --------------------------------------
+    # ---- channel state and measurement --------------------------------
     def _set_ch(self, ch):
         home = HOME(self.id)
         if ch != self.ch:
@@ -209,11 +211,11 @@ class Node:
                 self._away_since = self.radio.now
         self.ch = ch
 
-    # ---- geserialiseerde radio ------------------------------------------
+    # ---- serialized radio ----------------------------------------------
     def _when_free(self, job):
-        """Voer de wissel-job uit zodra de radio vrij is (nu of na de lopende
-        bezetting). Zendingen horen bij de eigen wissel en volgen direct,
-        dus alleen wissels hoeven in de wachtrij."""
+        """Run the switch job as soon as the radio is free (now or after
+        the ongoing busy period). Transmissions belong to their own
+        switch and follow directly, so only switches need to queue."""
         if not self._swq and self.radio.now >= self.busy_until:
             job()
         else:
@@ -227,7 +229,7 @@ class Node:
 
     def _drain(self):
         self._drain_at = None
-        if self.radio.now < self.busy_until:   # bezetting liep op (zending na wissel)
+        if self.radio.now < self.busy_until:   # busy period grew (transmission after switch)
             self._plan_drain(); return
         if self._swq:
             self._swq.popleft()()
@@ -246,9 +248,9 @@ class Node:
         self._when_free(job)
 
     def tx(self, ch, pkt, airtime, wait=None):
-        """Zending op het huidige kanaal; wait>0 houdt de node op het kanaal
-        voor de terugkeer. Standaard: data krijgt een ack1-venster
-        (t_ack + marge, ontwerp 7.3) op het exchangekanaal."""
+        """Transmission on the current channel; wait>0 keeps the node on
+        the channel for the return. Default: data gets an ack1 window
+        (t_ack + margin, design 7.3) on the exchange channel."""
         if wait is None:
             wait = T_ACK + ACK1_MARGIN if (pkt[0] & 0x0F) == 5 else 0
         start = max(self.radio.now, self.busy_until)
@@ -263,42 +265,42 @@ class Node:
         self._plan_drain()
 
     def bound_send(self, ch, pkt, airtime, wait=None):
-        """Gebonden zending: wissel, zenden, (ack-venster), terug naar huis."""
+        """Bound transmission: switch, transmit, (ack window), back home."""
         self.switch(ch, S_SWITCH, lambda: self.tx(ch, pkt, airtime, wait))
 
-    # ---- ontvangst -------------------------------------------------------
+    # ---- reception -------------------------------------------------------
     def schedule_recv(self, delay, ch, pkt, tx_id):
         def deliver():
             hello = (pkt[0] & 0x0F) == 1
             start = self.radio.now - delay
             rssi = self.radio.wire.link(tx_id, self.id)
             if rssi is None:
-                return    # buiten bereik (gesloten wereld): geen ontvangst, geen telling
-            # het hele pakket moet gehoord zijn: op het kanaal, en de eigen
-            # zending/wissel moet vóór de start van dit pakket voorbij zijn
+                return    # out of range (closed world): no reception, no count
+            # the whole packet must have been heard: on the channel, and the
+            # own transmission/switch must be past before the start of this packet
             if self.ch == ch and start >= self.deaf_until:
-                stooring = self.radio.wire.check(self.radio.now, self.id, tx_id, ch, start, self.radio.now)
-                if stooring:
-                    reden, door = stooring
+                disturbance = self.radio.wire.check(self.radio.now, self.id, tx_id, ch, start, self.radio.now)
+                if disturbance:
+                    reason, by = disturbance
                     self.collided += 1
                     self.radio.wire.collided[ch] += 1
                     if hello: self.hello_missed += 1
                     radio_log(f"[{self.radio.now/1e6:8.3f}s] node {self.id:#06x} verliest "
-                              f"type {pkt[0]:#04x} op kanaal {ch} ({reden} {door:#06x})")
+                              f"type {pkt[0]:#04x} on channel {ch} ({reason} {by:#06x})")
                     return
                 if hello: self.hello_rx += 1
                 self.core.rx((ch, rssi, pkt)); return
             if ch == HOME(self.id) or self.ch == ch:
                 if hello: self.hello_missed += 1
-                reden = ("bezig met eigen zending" if start < self.deaf_until
-                         else "van huis (exchange)")
+                reason = ("busy with own transmission" if start < self.deaf_until
+                          else "away from home (exchange)")
                 radio_log(f"[{self.radio.now/1e6:8.3f}s] node {self.id:#06x} hoort niets "
-                          f"op kanaal {ch} ({reden})")
+                          f"on channel {ch} ({reason})")
         self.radio.schedule(delay, deliver)
 
-# --------------------------------------------------------------------------- 
-# C-kern via ctypes — de enige protocolimplementatie (ontwerp 13b).
-# Structlayout is geverifieerd tegen sizeof/offsetof van core.h
+# ---------------------------------------------------------------------------
+# C core via ctypes — the only protocol implementation (design 13b).
+# Struct layout verified against sizeof/offsetof of core.h
 # (neighbor 12, pending 256, node 5448 B).
 # ---------------------------------------------------------------------------
 MC_MAX_NEIGHBORS, MC_MAX_PENDING, MC_MAX_DEDUP, MC_MAX_PAYLOAD = 64, 16, 128, 230
@@ -323,7 +325,7 @@ class CDedup(ctypes.Structure):
 class CNode(ctypes.Structure):
     pass
 
-CB = ctypes.CFUNCTYPE(None, ctypes.POINTER(CNode), ctypes.c_void_p)   # kern-callback (timer/switch-done)
+CB = ctypes.CFUNCTYPE(None, ctypes.POINTER(CNode), ctypes.c_void_p)   # core callback (timer/switch-done)
 TX_FN = ctypes.CFUNCTYPE(None, ctypes.POINTER(CNode), ctypes.c_uint8,
                          ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint16, ctypes.c_uint64)
 TIMER_FN = ctypes.CFUNCTYPE(None, ctypes.POINTER(CNode), ctypes.c_uint64,
@@ -337,12 +339,12 @@ CNode._fields_ = [
     ("nbr", CNeighbor * MC_MAX_NEIGHBORS), ("pend", CPending * MC_MAX_PENDING),
     ("dedup", CDedup * MC_MAX_DEDUP), ("hello_interval_us", ctypes.c_uint64),
     ("hello_jitter_us", ctypes.c_uint64),
-    ("ka_idle", ctypes.c_uint8 * 3),   # keepalivetellers per kanaal (4.1)
+    ("ka_idle", ctypes.c_uint8 * 3),   # keepalive counters per channel (4.1)
     ("tx", TX_FN), ("timer", TIMER_FN), ("switch_ch", SWITCH_FN), ("rand", RAND_FN),
     ("user", ctypes.c_void_p),
 ]
 
-NODES = {}   # adres van mimeshi_node -> Python-Node
+NODES = {}   # address of mimeshi_node -> Python Node
 
 def _node_of(nptr):
     return NODES[ctypes.addressof(nptr.contents)]
@@ -383,8 +385,8 @@ def load_lib(path):
     return lib
 
 class CCore:
-    """Protocolkern in C; elke node heeft zijn eigen mimeshi_node (geen
-    gedeelde state). De vier callbacks lopen via de simulator hierboven."""
+    """Protocol core in C; every node has its own mimeshi_node (no shared
+    state). The four callbacks run via the simulator above."""
     def __init__(self, node, lib):
         self.n, self.lib = node, lib
         self.mn = CNode()
@@ -400,19 +402,20 @@ class CCore:
         payload = text.encode()
         rc = self.lib.mimeshi_send_data(ctypes.byref(self.mn), dst, payload, len(payload), ack3)
         if rc != 0:
-            out(f"[sim] node {self.n.id:#06x}: zending geweigerd (rc={rc})")
+            out(f"[sim] node {self.n.id:#06x}: transmission refused (rc={rc})")
         return rc
 
 def sym_count(node):
-    """Aantal buren met bevestigd symmetrisch verkeer (nb.sym, 4.2/10.1).
-    Alleen zichtbaar op de C-kern (de status woont in de node-struct)."""
+    """Number of neighbors with confirmed symmetric traffic (nb.sym,
+    4.2/10.1). Only visible on the C core (the status lives in the node
+    struct)."""
     core = node.core
     if isinstance(core, CCore):
         return sum(1 for e in core.mn.nbr if e.alive and e.sym)
     return None
 
 def nbr_counts(node):
-    """(aantal buren gezien, aantal bevestigd symmetrisch) volgens de kern."""
+    """(neighbor count seen, count confirmed symmetric) according to the core."""
     core = node.core
     if isinstance(core, CCore):
         e = core.mn.nbr
@@ -424,9 +427,9 @@ def main():
     ap.add_argument('--so', default=os.path.join(os.path.dirname(__file__), '..', 'build', 'libmimeshi.so'))
     args = ap.parse_args()
     if not os.path.exists(args.so):
-        out(f"libmimeshi.so niet gevonden ({args.so}); bouw met gcc (zie README).")
+        out(f"libmimeshi.so not found ({args.so}); build with gcc (see README).")
         sys.exit(1)
-    # printf van de C-kern direct na de Python-prints laten verschijnen
+    # let printf of the C core appear directly after the Python prints
     try:
         libc = ctypes.CDLL(None)
         libc.setbuf(ctypes.c_void_p.in_dll(libc, "stdout"), None)
@@ -434,38 +437,38 @@ def main():
         pass
 
     radio = Radio()
-    a = Node(radio, 0x0100)   # thuis kanaal 1
-    b = Node(radio, 0x0101)   # thuis kanaal 2
+    a = Node(radio, 0x0100)   # home channel 1
+    b = Node(radio, 0x0101)   # home channel 2
     lib = load_lib(args.so)
     a.core = CCore(a, lib); b.core = CCore(b, lib)
 
-    out("=== Scenario 1: koppeltest (2 nodes, SF7, 62,5 kHz) ===")
+    out("=== Scenario 1: link test (2 nodes, SF7, 62.5 kHz) ===")
     a.core.start()
-    radio.schedule(500_000, b.core.start)   # echte nodes starten nooit op dezelfde
-    # microseconde; 0,5 s houdt de eerste rondes vrij van overlap zodat de
-    # unicast op 1,5 s op een echte neighbor table kan steunen (overlap tussen
-    # rondes meten de sweeps onderaan).
-    radio.run(until_us=1_500_000)           # eerste hello-ronde + acks
+    radio.schedule(500_000, b.core.start)   # real nodes never start on the same
+    # microsecond; 0.5 s keeps the first rounds free of overlap so the
+    # unicast at 1.5 s can lean on a real neighbor table (overlap between
+    # rounds is measured by the sweeps below).
+    radio.run(until_us=1_500_000)           # first hello round + acks
 
-    out("\n--- unicast A -> B (A kent B uit de hello-ronde) ---")
-    a.core.send_data(0x0101, "hallo mesh", ack3=True)
-    radio.run(until_us=3_000_000)          # hello-ack van A laat B de kaart zien
+    out("\n--- unicast A -> B (A knows B from the hello round) ---")
+    a.core.send_data(0x0101, "hello mesh", ack3=True)
+    radio.run(until_us=3_000_000)          # hello-ack from A shows B the map
 
-    out("\n--- unicast B -> A (na hello-ack: B kent A) ---")
-    b.core.send_data(0x0100, "terugbericht", ack3=True)
-    radio.run(until_us=50_000_000)         # tweede hello-rondes (30 s + jitter)
+    out("\n--- unicast B -> A (after hello-ack: B knows A) ---")
+    b.core.send_data(0x0100, "reply message", ack3=True)
+    radio.run(until_us=50_000_000)         # second hello rounds (30 s + jitter)
 
-    out("\n=== Metingen ===")
+    out("\n=== Measurements ===")
     for c in range(N_CH):
-        out(f"kanaal {c}: airtime {radio.airtime[c]/1e6:.3f} s, "
-            f"verloren ontvangsten {radio.wire.collided[c]}")
+        out(f"channel {c}: airtime {radio.airtime[c]/1e6:.3f} s, "
+            f"lost receptions {radio.wire.collided[c]}")
     for nid, nd in radio.nodes.items():
         sym = sym_count(nd)
-        out(f"node {nid:#06x}: thuis-doofheid {nd.away_total/1e6:.3f} s "
-            f"({100*nd.away_total/max(radio.now,1):.2f}% van de tijd), "
-            f"hellos gehoord {nd.hello_rx}, gemist {nd.hello_missed}, "
-            f"botsingen {nd.collided}"
-            + (f", symmetrisch bevestigd {sym}" if sym is not None else ""))
+        out(f"node {nid:#06x}: home-deafness {nd.away_total/1e6:.3f} s "
+            f"({100*nd.away_total/max(radio.now,1):.2f}% of the time), "
+            f"hellos heard {nd.hello_rx}, missed {nd.hello_missed}, "
+            f"collisions {nd.collided}"
+            + (f", confirmed symmetric {sym}" if sym is not None else ""))
 
 if __name__ == '__main__':
     main()

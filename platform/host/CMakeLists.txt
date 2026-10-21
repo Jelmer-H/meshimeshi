@@ -1,5 +1,5 @@
-# host-platform: dummy hardware-laag voor ontwikkeling op een werkstation.
-# Levert de vier callbacks (tx / timer / kanaalwissel / RNG) op stdout-niveau.
-# Wordt gebruikt door test_koppeltest en later door een 'console-radio'.
+# host platform: dummy hardware layer for workstation development.
+# Provides the four callbacks (tx / timer / channel switch / RNG) at stdout level.
+# Used by test_link_test and later by a 'console radio'.
 add_library(platform_host STATIC host_radio.c)
 target_include_directories(platform_host PUBLIC ../..)
