@@ -359,6 +359,7 @@ CNode._fields_ = [
     ("hello_jitter_us", ctypes.c_uint64),
     ("ka_idle", ctypes.c_uint8 * 3),   # keepalive counters per channel (4.1)
     ("chunk_ctr_last", ctypes.c_uint32),  # table counter at the last chunk push (4.3)
+    ("chunk_ticks", ctypes.c_uint8),       # tail repetition counter (4.3)
     ("proof_wait", ctypes.c_uint8 * 3),  # flush countdown per channel (4.2)
     ("tx", TX_FN), ("timer", TIMER_FN), ("switch_ch", SWITCH_FN), ("rand", RAND_FN),
     ("user", ctypes.c_void_p),

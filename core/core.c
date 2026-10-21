@@ -377,12 +377,17 @@ static void chunk_send(mimeshi_node *n) {
 
 static void chunk_tick(mimeshi_node *n, void *ud) {
     (void)ud;
-    /* push only on mutation (4.3): the local table counter moved since
-     * the last push. In a stable net nothing goes on air; a newcomer or
-     * a quality change triggers exactly one slice. The cadence is the
-     * bundling window: mutations within it share one slice. */
-    if (n->chunk_ctr_last != n->local_tbl_ctr) {
+    /* 4.3: push on mutation (the counter moved -- short window, slices
+     * bundle), AND the periodic repetition: knowledge diffuses outward
+     * only if slices keep going out even in a stable net ("recovery
+     * consists of the regularity of the push itself", 4.3). The repeat
+     * counter runs in chunk ticks; MC_CHUNK_REPEAT_TICKS is the slow
+     * tail cadence. */
+    n->chunk_ticks++;
+    uint8_t mutated = n->chunk_ctr_last != n->local_tbl_ctr;
+    if (mutated || n->chunk_ticks >= MC_CHUNK_REPEAT_TICKS) {
         n->chunk_ctr_last = n->local_tbl_ctr;
+        n->chunk_ticks = 0;
         chunk_send(n);
     }
     n->timer(n, MC_CHUNK_PERIOD_US + (n->rand(n) % 1000000ull), chunk_tick, 0);
@@ -601,15 +606,32 @@ static mimeshi_neighbor *route_next(mimeshi_node *n, uint16_t dst,
             best = via; best_score = route_score(n, via) + 64;   /* via the map beats greedy */
         }
     }
-    /* 3. greedy on geo (10.2): the confirmed neighbour closest to dst */
+    /* 3. smart greedy on geo (10.2): not the neighbour closest to the
+     * destination, but: first find the point on the whole known map
+     * closest to the destination geo (the best "gateway" toward it --
+     * may be far away), then route to the hop that can get closest to
+     * THAT point. A neighbour that is not closer to the destination can
+     * still be the best way toward the gateway around a concave shore
+     * (void guard: we must make progress toward the gateway). */
     if (dgx != MC_GEO_UNKNOWN && n->geox != MC_GEO_UNKNOWN) {
-        int32_t own = geo_dist2(n->geox, n->geoy, dgx, dgy);
+        int16_t tgx = dgx, tgy = dgy;      /* the gateway point: default the destination itself */
+        int32_t own_dst = geo_dist2(n->geox, n->geoy, dgx, dgy);
+        int32_t best_gw = own_dst;          /* the gateway must beat our own position */
+        for (int i = 0; i < MC_MAX_KNOWN; i++) {
+            mimeshi_2hop *e = &n->known[i];
+            if (!e->alive || e->geox == MC_GEO_UNKNOWN) continue;
+            int32_t d = geo_dist2(e->geox, e->geoy, dgx, dgy);
+            if (d < best_gw) { best_gw = d; tgx = e->geox; tgy = e->geoy; }
+        }
+        /* hop toward the gateway: the confirmed neighbour closest to the
+         * gateway point that is closer to it than we are */
+        int32_t own_gw = geo_dist2(n->geox, n->geoy, tgx, tgy);
         for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
             mimeshi_neighbor *nb = &n->nbr[i];
             if (!nb->alive || !nb->sym || nb == excl) continue;
             if (nb->geox == MC_GEO_UNKNOWN) continue;
-            if (geo_dist2(nb->geox, nb->geoy, dgx, dgy) >= own) continue;  /* not closer: void guard */
-            int s = route_score(n, nb);
+            if (geo_dist2(nb->geox, nb->geoy, tgx, tgy) >= own_gw) continue;  /* no progress: void guard */
+            int s = route_score(n, nb) - (geo_dist2(nb->geox, nb->geoy, tgx, tgy) >> 12);
             if (s > best_score) { best_score = s; best = nb; }
         }
     }

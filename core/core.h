@@ -28,7 +28,9 @@
 #define MC_T_ACK2_US      7000000ull    /* ack2 wait window at the sender (7.3, proposal) */
 #define MC_MAX_ROUTE_NBR  3             /* neighbours tried per hop (7.4) */
 #define MC_MAX_KNOWN     256            /* known map entries (10.1) */
-#define MC_CHUNK_PERIOD_US 120000000ull /* 2 min: one table-chunk slice on air (4.3) */
+#define MC_CHUNK_PERIOD_US 120000000ull /* 2 min: the chunk check tick (4.3) */
+#define MC_CHUNK_REPEAT_TICKS 10         /* slow tail repetition: a full slice every
+                                            ~20 min even in a stable net (4.3) */
 #define MC_CHUNK_ENTRIES 17             /* entries per chunk: 4 + 17 x 7 = 123 B (4.3) */
 #define MC_GEO_UNKNOWN   0x7fff         /* int16 sentinel: geo not known (10.2) */
 
@@ -132,8 +134,9 @@ struct mimeshi_node {
                                          next proof list on c is pulled
                                          forward (4.2) */
     uint32_t chunk_ctr_last;          /* local table counter at the last
-                                         chunk push (4.3): push only on
-                                         mutation, not periodically */
+                                         chunk push (4.3): mutation trigger */
+    uint8_t  chunk_ticks;              /* ticks since the last push (4.3):
+                                         the slow tail repetition counter */
     uint8_t  proof_wait[MC_N_CHANNELS];/* countdown to the flush moment
                                          per channel (4.2), staggered 20
                                          min apart; restarts at 1 h on
