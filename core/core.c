@@ -142,7 +142,8 @@ static void nbr_set_quality(mimeshi_node *n, mimeshi_neighbor *nb, int8_t rssi) 
     int diff = (int)q - (int)nb->quality;
     if (diff < 0) diff = -diff;
     nb->quality = q;
-    if (diff >= 2) n->local_tbl_ctr++;
+    if (diff >= 4) n->local_tbl_ctr++;   /* 2x the advertisement hysteresis (4.3):
+                                             measurement noise is not a mutation */
 }
 
 /* Add a neighbor (from a hello, hello-ack or proof list). Full = return 0;
@@ -326,51 +327,77 @@ static void proof_tick(mimeshi_node *n, void *ud) {
 
 static mimeshi_2hop *known_find(mimeshi_node *n, uint16_t id);
 static mimeshi_2hop *known_upsert(mimeshi_node *n, uint16_t id, uint16_t via,
-                                  uint8_t quality, int16_t gx, int16_t gy);
+                                  uint8_t quality, int16_t gx, int16_t gy,
+                                  const uint16_t *links, const uint8_t *lq, uint8_t nlinks);
 
 /* ---------------- table chunks (4.3) ----------------
- * Push, no pull, no ack (4.3): every slice of the own neighbor table
- * goes unsolicited on the own HOME channel; neighbours snoop along.
- * Minimal slice format (building block 2): type, node-id(2), entry
- * count(1), then per entry: neighbour-id(2), quality(1), geox(2),
- * geoy(2) = 7 B per entry, max MC_CHUNK_ENTRIES. The receiver fills
- * its 2-hop map (10.1): entry X heard via sender. Self-contained, no
- * order, no version (dropped, 4.3) -- freshness travels via last_seen.
+ * Push, no pull, no ack (4.3). Node-centric slice format per 4.3: the
+ * entry of a node is followed directly by ITS links, so the receiver
+ * builds a link graph and can compute paths (10.2) -- not just guess
+ * on position. Layout per entry: id(2), quality(1), nlinks(1),
+ * geox(2), geoy(2), then nlinks x (endpoint-id(2), quality(1)).
+ * Variable length, self-contained, no order dependence.
  */
-static void chunk_send(mimeshi_node *n, uint8_t ch) {
-    uint8_t p[8 + 7 * MC_CHUNK_ENTRIES];
+static uint8_t chunk_entry_put(mimeshi_node *n, uint8_t *e, uint16_t id,
+                               uint8_t quality, int16_t gx, int16_t gy,
+                               const uint16_t *links, const uint8_t *lq, uint8_t nlinks) {
+    (void)n;
+    wr16(e, id);
+    e[2] = quality;
+    e[3] = (uint8_t)nlinks;
+    wr16(e + 4, (uint16_t)gx); wr16(e + 6, (uint16_t)gy);
+    for (uint8_t i = 0; i < nlinks; i++) {
+        wr16(e + 8 + 3 * i, links[i]);
+        e[8 + 3 * i + 2] = lq[i];
+    }
+    return (uint8_t)(8 + 3 * nlinks);
+}
+
+static void chunk_send(mimeshi_node *n, uint8_t ch, uint8_t with_links) {
+    uint8_t p[240];
     p[0] = PKT_TABLE_CHUNK; wr16(p + 1, n->id);
     wr16(p + 3, (uint16_t)n->geox); wr16(p + 5, (uint16_t)n->geoy);  /* owner geo (4.3) */
+    uint16_t off = 8;
     uint8_t cnt = 0;
-    /* confirmed direct neighbours first (10.1): the entries that promise a
-     * usable route and carry the freshest quality */
+    /* confirmed direct neighbours first (10.1): their links are our own
+     * direct table -- the freshest and most accurate */
+    uint16_t lbuf[MC_CHUNK_LINKS]; uint8_t qbuf[MC_CHUNK_LINKS];
     for (int i = 0; i < MC_MAX_NEIGHBORS && cnt < MC_CHUNK_ENTRIES; i++) {
         mimeshi_neighbor *nb = &n->nbr[i];
         if (!nb->alive || !nb->sym) continue;
-        uint8_t *e = p + 8 + 7 * cnt;
-        wr16(e, nb->id);
-        e[2] = nb->quality;
-        wr16(e + 3, (uint16_t)nb->geox); wr16(e + 5, (uint16_t)nb->geoy);
+        uint8_t nl = 0;
+        for (int j = 0; j < MC_MAX_NEIGHBORS && nl < MC_CHUNK_LINKS; j++) {
+            mimeshi_neighbor *l = &n->nbr[j];
+            if (!l->alive || !l->sym || l == nb) continue;
+            /* only links between our own confirmed entries (4.3: the mutual
+             * links of the neighbours) */
+            lbuf[nl] = l->id;
+            qbuf[nl] = (uint8_t)((l->quality + nb->quality) / 2);
+            nl++;
+        }
+        off += chunk_entry_put(n, p + off, nb->id, nb->quality, nb->geox, nb->geoy,
+                               with_links ? lbuf : (const uint16_t *)0,
+                               with_links ? qbuf : (const uint8_t *)0,
+                               with_links ? nl : 0);
         cnt++;
+        if (off > 240 - 30) break;
     }
-    /* then known-map entries, round-robin over the map (4.3): every
-     * repetition carries the NEXT slice, no evaporation -- every entry
-     * gets its turn per cycle. Direct neighbours are already above. */
-    for (int i = 0; i < MC_MAX_KNOWN && cnt < MC_CHUNK_ENTRIES; i++) {
+    /* then known-map entries round-robin (4.3), with their learned links */
+    for (int i = 0; i < MC_MAX_KNOWN && cnt < MC_CHUNK_ENTRIES && off <= 240 - 30; i++) {
         mimeshi_2hop *h = &n->known[(n->chunk_rr + i) % MC_MAX_KNOWN];
         if (!h->alive || nbr_find(n, h->id)) continue;
-        uint8_t *e = p + 8 + 7 * cnt;
-        wr16(e, h->id);
-        e[2] = h->quality;
-        wr16(e + 3, (uint16_t)h->geox); wr16(e + 5, (uint16_t)h->geoy);
+        off += chunk_entry_put(n, p + off, h->id, h->quality, h->geox, h->geoy,
+                               with_links ? h->link : (const uint16_t *)0,
+                               with_links ? h->lq : (const uint8_t *)0,
+                               with_links ? h->nlinks : 0);
         cnt++;
     }
-    n->chunk_rr = (uint8_t)((n->chunk_rr + cnt) % MC_MAX_KNOWN);   /* next round continues where this one stopped */
+    n->chunk_rr = (uint8_t)((n->chunk_rr + cnt) % MC_MAX_KNOWN);
     p[7] = cnt;
     if (ch == n->home_ch) {
-        n->tx(n, ch, p, (uint16_t)(8 + 7 * cnt), t_data_us((uint16_t)(8 + 7 * cnt)));
+        n->tx(n, ch, p, off, t_data_us(off));
     } else {
-        bound_send(n, ch, p, (uint16_t)(8 + 7 * cnt), t_data_us((uint16_t)(8 + 7 * cnt)));
+        bound_send(n, ch, p, off, t_data_us(off));
     }
     ka_called(n, ch);                        /* own call on that channel (4.1) */
 }
@@ -384,7 +411,9 @@ static void chunk_tick(mimeshi_node *n, void *ud) {
      * counter runs in chunk ticks; MC_CHUNK_REPEAT_TICKS is the slow
      * tail cadence. */
     n->chunk_ticks++;
-    uint8_t mutated = n->chunk_ctr_last != n->local_tbl_ctr;
+    uint8_t mutated = n->chunk_ctr_last != n->local_tbl_ctr
+                   && n->chunk_ticks >= MC_CHUNK_MUT_MIN_TICKS;   /* bundle mutations: the
+                                                                     push waits for the window */
     /* the tail cadence rises with the number of direct neighbours n
      * (4.3: per doubling of n the pause doubles) -- the marginal
      * airtime of a slice rises with n, and hub sites carry most of it.
@@ -399,10 +428,16 @@ static void chunk_tick(mimeshi_node *n, void *ud) {
         n->chunk_ticks = 0;
         if (n->hello_interval_us < MC_HELLO_MAX_US) {
             for (uint8_t ch = 0; ch < MC_N_CHANNELS; ch++)
-                chunk_send(n, ch);          /* startup: across the channel communities (4.3) */
+                chunk_send(n, ch, 1);       /* startup: all channels, with links (4.3) */
         } else {
-            for (uint8_t s = 0; s < MC_CHUNK_SLICES; s++)
-                chunk_send(n, n->home_ch);   /* stable: multiple slices on the home channel */
+            /* stable: mutations carry links (fresh knowledge needs the
+             * graph, 4.3); the periodic tail repeats geo+quality only --
+             * the link graph fills via the mutation pushes, the tail
+             * keeps the map fresh at 8 B per entry */
+            chunk_send(n, n->home_ch, mutated ? 1 : 0);
+            /* one slice per repetition: the round-robin carries the whole
+             * map over successive repetitions (4.3), and the channel
+             * share stays modest */
         }
     }
     n->timer(n, MC_CHUNK_PERIOD_US + (n->rand(n) % 1000000ull), chunk_tick, 0);
@@ -425,20 +460,33 @@ static void chunk_recv(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *
         nbr_set_quality(n, snb, rssi); snb->last_seen = 0;
         if (ogx != MC_GEO_UNKNOWN) { snb->geox = ogx; snb->geoy = ogy; }
     }
-    for (uint8_t i = 0; i < cnt; i++) {
-        const uint8_t *e = pkt + 8 + 7 * i;
+    const uint8_t *e = pkt + 8;
+    const uint8_t *end = pkt + len;
+    for (uint8_t i = 0; i < cnt && e + 8 <= end; i++) {
         uint16_t x = rd16(e);
-        if (x == n->id || x == from) continue;        /* ourselves or the sender: no 2-hop entry */
-        known_upsert(n, x, from, e[2], (int16_t)rd16(e + 3), (int16_t)rd16(e + 5));
-    }
-    /* an entry for US in the neighbour's chunk is reverse evidence
-     * (4.3): "I hear X" confirms at X, in a single reception, both
-     * directions of the link X-sender. */
-    for (uint8_t i = 0; i < cnt; i++) {
-        const uint8_t *e = pkt + 4 + 7 * i;
-        if (rd16(e) == n->id && snb) {
-            snb->sym = 1; snb->ack_try = 0; snb->proven_age_us = 0;  /* 4.3 */
+        uint8_t nl = e[3];
+        if (e + 8 + 3 * (uint16_t)nl > end) break;    /* malformed: ignore the rest */
+        int16_t gx = (int16_t)rd16(e + 4), gy = (int16_t)rd16(e + 6);
+        /* the links of x, straight from the entry (4.3) */
+        uint16_t links[MC_CHUNK_LINKS]; uint8_t lq[MC_CHUNK_LINKS];
+        uint8_t take = nl < MC_CHUNK_LINKS ? nl : MC_CHUNK_LINKS;
+        for (uint8_t j = 0; j < take; j++) {
+            links[j] = rd16(e + 8 + 3 * j);
+            lq[j] = e[8 + 3 * j + 2];
         }
+        if (x == n->id && snb) {
+            /* an entry for US in the neighbour's chunk is reverse evidence
+             * (4.3): "I hear X" confirms at X both directions. */
+            snb->sym = 1; snb->ack_try = 0; snb->proven_age_us = 0;
+        } else if (x != from) {
+            known_upsert(n, x, from, e[2], gx, gy, links, lq, take);
+            /* the sender itself is a link endpoint of x: store that too */
+            if (nl > 0) {
+                mimeshi_2hop *xh = known_find(n, x);
+                (void)xh;
+            }
+        }
+        e += 8 + 3 * nl;
     }
 }
 
@@ -567,7 +615,8 @@ static uint8_t known_score(mimeshi_node *n, uint16_t via, uint8_t quality) {
 /* Insert or refresh a known-map entry; on a full map the weakest entry
  * is displaced (10.1). Weaker-than-existing entries do not displace. */
 static mimeshi_2hop *known_upsert(mimeshi_node *n, uint16_t id, uint16_t via,
-                                  uint8_t quality, int16_t gx, int16_t gy) {
+                                  uint8_t quality, int16_t gx, int16_t gy,
+                                  const uint16_t *links, const uint8_t *lq, uint8_t nlinks) {
     if (id == n->id) return 0;
     mimeshi_2hop *h = known_find(n, id);
     if (!h) {
@@ -588,6 +637,18 @@ static mimeshi_2hop *known_upsert(mimeshi_node *n, uint16_t id, uint16_t via,
     h->quality = quality;
     h->score = known_score(n, via, quality);
     if (gx != MC_GEO_UNKNOWN) { h->geox = gx; h->geoy = gy; }
+    if (nlinks) {                                  /* merge learned links (4.3) */
+        for (uint8_t i = 0; i < nlinks && i < MC_CHUNK_LINKS; i++) {
+            uint8_t found = 0;
+            for (uint8_t j = 0; j < h->nlinks; j++)
+                if (h->link[j] == links[i]) { found = 1; break; }
+            if (!found && h->nlinks < MC_CHUNK_LINKS) {
+                h->link[h->nlinks] = links[i];
+                h->lq[h->nlinks] = lq ? lq[i] : 0;
+                h->nlinks++;
+            }
+        }
+    }
     return h;
 }
 
@@ -598,10 +659,106 @@ static int route_score(mimeshi_node *n, mimeshi_neighbor *nb) {
     return q - (nb->penalty << 3);          /* penalty weighs heavily (10.4) */
 }
 
+/* Path computation on the learned link graph (10.2). The graph: our own
+ * confirmed direct links (the freshest, always present) plus the links
+ * learned from the chunks (4.3: node-centric entries carry their links).
+ * Dijkstra with link quality as weight: cost = (256 - quality); the
+ * entries link[] arrays give the edges between known nodes. Result: the
+ * FIRST hop of the best path to dst, or 0 when dst is unreachable in
+ * the graph. excl is not taken as the first hop (7.2: no ping-pong). */
+#define MC_DIJ_INF 0x7fffffff
+static int32_t dij_cost(uint8_t q) { return 256 - (int32_t)q; }
+
+static mimeshi_neighbor *route_path(mimeshi_node *n, uint16_t dst, mimeshi_neighbor *excl) {
+    /* node ids -> compact index: 0 = us, 1.. our neighbours and known ids */
+    static uint16_t ids[MC_MAX_NEIGHBORS + MC_MAX_KNOWN + 1];
+    static int32_t dist[MC_MAX_NEIGHBORS + MC_MAX_KNOWN + 1];
+    static uint16_t first[MC_MAX_NEIGHBORS + MC_MAX_KNOWN + 1];   /* first hop toward that node */
+    static uint8_t done[MC_MAX_NEIGHBORS + MC_MAX_KNOWN + 1];
+    int nn = 1;                                     /* index 0 = ourselves */
+    ids[0] = n->id;
+
+    /* index map: our confirmed direct neighbours (hop candidates) and
+     * every alive known-map entry */
+    int idx_of[MC_MAX_NEIGHBORS + MC_MAX_KNOWN + 1];
+    (void)idx_of;
+    for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
+        mimeshi_neighbor *nb = &n->nbr[i];
+        if (!nb->alive) continue;
+        ids[nn] = nb->id; nn++;
+    }
+    for (int i = 0; i < MC_MAX_KNOWN; i++) {
+        mimeshi_2hop *h = &n->known[i];
+        if (!h->alive) continue;
+        int dup = 0;
+        for (int j = 0; j < nn; j++) if (ids[j] == h->id) { dup = 1; break; }
+        if (!dup) { ids[nn] = h->id; nn++; }
+    }
+
+    /* Dijkstra init */
+    for (int i = 0; i < nn; i++) { dist[i] = MC_DIJ_INF; first[i] = 0; done[i] = 0; }
+    dist[0] = 0;
+
+    /* helper: index of a node id, -1 if absent */
+    #define IDX(x) ({ int r_ = -1; for (int j_ = 0; j_ < nn; j_++) if (ids[j_] == (x)) { r_ = j_; break; } r_; })
+
+    for (int round = 0; round < nn; round++) {
+        int u = -1; int32_t du = MC_DIJ_INF;
+        for (int i = 0; i < nn; i++)
+            if (!done[i] && dist[i] < du) { du = dist[i]; u = i; }
+        if (u < 0 || du == MC_DIJ_INF) break;
+        done[u] = 1;
+        if (ids[u] == dst) break;
+
+        /* edges from u: our own direct links when u == 0, otherwise the
+         * learned links of the known entry with this id */
+        if (u == 0) {
+            for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
+                mimeshi_neighbor *nb = &n->nbr[i];
+                if (!nb->alive || !nb->sym) continue;
+                int v = IDX(nb->id);
+                if (v < 0) continue;
+                int32_t nd = dist[0] + dij_cost(nb->quality);
+                if (nd < dist[v]) {
+                    dist[v] = nd;
+                    first[v] = nb->id;            /* the first hop on the path to v */
+                }
+            }
+        } else {
+            /* the learned links of this known node */
+            for (int k = 0; k < MC_MAX_KNOWN; k++) {
+                mimeshi_2hop *h = &n->known[k];
+                if (!h->alive || h->id != ids[u]) continue;
+                for (uint8_t l = 0; l < h->nlinks; l++) {
+                    int v = IDX(h->link[l]);
+                    if (v < 0) continue;
+                    int32_t nd = dist[u] + dij_cost(h->lq[l] ? h->lq[l] : h->quality);
+                    if (nd < dist[v]) {
+                        dist[v] = nd;
+                        first[v] = first[u] ? first[u] : ids[u];   /* propagate the first hop */
+                        if (!first[v]) first[v] = ids[u];
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    int t = IDX(dst);
+    if (t < 0 || dist[t] == MC_DIJ_INF || first[t] == 0) return 0;
+    mimeshi_neighbor *hop = nbr_find(n, first[t]);
+    if (!hop || !hop->sym || hop == excl) return 0;
+    return hop;
+    #undef IDX
+}
+
 /* Choose the next hop toward dst (10.2). dst_geo: the destination geo if
  * known (own map or source geo). Returns the neighbour or 0. */
 static mimeshi_neighbor *route_next(mimeshi_node *n, uint16_t dst,
                                      int16_t dgx, int16_t dgy, mimeshi_neighbor *excl) {
+    /* excl excludes the previous ATTEMPT (retry series). Callers pass
+     * the hop where the packet came from as well: a packet must never
+     * bounce straight back (7.2: re-route, not ping-pong). */
     /* 1. direct, confirmed */
     mimeshi_neighbor *best = 0;
     int best_score = -1;
@@ -610,15 +767,21 @@ static mimeshi_neighbor *route_next(mimeshi_node *n, uint16_t dst,
         if (!nb->alive || nb == excl) continue;
         if (nb->id == dst && nb->sym) return nb;
     }
-    /* 2. known map: the entry names a via; if that via is a confirmed
-     * direct neighbour, it is the hop candidate toward dst (10.2). The
-     * entry itself only gives direction -- the hop runs over a confirmed
-     * direct link (10.1). */
+    /* 2. path on the learned link graph (10.2): with the links from the
+     * chunks (4.3) the node computes a real path -- the first hop of the
+     * best-quality path wins over every heuristic. The direct case (1)
+     * above is the one-hop path and already returned. */
+    mimeshi_neighbor *ph = route_path(n, dst, excl);
+    if (ph) return ph;
+
+    /* 2b. fallback: the known map without links -- the entry names a via;
+     * if that via is a confirmed direct neighbour it is the hop candidate
+     * (the graph was incomplete; this is the old behaviour). */
     mimeshi_2hop *h = known_find(n, dst);
     if (h) {
         mimeshi_neighbor *via = nbr_find(n, h->via);
         if (via && via->sym && via != excl) {
-            best = via; best_score = route_score(n, via) + 64;   /* via the map beats greedy */
+            best = via; best_score = route_score(n, via) + 64;
         }
     }
     /* 3. smart greedy on geo (10.2): not the neighbour closest to the
@@ -722,15 +885,18 @@ static void ack1_timeout(mimeshi_node *n, void *ud) {
         n->timer(n, (n->rand(n) % 500000ull) + 100000ull, pending_retry_timer, p);  /* wait > airtime (7.4) */
         return;
     }
-    /* neighbour exhausted: next neighbour in the series (7.4) */
+    /* neighbour exhausted: next neighbour in the series (7.4); the
+     * packet never goes straight back to prev_hop (7.2) */
     if (p->series + 1 < MC_MAX_ROUTE_NBR) {
         p->series++;
         p->tries_left = MC_RETRY_TX;
         mimeshi_neighbor *excl = nbr_find(n, p->next_hop);
+        mimeshi_neighbor *back = nbr_find(n, p->prev_hop);
         int16_t dgx, dgy;
         if (p->dst_geox == MC_GEO_UNKNOWN) route_dst_geo(n, p->dst, &dgx, &dgy);
         else { dgx = p->dst_geox; dgy = p->dst_geoy; }
         mimeshi_neighbor *nx = route_next(n, p->dst, dgx, dgy, excl);
+        if (nx == back) nx = 0;                /* no ping-pong (7.2) */
         if (nx) {
             p->next_hop = nx->id;
             p->budget_left--;
@@ -948,15 +1114,19 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
             if (p->active && p->state == 1 && p->msg_id == msg_id) {
                 p->active = 0;                          /* positive: hop done */
                 if (!neg) return;
-                /* negative: next neighbour, immediately (7.4) */
+                /* negative: next neighbour, immediately (7.4). Never back
+                 * toward prev_hop: the packet may not ping-pong (7.2). */
                 p->active = 1; p->state = 0;
                 p->tries_left = MC_RETRY_TX;
                 if (p->series + 1 < MC_MAX_ROUTE_NBR) p->series++;
                 mimeshi_neighbor *excl = nbr_find(n, p->next_hop);
+                mimeshi_neighbor *back = nbr_find(n, p->prev_hop);
                 int16_t dgx, dgy;
                 if (p->dst_geox == MC_GEO_UNKNOWN) route_dst_geo(n, p->dst, &dgx, &dgy);
                 else { dgx = p->dst_geox; dgy = p->dst_geoy; }
                 mimeshi_neighbor *nx = route_next(n, p->dst, dgx, dgy, excl);
+                if (!nx && back && back != excl) nx = 0;   /* falling back to prev_hop is not a route */
+                if (nx == back) nx = 0;
                 if (nx && p->budget_left > 0) {
                     p->next_hop = nx->id;
                     p->budget_left--;
@@ -1027,7 +1197,8 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         int16_t mgx, mgy;
         route_dst_geo(n, dst, &mgx, &mgy);
         if (mgx != MC_GEO_UNKNOWN) { dgx = mgx; dgy = mgy; }  /* own map beats the header when it knows dst */
-        mimeshi_neighbor *nx = route_next(n, dst, dgx, dgy, nbr_find(n, prev));
+        mimeshi_neighbor *skip = nbr_find(n, prev);   /* never bounce back (7.2) */
+        mimeshi_neighbor *nx = route_next(n, dst, dgx, dgy, skip);
         if (!nx) {
             /* no route from here (void or unknown, 10.2/10.3): negative
              * ack2 immediately; the previous hop re-routes. */

@@ -32,7 +32,13 @@
 #define MC_CHUNK_REPEAT_TICKS 10         /* slow tail repetition: slices every
                                             ~20 min even in a stable net (4.3) */
 #define MC_CHUNK_SLICES     2             /* slices per repetition in the stable phase (4.3) */
-#define MC_CHUNK_ENTRIES 17             /* entries per chunk: 4 + 17 x 7 = 123 B (4.3) */
+#define MC_CHUNK_MUT_MIN_TICKS 3          /* min ticks between mutation pushes (4.3): the
+                                            short window still bundles, but a growing map
+                                            cannot chain pushes back-to-back */
+#define MC_CHUNK_ENTRIES 8              /* entries per chunk; with links an entry is
+                                            up to 8 + 3*MC_CHUNK_LINKS B (4.3) */
+#define MC_CHUNK_LINKS    5             /* links per entry (4.3): the links of the
+                                            node follow directly after its entry */
 #define MC_GEO_UNKNOWN   0x7fff         /* int16 sentinel: geo not known (10.2) */
 
 /* ---------------- internal types (visible for fixed allocation) ---- */
@@ -75,7 +81,12 @@ typedef struct {
     int16_t  geox, geoy;    /* position of X (10.2); MC_GEO_UNKNOWN = not known */
     uint8_t  alive;
     uint8_t  sym;           /* reserved: hop selection demands a confirmed
-                              direct neighbour (10.1) */ 
+                              direct neighbour (10.1) */
+    uint8_t  nlinks;        /* links of X as learned from chunks (4.3): the
+                              node-centric entries carry their links, so the
+                              receiver can compute paths (10.2), not just guess */
+    uint16_t link[MC_CHUNK_LINKS];  /* the other endpoint of each link */
+    uint8_t  lq[MC_CHUNK_LINKS];    /* link quality (both directions averaged) */
 } mimeshi_2hop;
 
 typedef struct {

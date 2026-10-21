@@ -320,7 +320,9 @@ class C2Hop(ctypes.Structure):
     _fields_ = [("id", ctypes.c_uint16), ("via", ctypes.c_uint16),
                 ("quality", ctypes.c_uint8), ("score", ctypes.c_uint8),
                 ("geox", ctypes.c_int16), ("geoy", ctypes.c_int16),
-                ("alive", ctypes.c_uint8), ("sym", ctypes.c_uint8)]
+                ("alive", ctypes.c_uint8), ("sym", ctypes.c_uint8),
+                ("nlinks", ctypes.c_uint8),
+                ("link", ctypes.c_uint16 * 5), ("lq", ctypes.c_uint8 * 5)]
 
 class CPending(ctypes.Structure):
     _fields_ = [("active", ctypes.c_uint8), ("state", ctypes.c_uint8),
