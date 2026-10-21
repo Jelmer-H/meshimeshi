@@ -25,13 +25,13 @@ target_include_directories(mimeshi_static PUBLIC ${CMAKE_SOURCE_DIR})
 # Scenario 1 on the C core itself (without Python). Compile and run with
 #   ctest --test-dir build
 enable_testing()
-add_executable(test_koppeltest tests/test_koppeltest.c)
+add_executable(test_link_test tests/test_link_test.c)
 # Asserts are the actual test checks: keep them active even in
 # RelWithDebInfo (NDEBUG would compile them away and the test would
 # assert nothing).
-target_compile_options(test_koppeltest PRIVATE -UNDEBUG)
-target_link_libraries(test_koppeltest mimeshi_static)
-add_test(NAME koppeltest COMMAND test_koppeltest)
+target_compile_options(test_link_test PRIVATE -UNDEBUG)
+target_link_libraries(test_link_test mimeshi_static)
+add_test(NAME link_test COMMAND test_link_test)
 
 # ---- platform layers (stubs; per platform only the hardware interface) ----
 add_subdirectory(platform/host)
