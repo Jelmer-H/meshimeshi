@@ -1,14 +1,15 @@
 /*
- * Meshimeshi — protocolkern, publieke API (core.h)
- * Ontwerp: docs/ontwerp.md (sectie 13b: gedeelde kern voor firmware en simulator).
+ * Meshimeshi — protocol core, public API (core.h)
+ * Design: docs/design.md (section 13b: shared core for firmware and simulator).
  *
- * De kern heeft geen eigen klok, radio of RNG: alles komt via de callbacks in
- * mimeshi_init(). De simulator levert ze (virtuele radio); op firmware levert de
- * platformlaag ze. Geen dynamische allocatie; alle buffers vast.
+ * The core has no own clock, radio or RNG: everything arrives via the
+ * callbacks in mimeshi_init(). The simulator provides them (virtual radio);
+ * on firmware the platform layer provides them. No dynamic allocation;
+ * all buffers are fixed.
  *
- * De node-struct staat volledig in de header, zodat nodes statisch kunnen
- * worden gereserveerd (geen heap). Interne velden zijn read-only voor de
- * platformlaag.
+ * The node struct lives entirely in the header so nodes can be reserved
+ * statically (no heap). Internal fields are read-only for the platform
+ * layer.
  */
 #ifndef MCORE_H
 #define MCORE_H
@@ -16,27 +17,28 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* ---------------- configuratie (firmwareconstanten) ---------------- */
+/* ---------------- configuration (firmware constants) ---------------- */
 #define MC_N_CHANNELS    3
 #define MC_MAX_NEIGHBORS 64
 #define MC_MAX_PENDING   16
 #define MC_MAX_DEDUP    128
 #define MC_MAX_PAYLOAD  230
 
-/* ---------------- interne typen (zichtbaar voor vaste allocatie) ---- */
+/* ---------------- internal types (visible for fixed allocation) ---- */
 typedef struct {
     uint16_t id;
-    uint8_t  quality;      /* afgeleid van RSSI, bijgewerkt per hello/ack */
-    uint8_t  ack_try;      /* teller per buur (4.1): elke identificerende
-                              zending van de buur telt; ack-pogingen op de
-                              tellerstanden 1, 2, 4, 8, 16, daarna gemiddeld
-                              1 op 16; reset bij bevestiging of hernieuwd contact */
+    uint8_t  quality;      /* derived from RSSI, updated per hello/ack */
+    uint8_t  ack_try;      /* counter per neighbor (4.1): every identifying
+                              transmission of the neighbor counts; ack
+                              attempts at counter values 1, 2, 4, 8, 16,
+                              then on average 1 in 16; reset on
+                              confirmation or renewed contact */
     uint32_t last_seen;
-    uint16_t state_ver;    /* laatst geziene state-versie van deze buur (4.3) */
+    uint16_t state_ver;    /* last seen state version of this neighbor (4.3) */
     uint8_t  alive;
-    uint8_t  sym;           /* 1 = bevestigd symmetrisch (geslaagde unicast
-                               met ack1 of tablepull van de buur); 0 =
-                               alleen gezien, één richting (4.2, 10.1) */
+    uint8_t  sym;           /* 1 = confirmed symmetric (successful unicast
+                               with ack1 or tablepull from the neighbor);
+                               0 = only seen, one direction (4.2, 10.1) */
 } mimeshi_neighbor;
 
 typedef struct {
@@ -51,7 +53,7 @@ typedef struct { uint16_t msg_id, src; } mimeshi_dedup;
 struct mimeshi_node;
 typedef struct mimeshi_node mimeshi_node;
 
-/* ---------------- hardware-interface -------------------------------- */
+/* ---------------- hardware interface -------------------------------- */
 typedef void (*mimeshi_tx_fn)(mimeshi_node *n, uint8_t channel, const uint8_t *pkt,
                             uint16_t len, uint64_t airtime_us);
 typedef void (*mimeshi_timer_fn)(mimeshi_node *n, uint64_t delay_us,
@@ -68,37 +70,39 @@ struct mimeshi_node {
     mimeshi_neighbor nbr[MC_MAX_NEIGHBORS];
     mimeshi_pending  pend[MC_MAX_PENDING];
     mimeshi_dedup    dedup[MC_MAX_DEDUP];
-    uint64_t hello_interval_us;       /* adaptief: 30 s -> 1 u */
-    uint64_t hello_jitter_us;         /* random fase per ronde; 0 = geen jitter.
-                                         Default MC_HELLO_JITTER_US; voor de
-                                         simulatie in te stellen vóór mimeshi_start */
-    uint8_t  ka_idle[MC_N_CHANNELS];  /* stillteteller per kanaal in keepaliveticks
-                                         (4.1): elke eigen identificerende zending
-                                         op kanaal c zet hem op 0; na 64 ticks
-                                         (= T_keepalive, core.c) stilte volgt
-                                         precies één hello op c */
+    uint64_t hello_interval_us;       /* adaptive: 30 s -> 1 h */
+    uint64_t hello_jitter_us;         /* random phase per round; 0 = no jitter.
+                                         Default MC_HELLO_JITTER_US; the
+                                         simulation can set it before mimeshi_start */
+    uint8_t  ka_idle[MC_N_CHANNELS];  /* silence counter per channel in
+                                         keepalive ticks (4.1): every own
+                                         identifying transmission on channel c
+                                         sets it to 0; after 64 ticks
+                                         (= T_keepalive, core.c) of silence
+                                         exactly one hello follows on c */
     mimeshi_tx_fn     tx;
     mimeshi_timer_fn  timer;
     mimeshi_switch_fn switch_ch;
     mimeshi_rand_fn   rand;
-    void *user;                       /* eigen data van platform/simulator */
+    void *user;                       /* own data of platform/simulator */
 };
 
 /* ---------------- API ----------------------------------------------- */
-/* Initialiseert de node (nuldekking + callbacks). id bepaalt het thuiskanaal. */
+/* Initializes the node (zeroing + callbacks). The id determines the home channel. */
 void mimeshi_init(mimeshi_node *n, uint16_t id, mimeshi_tx_fn tx, mimeshi_timer_fn timer,
                 mimeshi_switch_fn sw, mimeshi_rand_fn rnd, void *user);
 
-/* Eerste hello-ronde direct, daarna opstartrondes met random fase (jitter);
- * na de opstartfase bestaat de hello alleen nog als per-kanaal-keepalive (4.1). */
+/* First hello round immediately, then startup rounds with random phase
+ * (jitter); after the startup phase the hello only survives as
+ * per-channel keepalive (4.1). */
 void mimeshi_start(mimeshi_node *n);
 
-/* Unicast naar dst. 0 = geaccepteerd, -1 = dst niet in de kaart (geen flood),
- * -2 = geen pending-slot vrij, -3 = payload te groot. */
+/* Unicast to dst. 0 = accepted, -1 = dst not in the map (no flood),
+ * -2 = no free pending slot, -3 = payload too large. */
 int  mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload,
                      uint16_t len, bool want_ack3);
 
-/* Pakket ontvangen (van radio of simulator). ch = kanaal van ontvangst. */
+/* Packet received (from radio or simulator). ch = channel of reception. */
 void mimeshi_rx(mimeshi_node *n, uint8_t channel, int8_t rssi_db,
               const uint8_t *pkt, uint16_t len);
 

@@ -1,9 +1,9 @@
 /*
- * host_radio.c — hardware-laag voor ontwikkeling op een werkstation (stub).
+ * host_radio.c — hardware layer for development on a workstation (stub).
  *
- * De echte platforms (nrf52/, esp32/) vervangen alleen deze laag; de kern
- * blijft ongewijzigd (ontwerp 13b). Deze stub logt de vier callbacks op stdout
- * zodat de koppeltest ook zonder Python draaibaar is.
+ * The real platforms (nrf52/, esp32/) only replace this layer; the core
+ * stays unchanged (design 13b). This stub logs the four callbacks to
+ * stdout so the link test also runs without Python.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,13 +13,13 @@
 
 void host_tx(mimeshi_node *n, uint8_t ch, const uint8_t *pkt, uint16_t len, uint64_t airtime) {
     (void)n;
-    printf("[host] tx kanaal %u: type %02X (%u B, %llu ms)\n",
+    printf("[host] tx channel %u: type %02X (%u B, %llu ms)\n",
            ch, pkt[0], len, (unsigned long long)(airtime / 1000));
 }
 
 void host_timer(mimeshi_node *n, uint64_t delay_us, void (*cb)(mimeshi_node *, void *), void *ud) {
     (void)n; (void)delay_us; (void)cb; (void)ud;
-    /* stub: echte timing zit in de simulator, niet hier */
+    /* stub: real timing lives in the simulator, not here */
 }
 
 void host_switch(mimeshi_node *n, uint8_t ch, uint64_t s_us, void (*done)(mimeshi_node *, void *), void *ud) {
