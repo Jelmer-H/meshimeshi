@@ -27,7 +27,7 @@
 #define MC_SYM_MARGIN_US  7200000000ull  /* 2 h flush margin (4.2) */
 #define MC_T_ACK2_US      7000000ull    /* ack2 wait window at the sender (7.3, proposal) */
 #define MC_MAX_ROUTE_NBR  3             /* neighbours tried per hop (7.4) */
-#define MC_MAX_2HOP      128            /* 2-hop map entries (10.1) */
+#define MC_MAX_KNOWN     256            /* known map entries (10.1) */
 #define MC_CHUNK_PERIOD_US 120000000ull /* 2 min: one table-chunk slice on air (4.3) */
 #define MC_CHUNK_ENTRIES 17             /* entries per chunk: 4 + 17 x 7 = 123 B (4.3) */
 #define MC_GEO_UNKNOWN   0x7fff         /* int16 sentinel: geo not known (10.2) */
@@ -58,16 +58,21 @@ typedef struct {
                                0 = only seen, one direction (4.2, 10.1) */
 } mimeshi_neighbor;
 
-/* 2-hop map entry (10.1): node X heard via neighbor N. Filled from the
- * table chunks of N (4.3): an entry for X in N's chunk proves N hears X
- * and gives X's geo. Routing uses these for the 2-hop case and greedy. */
+/* Known map entry (10.1): node X, learned via the entry of another node.
+ * The map has no hop limit: every chunk entry a node receives lands here,
+ * wherever it came from. Capped at MC_MAX_KNOWN; on overflow the entries
+ * with the best score stay -- quality toward us, freshness, and hub role
+ * (how many of our entries travel via this one). The score is local and
+ * cheap: computable from the stored entry without airtime. */
 typedef struct {
-    uint16_t id, via;       /* X, and the direct neighbor N that hears X */
-    uint8_t  quality;       /* N's advertised quality of X */
+    uint16_t id, via;       /* X, and the node whose chunk carried X */
+    uint8_t  quality;       /* advertised quality of X at the sender */
+    uint8_t  score;         /* eviction score (10.1): quality + freshness +
+                                hub role, updated on insert/refresh */
     int16_t  geox, geoy;    /* position of X (10.2); MC_GEO_UNKNOWN = not known */
     uint8_t  alive;
-    uint8_t  sym;           /* reserved: 2-hop symmetry needs N's claim + our
-                              reception; routing demands only via confirmed */
+    uint8_t  sym;           /* reserved: hop selection demands a confirmed
+                              direct neighbour (10.1) */ 
 } mimeshi_2hop;
 
 typedef struct {
@@ -112,7 +117,7 @@ struct mimeshi_node {
                                          not set; the simulator sets it before
                                          start, firmware from GPS */
     mimeshi_neighbor nbr[MC_MAX_NEIGHBORS];
-    mimeshi_2hop    hop2[MC_MAX_2HOP]; /* 2-hop map (10.1), via table chunks */
+    mimeshi_2hop    known[MC_MAX_KNOWN]; /* known map (10.1), via chunks and snooping */
     mimeshi_pending  pend[MC_MAX_PENDING];
     mimeshi_dedup    dedup[MC_MAX_DEDUP];
     uint64_t hello_interval_us;       /* adaptive: 30 s -> 1 h */

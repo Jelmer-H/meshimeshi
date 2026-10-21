@@ -323,7 +323,9 @@ static void proof_tick(mimeshi_node *n, void *ud) {
     n->timer(n, MC_KEEPALIVE_TICK_US, proof_tick, 0);
 }
 
-static mimeshi_2hop *hop2_find(mimeshi_node *n, uint16_t id);
+static mimeshi_2hop *known_find(mimeshi_node *n, uint16_t id);
+static mimeshi_2hop *known_upsert(mimeshi_node *n, uint16_t id, uint16_t via,
+                                  uint8_t quality, int16_t gx, int16_t gy);
 
 /* ---------------- table chunks (4.3) ----------------
  * Push, no pull, no ack (4.3): every slice of the own neighbor table
@@ -339,18 +341,33 @@ static void chunk_send(mimeshi_node *n) {
     p[0] = PKT_TABLE_CHUNK; wr16(p + 1, n->id);
     wr16(p + 3, (uint16_t)n->geox); wr16(p + 5, (uint16_t)n->geoy);  /* owner geo (4.3) */
     uint8_t cnt = 0;
+    /* confirmed direct neighbours first (10.1): the entries that promise a
+     * usable route and carry the freshest quality */
     for (int i = 0; i < MC_MAX_NEIGHBORS && cnt < MC_CHUNK_ENTRIES; i++) {
         mimeshi_neighbor *nb = &n->nbr[i];
-        if (!nb->alive || !nb->sym) continue;   /* only confirmed links (10.1):
-                                                   a chunk entry promises a
-                                                   usable route, and routing
-                                                   may only use confirmed
-                                                   links */
+        if (!nb->alive || !nb->sym) continue;
         uint8_t *e = p + 8 + 7 * cnt;
         wr16(e, nb->id);
         e[2] = nb->quality;
         wr16(e + 3, (uint16_t)nb->geox); wr16(e + 5, (uint16_t)nb->geoy);
         cnt++;
+    }
+    /* then the best known-map entries (10.1): knowledge diffuses outward,
+     * bounded by the chunk size. Highest eviction score first; advertised
+     * entries are damped so the next round carries others. */
+    while (cnt < MC_CHUNK_ENTRIES) {
+        int best = -1; uint8_t bs = 0;
+        for (int i = 0; i < MC_MAX_KNOWN; i++)
+            if (n->known[i].alive && n->known[i].score > bs) { bs = n->known[i].score; best = i; }
+        if (best < 0 || bs == 0) break;
+        mimeshi_2hop *h = &n->known[best];
+        if (nbr_find(n, h->id)) { h->score = 0; continue; }
+        uint8_t *e = p + 8 + 7 * cnt;
+        wr16(e, h->id);
+        e[2] = h->quality;
+        wr16(e + 3, (uint16_t)h->geox); wr16(e + 5, (uint16_t)h->geoy);
+        cnt++;
+        h->score = 0;
     }
     p[7] = cnt;
     n->tx(n, n->home_ch, p, (uint16_t)(8 + 7 * cnt), t_data_us((uint16_t)(8 + 7 * cnt)));
@@ -391,15 +408,7 @@ static void chunk_recv(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *
         const uint8_t *e = pkt + 8 + 7 * i;
         uint16_t x = rd16(e);
         if (x == n->id || x == from) continue;        /* ourselves or the sender: no 2-hop entry */
-        mimeshi_2hop *h = hop2_find(n, x);
-        if (!h) {
-            for (int j = 0; j < MC_MAX_2HOP; j++)
-                if (!n->hop2[j].alive) { h = &n->hop2[j]; break; }
-        }
-        if (!h) continue;                             /* map full: entry skipped */
-        h->alive = 1; h->id = x; h->via = from;
-        h->quality = e[2];
-        h->geox = (int16_t)rd16(e + 3); h->geoy = (int16_t)rd16(e + 5);
+        known_upsert(n, x, from, e[2], (int16_t)rd16(e + 3), (int16_t)rd16(e + 5));
     }
     /* an entry for US in the neighbour's chunk is reverse evidence
      * (4.3): "I hear X" confirms at X, in a single reception, both
@@ -513,10 +522,52 @@ static int32_t geo_dist2(int16_t ax, int16_t ay, int16_t bx, int16_t by) {
 }
 
 /* Look up a 2-hop entry: node id -> via which direct neighbour. */
-static mimeshi_2hop *hop2_find(mimeshi_node *n, uint16_t id) {
-    for (int i = 0; i < MC_MAX_2HOP; i++)
-        if (n->hop2[i].alive && n->hop2[i].id == id) return &n->hop2[i];
+static mimeshi_2hop *known_find(mimeshi_node *n, uint16_t id) {
+    for (int i = 0; i < MC_MAX_KNOWN; i++)
+        if (n->known[i].alive && n->known[i].id == id) return &n->known[i];
     return 0;
+}
+
+/* Eviction score of a known-map entry (10.1): quality of the link that
+ * carried it, freshness, and hub role. Direct neighbours score highest
+ * (they are the hop candidates); far entries with a low quality and a
+ * weak hub role are displaced first. Purely local. */
+static uint8_t known_score(mimeshi_node *n, uint16_t via, uint8_t quality) {
+    mimeshi_neighbor *nb = nbr_find(n, via);
+    int s = quality;
+    if (nb && nb->sym) s += 32;                   /* confirmed direct via: strongest */
+    else if (nb) s += 16;                         /* seen direct via */
+    for (int i = 0; i < MC_MAX_KNOWN; i++)        /* hub role: others travel via this entry */
+        if (n->known[i].alive && n->known[i].via == via) s++;
+    if (s > 255) s = 255;
+    return (uint8_t)s;
+}
+
+/* Insert or refresh a known-map entry; on a full map the weakest entry
+ * is displaced (10.1). Weaker-than-existing entries do not displace. */
+static mimeshi_2hop *known_upsert(mimeshi_node *n, uint16_t id, uint16_t via,
+                                  uint8_t quality, int16_t gx, int16_t gy) {
+    if (id == n->id) return 0;
+    mimeshi_2hop *h = known_find(n, id);
+    if (!h) {
+        int slot = -1;
+        uint8_t ns = known_score(n, via, quality);
+        for (int i = 0; i < MC_MAX_KNOWN; i++)
+            if (!n->known[i].alive) { slot = i; break; }
+        if (slot < 0) {                            /* full: displace the weakest */
+            uint8_t worst = 255; int wi = -1;
+            for (int i = 0; i < MC_MAX_KNOWN; i++)
+                if (n->known[i].score < worst) { worst = n->known[i].score; wi = i; }
+            if (worst >= ns) return 0;             /* the newcomer is the weakest: skip */
+            slot = wi;
+        }
+        h = &n->known[slot];
+        h->alive = 1; h->id = id; h->via = via;
+    }
+    h->quality = quality;
+    h->score = known_score(n, via, quality);
+    if (gx != MC_GEO_UNKNOWN) { h->geox = gx; h->geoy = gy; }
+    return h;
 }
 
 /* Candidate for the next hop: quality, penalised on failures (10.4). */
@@ -538,12 +589,15 @@ static mimeshi_neighbor *route_next(mimeshi_node *n, uint16_t dst,
         if (!nb->alive || nb == excl) continue;
         if (nb->id == dst && nb->sym) return nb;
     }
-    /* 2. two-hop via a confirmed neighbour */
-    mimeshi_2hop *h = hop2_find(n, dst);
+    /* 2. known map: the entry names a via; if that via is a confirmed
+     * direct neighbour, it is the hop candidate toward dst (10.2). The
+     * entry itself only gives direction -- the hop runs over a confirmed
+     * direct link (10.1). */
+    mimeshi_2hop *h = known_find(n, dst);
     if (h) {
         mimeshi_neighbor *via = nbr_find(n, h->via);
         if (via && via->sym && via != excl) {
-            best = via; best_score = route_score(n, via) + 64;   /* 2-hop wins over greedy */
+            best = via; best_score = route_score(n, via) + 64;   /* via the map beats greedy */
         }
     }
     /* 3. greedy on geo (10.2): the confirmed neighbour closest to dst */
@@ -563,7 +617,7 @@ static mimeshi_neighbor *route_next(mimeshi_node *n, uint16_t dst,
 
 /* destination geo for dst: the 2-hop map first, then the direct table */
 static void route_dst_geo(mimeshi_node *n, uint16_t dst, int16_t *gx, int16_t *gy) {
-    mimeshi_2hop *h = hop2_find(n, dst);
+    mimeshi_2hop *h = known_find(n, dst);
     if (h && h->geox != MC_GEO_UNKNOWN) { *gx = h->geox; *gy = h->geoy; return; }
     mimeshi_neighbor *nb = nbr_find(n, dst);
     if (nb && nb->geox != MC_GEO_UNKNOWN) { *gx = nb->geox; *gy = nb->geoy; return; }
@@ -699,7 +753,7 @@ static int send_data_internal(mimeshi_node *n, uint16_t dst, const uint8_t *payl
     route_dst_geo(n, dst, &dgx, &dgy);
     mimeshi_neighbor *nx = route_next(n, dst, dgx, dgy, 0);
     if (!nx) {
-        if (dgx == MC_GEO_UNKNOWN && !hop2_find(n, dst)) return -1;  /* unknown: do not flood (10.2) */
+        if (dgx == MC_GEO_UNKNOWN && !known_find(n, dst)) return -1;  /* unknown: do not flood (10.2) */
         /* geo known but void (10.3): refused here, waypoint/perimeter follow later */
         return -1;
     }

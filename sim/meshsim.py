@@ -576,11 +576,11 @@ def multihop(mk, jitter):
     interval = 3_600_000_000 // max(_ARGS.rate, 1)
     by_id = {kn.id: kn for kn in nodes}
 
-    def in_2hop(kn, x):
+    def in_known(kn, x):
         """x lies in the 2-hop map of kn (learned via chunks, 4.3)."""
         core = kn.core
         if not isinstance(core, CCore): return False
-        return any(h.alive and h.id == x for h in core.mn.hop2)
+        return any(h.alive and h.id == x for h in core.mn.known)
 
     def route_confirmed(kn, x):
         """x is reachable from kn over fully confirmed links: a confirmed
@@ -591,7 +591,7 @@ def multihop(mk, jitter):
         if not isinstance(core, CCore): return False
         nb = [e for e in core.mn.nbr if e.alive and e.id == x and e.sym]
         if nb: return True
-        for h in core.mn.hop2:
+        for h in core.mn.known:
             if not h.alive or h.id != x: continue
             via = [e for e in core.mn.nbr if e.alive and e.id == h.via and e.sym]
             if not via: continue

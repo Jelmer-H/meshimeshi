@@ -306,7 +306,7 @@ class Node:
 # Struct layout verified against sizeof/offsetof of core.h
 # (neighbor 12, pending 256, node 5448 B).
 # ---------------------------------------------------------------------------
-MC_MAX_NEIGHBORS, MC_MAX_PENDING, MC_MAX_DEDUP, MC_MAX_PAYLOAD, MC_MAX_2HOP = 64, 16, 128, 230, 128
+MC_MAX_NEIGHBORS, MC_MAX_PENDING, MC_MAX_DEDUP, MC_MAX_PAYLOAD, MC_MAX_KNOWN = 64, 16, 128, 230, 256
 
 class CNeighbor(ctypes.Structure):
     _fields_ = [("id", ctypes.c_uint16), ("quality", ctypes.c_uint8),
@@ -318,7 +318,7 @@ class CNeighbor(ctypes.Structure):
 
 class C2Hop(ctypes.Structure):
     _fields_ = [("id", ctypes.c_uint16), ("via", ctypes.c_uint16),
-                ("quality", ctypes.c_uint8),
+                ("quality", ctypes.c_uint8), ("score", ctypes.c_uint8),
                 ("geox", ctypes.c_int16), ("geoy", ctypes.c_int16),
                 ("alive", ctypes.c_uint8), ("sym", ctypes.c_uint8)]
 
@@ -353,11 +353,12 @@ RAND_FN = ctypes.CFUNCTYPE(ctypes.c_uint32, ctypes.POINTER(CNode))
 CNode._fields_ = [
     ("id", ctypes.c_uint16), ("home_ch", ctypes.c_uint8), ("local_tbl_ctr", ctypes.c_uint16),
     ("geox", ctypes.c_int16), ("geoy", ctypes.c_int16),
-    ("nbr", CNeighbor * MC_MAX_NEIGHBORS), ("hop2", C2Hop * MC_MAX_2HOP),
+    ("nbr", CNeighbor * MC_MAX_NEIGHBORS), ("known", C2Hop * MC_MAX_KNOWN),
     ("pend", CPending * MC_MAX_PENDING),
     ("dedup", CDedup * MC_MAX_DEDUP), ("hello_interval_us", ctypes.c_uint64),
     ("hello_jitter_us", ctypes.c_uint64),
     ("ka_idle", ctypes.c_uint8 * 3),   # keepalive counters per channel (4.1)
+    ("chunk_ctr_last", ctypes.c_uint32),  # table counter at the last chunk push (4.3)
     ("proof_wait", ctypes.c_uint8 * 3),  # flush countdown per channel (4.2)
     ("tx", TX_FN), ("timer", TIMER_FN), ("switch_ch", SWITCH_FN), ("rand", RAND_FN),
     ("user", ctypes.c_void_p),
