@@ -59,20 +59,27 @@
  * Fixed values from the table in 14.1. The core passes the airtime to
  * tx() so the platform layer can schedule the transmit window; the
  * functions are deliberately simple (three classes) instead of an exact
- * LoRa airtime formula. */
-static uint64_t t_ack_us(void)        { return 78000ull; }
-static uint64_t t_hello_us(void)      { return 70000ull; }
+ * LoRa airtime formula. hello: 3 B, hello-ack/proof list: 5 B and 3+2n B
+ * (6.2); ack1/ack2: 7 B. */
+static uint64_t t_ack_us(void)        { return 78000ull; }   /* ack1/ack2: 7 B */
+static uint64_t t_hello_us(void)      { return 62000ull; }   /* hello: 3 B (6.3) */
+static uint64_t t_hack_us(void)       { return 70000ull; }   /* hello-ack: 5 B (6.2) */
+static uint64_t t_proof_us(uint8_t n) { (void)n; return 70000ull; }  /* proof list: 3+2n B, n<=17 -> 37 B max; one class (4.2) */
 static uint64_t t_data_us(uint16_t l) { return l <= 40 ? 173000ull : l <= 150 ? 459000ull : 869000ull; }
 
 /* ---------------- packet types and formats ----------------
  * Type byte: low nibble = type, high nibble = flags (6.1). All
  * multi-byte fields little-endian (rd16/wr16). Layouts:
  *
- *   HELLO       5 B   type, node-id(2), state version neighbor table(2)  (4.1, 6.3)
- *   HELLO_ACK   7 B   type, destination-id(2) = hello sender,
- *                     sender-id(2), state version(2) — directional:
- *                     the address makes the ack an exact symmetry proof
- *                     (78 ms airtime; 2, 4.2)
+ *   HELLO       3 B   type, node-id(2)  (4.1, 6.3). Startup only: after the
+ *                     adaptive phase the hello no longer exists; the state
+ *                     version is dropped (no pull anymore, 4.3).
+ *   HELLO_ACK   5 B   type, destination-id(2) = hello sender,
+ *                     sender-id(2) — directional: the address makes the ack
+ *                     an exact symmetry proof (5.1 ms symbol time incl.; 2, 4.2)
+ *   PROOF       3+2n B type, node-id(2), n x neighbour-id(2), n <= 17 (4.2).
+ *                     Reactionless keepalive + symmetry flush; an empty list
+ *                     is the minimal keepalive beacon (type + node-id).
  *   DATA      10+n B  type+F_ACK3_REQ, msg-id(2), source(2), destination(2),
  *                     previous-hop(2), budget(1, offset 9), payload(n)  (6.1)
  *   ACK1        7 B   type, msg-id(2), source of the message(2), sender(2) (6.2)
@@ -83,7 +90,7 @@ static uint64_t t_data_us(uint16_t l) { return l <= 40 ? 173000ull : l <= 150 ? 
  * their future function and are ignored at the moment.
  */
 enum {
-    PKT_HELLO = 1, PKT_HELLO_ACK, PKT_TABLE_PULL, PKT_TABLE_CHUNK,
+    PKT_HELLO = 1, PKT_HELLO_ACK, PKT_PROOF, PKT_TABLE_CHUNK,
     PKT_DATA, PKT_ACK1, PKT_ACK2, PKT_ACK3, PKT_FAIL_RPT
 };
 #define F_ACK3_REQ 0x10   /* requested by the source of the message (11) */
@@ -121,17 +128,16 @@ static uint8_t quality_of(int8_t rssi) {
     return (uint8_t)(rssi < 0 ? (rssi + 128) >> 1 : 63);
 }
 
-/* Add a neighbor (from a hello or hello-ack). Full = return 0; the caller
- * continues without the neighbor. A new entry starts as "seen": one
- * direction, sym = 0 (4.2). my_state_ver increments on every mutation:
- * the hello carries that version so neighbors see that a tablepull is
- * needed (4.3). */
+/* Add a neighbor (from a hello, hello-ack or proof list). Full = return 0;
+ * the caller continues without the neighbor. A new entry starts as "seen":
+ * one direction, sym = 0 (4.2). The local table counter feeds push-window
+ * bundling (4.3); it never goes on air. */
 static mimeshi_neighbor *nbr_add(mimeshi_node *n, uint16_t id) {
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
         if (!n->nbr[i].alive) {
             n->nbr[i].alive = 1; n->nbr[i].id = id;
             n->nbr[i].sym = 0; n->nbr[i].ack_try = 0;
-            n->my_state_ver++;
+            n->local_tbl_ctr++;
             return &n->nbr[i];
         }
     return 0;
@@ -199,16 +205,16 @@ static void bound_send(mimeshi_node *n, uint8_t ch, const uint8_t *pkt, uint16_t
 
 /* ---------------- hello (4.1) ---------------- */
 
-/* One hello round: the same packet on all three channels, in fixed
+/* One hello round: the same 3 B packet on all three channels, in fixed
  * order. Reasons (2): neighbors sit randomly on all home channels, and
  * the fixed order gives responders a predictable moment when the sender
  * is listening on its own channel again — their hello-acks go there.
- * Cost: 3 x 5 B with adaptive interval. */
+ * Startup only (4.1). Cost: 3 x 3 B with adaptive interval. */
 static void hello_round(mimeshi_node *n) {
-    uint8_t p[5] = { PKT_HELLO, 0,0,0,0 };
-    wr16(p + 1, n->id); wr16(p + 3, n->my_state_ver);
+    uint8_t p[3] = { PKT_HELLO, 0, 0 };
+    wr16(p + 1, n->id);
     for (uint8_t c = 0; c < MC_N_CHANNELS; c++) {          /* fixed order */
-        bound_send(n, c, p, 5, t_hello_us());
+        bound_send(n, c, p, 3, t_hello_us());
         ka_called(n, c);                                   /* own call on c (4.1) */
     }
     /* after the round the node is home; hello-acks arrive there (within the window) */
@@ -240,54 +246,84 @@ static void hello_tick(mimeshi_node *n, void *ud) {
     n->timer(n, n->hello_interval_us + hello_jitter(n), hello_tick, 0);
 }
 
-/* Keepalive hello on channel c (4.1): exactly one hello, not a round —
- * only the channel that has been silent for an hour. With the usual
- * random phase, so quiet regions desynchronize on their own (4.1,
- * link test). */
-static void ka_fire(mimeshi_node *n, void *ud) {
-    uint8_t c = (uint8_t)(size_t)ud;
-    uint8_t p[5] = { PKT_HELLO, 0,0,0,0 };
-    wr16(p + 1, n->id); wr16(p + 3, n->my_state_ver);
-    bound_send(n, c, p, 5, t_hello_us());
-    ka_called(n, c);                        /* counter only runs again from this call */
-}
+/* Proof list for channel c (4.2): type, node-id, then the ids of the
+ * direct neighbors at home on c whose reverse-direction evidence
+ * ("last proven") expires within the flush margin. Reactionless by
+ * design: no receiver ever replies. An empty list is the minimal
+ * keepalive beacon (4.1). The packet is an own call on c and resets the
+ * keepalive counter of c.
+ *
+ * Combined trigger (4.2): the flush check runs every 20 min rotating
+ * per channel; a channel that has been silent for T_keepalive pulls
+ * its moment forward -- same packet, one airtime for both roles.
+ * Cap: at most one proof list per channel per hour. */
+#define MC_PROOF_MAX_IDS 17
 
-/* The keepalive time base: the core has no clock, so it counts silence
- * in ticks. If MC_KEEPALIVE_TICKS of silence (= T_keepalive) have passed
- * on channel c, exactly one hello follows on c, scheduled with jitter.
- * Reschedules itself; started in mimeshi_start(). During the startup
- * phase the round rhythm keeps resetting the counter — keepalive and
- * round therefore do not disturb each other. */
-static void ka_tick(mimeshi_node *n, void *ud) {
-    (void)ud;
-    for (uint8_t c = 0; c < MC_N_CHANNELS; c++) {
-        if (n->ka_idle[c] < MC_KEEPALIVE_TICKS) n->ka_idle[c]++;
-        if (n->ka_idle[c] >= MC_KEEPALIVE_TICKS) {
-            n->ka_idle[c] = 0;              /* counter reset on scheduling: one hello, no storm */
-            n->timer(n, hello_jitter(n), ka_fire, (void *)(size_t)c);
+static void proof_send(mimeshi_node *n, uint8_t c) {
+    uint8_t p[3 + 2 * MC_PROOF_MAX_IDS] = { PKT_PROOF, 0, 0 };
+    uint8_t cnt = 0;
+    wr16(p + 1, n->id);
+    for (int i = 0; i < MC_MAX_NEIGHBORS && cnt < MC_PROOF_MAX_IDS; i++) {
+        mimeshi_neighbor *nb = &n->nbr[i];
+        if (!nb->alive || !nb->sym) continue;       /* flush works on confirmed links */
+        if ((uint8_t)(nb->id % MC_N_CHANNELS) != c) continue;  /* sub-list per channel */
+        if (nb->proven_age_us >= MC_T_SYM_US - MC_SYM_MARGIN_US) {  /* inside flush margin */
+            wr16(p + 3 + 2 * cnt, nb->id);
+            cnt++;
         }
     }
-    n->timer(n, MC_KEEPALIVE_TICK_US, ka_tick, 0);
+    bound_send(n, c, p, (uint16_t)(3 + 2 * cnt), t_proof_us(cnt));
+    ka_called(n, c);            /* own call: keepalive counter of c resets (4.1) */
+}
+
+static void proof_fire(mimeshi_node *n, void *ud) {
+    proof_send(n, (uint8_t)(size_t)ud);
+}
+
+/* Flush check, rotating per channel (4.2). Each channel has its own
+ * countdown in proof_wait[] ticks; the stagger (c x MC_PROOF_ROT_TICKS)
+ * gives each channel one flush moment per hour, 20 minutes apart: no
+ * self-congestion. Next to the countdown, a channel silent for
+ * T_keepalive (ka_idle at max) is due NOW even without its slot -- the
+ * keepalive trigger pulls the moment forward (4.1). The countdown
+ * restarts at MC_KEEPALIVE_TICKS (= 1 h) on every fire: that is the cap,
+ * one proof list per channel per hour maximum.
+ */
+#define MC_PROOF_ROT_TICKS (MC_KEEPALIVE_TICKS / MC_N_CHANNELS)  /* 20 min in ticks (4.2) */
+static void proof_tick(mimeshi_node *n, void *ud) {
+    (void)ud;
+    for (int i = 0; i < MC_MAX_NEIGHBORS; i++)          /* evidence ages per tick (4.2) */
+        if (n->nbr[i].alive && n->nbr[i].proven_age_us < MC_T_SYM_US)
+            n->nbr[i].proven_age_us += MC_KEEPALIVE_TICK_US;
+    for (uint8_t c = 0; c < MC_N_CHANNELS; c++) {
+        if (n->ka_idle[c] < MC_KEEPALIVE_TICKS) n->ka_idle[c]++;
+        uint8_t due = n->proof_wait[c] == 0 || n->ka_idle[c] >= MC_KEEPALIVE_TICKS;
+        if (due) {
+            n->ka_idle[c] = 0;              /* reset on scheduling: one packet, no storm */
+            n->proof_wait[c] = MC_KEEPALIVE_TICKS;        /* cap: next slot after 1 h */
+            n->timer(n, hello_jitter(n), proof_fire, (void *)(size_t)c);
+        } else n->proof_wait[c]--;
+    }
+    n->timer(n, MC_KEEPALIVE_TICK_US, proof_tick, 0);
 }
 
 /* Deliver a hello-ack on the HOME channel of the hello sender (2): the
  * sender is there after its round and catches all answers within the
  * response window. One exchange, then home.
  *
- * Directional format (7 B): the destination is the hello sender. Only
+ * Directional format (5 B): the destination is the hello sender. Only
  * because of that does the ack prove symmetry — the responder received
  * OUR hello (its ack is a reaction to it) and its ack reached us
  * (4.2, 10.1). That is the proof channel of the hello process:
- * available before the first unicast. Our own state version travels
- * along for the pull decision (4.3); eavesdroppers process the sender
- * as a minimal hello ("seen"). */
+ * available before the first unicast. Eavesdroppers process the sender
+ * as a minimal hello ("seen"); the state version is dropped (4.3: no
+ * pull anymore). */
 static void hello_ack_fire(mimeshi_node *n, void *ud) {
     uint16_t to = (uint16_t)(uintptr_t)(size_t)ud;
-    uint8_t p[7] = { PKT_HELLO_ACK, 0,0, 0,0, 0,0 };
+    uint8_t p[5] = { PKT_HELLO_ACK, 0,0, 0,0 };
     wr16(p + 1, to);                       /* destination: the hello sender */
     wr16(p + 3, n->id);
-    wr16(p + 5, n->my_state_ver);
-    bound_send(n, (uint8_t)(to % MC_N_CHANNELS), p, 7, t_ack_us()); /* to HOME of the sender */
+    bound_send(n, (uint8_t)(to % MC_N_CHANNELS), p, 5, t_hack_us()); /* to HOME of the sender */
     ka_called(n, (uint8_t)(to % MC_N_CHANNELS));    /* own call on that channel (4.1) */
 }
 
@@ -461,24 +497,23 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
     uint8_t type = pkt[0] & 0x0F, flags = pkt[0] & 0xF0;
     switch (type) {
     case PKT_HELLO: {
-        /* update or add the neighbor, then schedule an ack. quality is
-         * the RSSI measurement of this reception; the state version of
-         * the neighbor is tracked for future tablepulls (4.3);
-         * last_seen is still a stub for now — real aging policy (4.4)
-         * follows. */
+        /* Startup beacon (3 B, 4.1): update or add the neighbor, then
+         * schedule an ack. Quality is the RSSI measurement of this
+         * reception; last_seen is still a stub — real aging policy (4.4)
+         * follows. No state version on air anymore (4.3). */
         uint16_t from = rd16(pkt + 1);
         mimeshi_neighbor *nb = nbr_find(n, from);
         if (!nb) nb = nbr_add(n, from);
         if (nb) {
             nb->last_seen = 0;
             nb->quality = quality_of(rssi);
-            nb->state_ver = rd16(pkt + 3);
+            nb->proven_age_us = 0;      /* fresh reception: reverse direction freshly measured */
         }
         hello_ack_wait(n, from, rssi);
         break;
     }
     case PKT_HELLO_ACK: {
-        /* Directional ack (7 B): destination = the original hello
+        /* Directional ack (5 B): destination = the original hello
          * sender.
          *  - Addressed to US: the responder received our hello and
          *    this ack reached us — both directions worked at that
@@ -486,18 +521,43 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
          *    channel of the hello process, available before the first
          *    unicast.
          *  - Addressed to someone else (snooping, 2): the sender is
-         *    processed as a minimal hello — id, state version (directly
-         *    from the source) and the quality measured here — but stays
-         *    "seen": one-direction proof, no symmetry. The ack triggers
-         *    no new reaction: the type byte serves that purpose. */
+         *    processed as a minimal hello — id and the quality measured
+         *    here — but stays "seen": one-direction proof, no symmetry.
+         *    The ack triggers no new reaction: the type byte serves
+         *    that purpose. */
         uint16_t dst = rd16(pkt + 1), from = rd16(pkt + 3);
         mimeshi_neighbor *nb = nbr_find(n, from);
         if (!nb) nb = nbr_add(n, from);
         if (nb) {
             nb->last_seen = 0;
             nb->quality = quality_of(rssi);
-            nb->state_ver = rd16(pkt + 5);
+            nb->proven_age_us = 0;      /* fresh reception of an identifying transmission */
             if (dst == n->id) { nb->sym = 1; nb->ack_try = 0; }   /* confirmed symmetric (4.2) */
+        }
+        break;
+    }
+    case PKT_PROOF: {
+        /* Proof list (4.2): type, node-id, n x neighbour-id. Reactionless:
+         * never reply, whatever the content. Two effects:
+         *  - WE appear in the list: the sender claims it hears us —
+         *    both directions confirmed in a single reception (4.2),
+         *    reverse evidence freshly refreshed.
+         *  - We do not appear: snooping — liveness and quality for the
+         *    sender, "seen" at most. No downgrade either: absence in
+         *    one packet is no negative evidence (4.2, decided). */
+        uint16_t from = rd16(pkt + 1);
+        uint16_t ids = (uint16_t)((len - 3) / 2);
+        mimeshi_neighbor *nb = nbr_find(n, from);
+        if (!nb) nb = nbr_add(n, from);
+        if (nb) {
+            nb->last_seen = 0;
+            nb->quality = quality_of(rssi);
+        }
+        /* appearing in the list = reverse evidence refreshed (4.2) */
+        for (uint16_t i = 0; i < ids; i++) {
+            if (rd16(pkt + 3 + 2 * i) == n->id && nb) {
+                nb->sym = 1; nb->ack_try = 0; nb->proven_age_us = 0;
+            }
         }
         break;
     }
@@ -520,7 +580,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
             if (p->active && p->msg_id == msg_id) {
                 p->active = 0;                     /* hop succeeded; ack2 arrives on its own on our home channel */
                 mimeshi_neighbor *nb = nbr_find(n, rd16(pkt + 5));
-                if (nb) { nb->sym = 1; nb->ack_try = 0; }  /* confirmed symmetric (4.2, 10.1) */
+                if (nb) { nb->sym = 1; nb->ack_try = 0; nb->proven_age_us = 0; }  /* confirmed symmetric (4.2, 10.1) */
                 printf("[core] node %u: ACK1 for msg %u\n", n->id, msg_id);
                 return;
             }
@@ -578,7 +638,7 @@ void mimeshi_init(mimeshi_node *n, uint16_t id, mimeshi_tx_fn tx, mimeshi_timer_
                 mimeshi_switch_fn sw, mimeshi_rand_fn rnd, void *user) {
     memset(n, 0, sizeof(*n));
     n->id = id; n->home_ch = (uint8_t)(id % MC_N_CHANNELS);
-    n->my_state_ver = 1; n->hello_interval_us = MC_HELLO_START_US;
+    n->local_tbl_ctr = 1; n->hello_interval_us = MC_HELLO_START_US;
     n->hello_jitter_us = MC_HELLO_JITTER_US;
     n->tx = tx; n->timer = timer; n->switch_ch = sw; n->rand = rnd; n->user = user;
 }
@@ -586,11 +646,20 @@ void mimeshi_init(mimeshi_node *n, uint16_t id, mimeshi_tx_fn tx, mimeshi_timer_
 /* First hello round immediately (fast map building, 4.1), then the
  * adaptive timer with random phase. Idempotent for the rest of the
  * core: after start the hello runs on the timer; do not repeat
- * mimeshi_start() itself. */
+ * mimeshi_start() itself. After the startup phase the hello stops; the
+ * proof tick carries keepalive and symmetry flush from here (4.1, 4.2). */
+/* Stagger the flush moments (4.2): channel c is due for the first time
+ * after c x 20 min, so the three channels lie 20 minutes apart. */
+static void proof_stagger(mimeshi_node *n) {
+    for (uint8_t c = 0; c < MC_N_CHANNELS; c++)
+        n->proof_wait[c] = (uint8_t)(c * MC_PROOF_ROT_TICKS);
+}
+
 void mimeshi_start(mimeshi_node *n) {
     hello_round(n);
+    proof_stagger(n);
     /* random phase: prevents synchronous rounds on simultaneous startup (4.1) */
     n->timer(n, n->hello_interval_us + hello_jitter(n), hello_tick, 0);
-    /* keepalive tick: the time base for the per-channel keepalive (4.1) */
-    n->timer(n, MC_KEEPALIVE_TICK_US, ka_tick, 0);
+    /* proof tick: time base for keepalive + symmetry flush (4.1, 4.2) */
+    n->timer(n, MC_KEEPALIVE_TICK_US, proof_tick, 0);
 }
