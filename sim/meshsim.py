@@ -17,6 +17,8 @@ jitter is the max hello phase jitter in microseconds (None = core value).
 """
 import argparse, os, sys
 
+import random
+
 import simpy
 
 from sim1 import (radio_log, Node, CCore, load_lib, Wire, sym_count, nbr_counts,
@@ -274,6 +276,109 @@ def collision(mk, jitter):
     radio.run(until_us=31_000_000)
     report(radio)
 
+
+@scenario("traffic", "local-net + periodic unicast between confirmed symmetric neighbor pairs")
+def traffic(mk, jitter):
+    """Design 14.1 scenario 2 with workload: after the startup phase,
+    nodes send unicaasts to confirmed symmetric neighbors (10.1) at a
+    fixed request rate. Measures delivery ratio, retries/airtime under
+    load, collisions, home-deafness and duty against the 10% limit, and
+    whether the resting load (proof lists) still fits next to it.
+    CLI: --nodes --duration (hours) --rate (unicasts per hour per node),
+    --payload (bytes)."""
+    nodes_list = load_nodes_csv(_ARGS.nodes)
+    duration_us = _ARGS.duration * 3_600_000_000
+    rate_per_h = _ARGS.rate
+    payload_b = _ARGS.payload
+    radio = Radio()
+    radio.wire.open = False
+    lat0 = sum(n['lat'] for n in nodes_list) / len(nodes_list)
+    lon0 = sum(n['lon'] for n in nodes_list) / len(nodes_list)
+    pos = {n['id']: (*project(n['lat'], n['lon'], lat0, lon0), n['h']) for n in nodes_list}
+    nodes = []
+    for i, nd in enumerate(nodes_list):
+        kn = Node(radio, nd['id'])
+        kn.core = set_jitter(mk(kn), jitter)
+        nodes.append(kn)
+        radio.schedule(i * 250_000, kn.core.start)
+    ids = [n['id'] for n in nodes_list]
+    for a in ids:
+        for b in ids:
+            if a == b: continue
+            raw = linkbudget(pos[a], pos[b])
+            if raw is None: continue
+            fade = ((a * 31 + b * 17) % 11) - 5
+            r = raw + fade
+            if r >= RX_MIN_DBM:
+                radio.wire.links[(a, b)] = max(-128, min(120, round(r)))
+    out(f"{len(nodes_list)} nodes from {_ARGS.nodes}, "
+        f"{_ARGS.duration} h, {rate_per_h} unicast/h per node, payload {payload_b} B")
+
+    # delivery bookkeeping: msg-id -> (src, dst, attempts) via dedup at rx
+    attempted = [0]
+    delivered = [0]     # DATA receptions at the destination (dedup-fresh)
+    retries_seen = [0]  # duplicate receptions = retries of the same hop
+
+    base_rx = CCore.rx
+    def rx(self, arg):
+        ch, rssi, pkt = arg
+        if pkt and (pkt[0] & 0x0F) == 5 and len(pkt) > 10:
+            dst = pkt[5] | (pkt[6] << 8)
+            if dst == self.n.id:          # only the destination counts
+                src = pkt[3] | (pkt[4] << 8)
+                mid = pkt[1] | (pkt[2] << 8)
+                key = (mid, src)
+                if not hasattr(rx, '_seen'): rx._seen = set()
+                if key not in rx._seen:
+                    rx._seen.add(key)
+                    delivered[0] += 1
+                else:
+                    retries_seen[0] += 1
+        base_rx(self, arg)
+    CCore.rx = rx
+
+    payload = bytes(range(payload_b % 221))[:payload_b] if payload_b else b'x' * 8
+
+    # traffic generator: every interval a random node sends to a random
+    # confirmed symmetric neighbor (10.1); skipped if none yet (startup).
+    rng = random.Random(2026)
+    interval = 3_600_000_000 // max(rate_per_h, 1)
+    def gen():
+        cand = []
+        for kn in nodes:
+            if sym_count(kn):
+                cand.append(kn)
+        if cand:
+            kn = rng.choice(cand)
+            peers = [e.id for e in kn.core.mn.nbr if e.alive and e.sym]
+            if peers:
+                data = bytes(payload)
+                kn.core.send_data(rng.choice(peers), data, ack3=False)
+                attempted[0] += 1
+        radio.schedule(interval, gen)
+    radio.schedule(4_000_000_000, gen)      # from ~1 h: everyone confirmed
+    radio.run(until_us=duration_us)
+
+    out("\n=== Measurements ===")
+    att, dlv = attempted[0], delivered[0]
+    out(f"unicast attempts {att}, delivered {dlv} "
+        f"({100*dlv/max(att,1):.1f}% of attempts, retries seen {retries_seen[0]})")
+    for c in range(N_CH):
+        out(f"channel {c}: airtime {radio.airtime[c]/1e6:.3f} s, "
+            f"lost receptions {radio.wire.collided[c]}")
+    stats = [nbr_counts(kn) for kn in nodes]
+    conf = [s[1] for s in stats]
+    out(f"confirmed symmetric avg {sum(conf)/len(conf):.1f}, "
+        f"nodes without confirmed neighbor: {sum(1 for b in conf if b == 0)}")
+    away = [kn.away_total for kn in nodes]
+    out(f"home-deafness: avg {sum(away)/len(away)/1e6:.1f} s, max {max(away)/1e6:.1f} s "
+        f"({100*max(away)/max(radio.now,1):.2f}% of the time)")
+    usage = {(n, c): radio.duty.usage(n, c, radio.now) for n in ids for c in range(N_CH)}
+    top = sorted(usage.values(), reverse=True)[:5]
+    out(f"duty (sliding hour, limit 360 s): max {top[0]/1e6:.1f} s, "
+        f"top 5 {[f'{u/1e6:.1f}' for u in top]} s, "
+        f"above limit: {sum(1 for u in usage.values() if u > 360_000_000)}")
+
 # ---------------- CLI -------------------------------------------------------
 
 def main():
@@ -288,7 +393,11 @@ def main():
     ap.add_argument('--nodes', default=os.path.join(os.path.dirname(__file__), 'nodes', 'utrecht40.csv'),
                     help='node list (id,lat,lon,height_m,name) for local-net')
     ap.add_argument('--duration', type=int, default=8, metavar='HOURS',
-                    help='simulation duration in hours (local-net, default 8)')
+                    help='simulation duration in hours (local-net/traffic, default 8)')
+    ap.add_argument('--rate', type=int, default=6, metavar='PERHOUR',
+                    help='unicasts per hour per node (traffic, default 6)')
+    ap.add_argument('--payload', type=int, default=20, metavar='BYTES',
+                    help='unicast payload size in bytes (traffic, default 20)')
     args = ap.parse_args()
     global _ARGS
     _ARGS = args

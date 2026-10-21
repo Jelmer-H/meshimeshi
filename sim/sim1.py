@@ -402,8 +402,8 @@ class CCore:
         ch, rssi, pkt = arg
         buf = (ctypes.c_uint8 * len(pkt)).from_buffer_copy(pkt) if pkt else (ctypes.c_uint8 * 1)()
         self.lib.mimeshi_rx(ctypes.byref(self.mn), ch, rssi, buf, len(pkt))
-    def send_data(self, dst, text, ack3=True):
-        payload = text.encode()
+    def send_data(self, dst, data, ack3=True):
+        payload = data.encode() if isinstance(data, str) else bytes(data)
         rc = self.lib.mimeshi_send_data(ctypes.byref(self.mn), dst, payload, len(payload), ack3)
         if rc != 0:
             out(f"[sim] node {self.n.id:#06x}: transmission refused (rc={rc})")
