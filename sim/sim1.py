@@ -79,24 +79,24 @@ class Wire:
             if s1 is None:
                 continue                     # disturbance out of range does not interfere
             if s1 >= s + CAPTURE_DB:
-                return ("capture door", t0)
+                return ("capture by", t0)
             if s1 > s - CAPTURE_DB:
-                return ("botsing met", t0)
+                return ("collision with", t0)
         return None
 
 class DutyLedger:
     """Transmit time per (node, channel) in a sliding window — the 10%
     duty per channel (design 2). Records all transmissions of every Radio."""
-    def __init__(self, venster_us=3_600_000_000):
-        self.venster = venster_us
+    def __init__(self, window_us=3_600_000_000):
+        self.window = window_us
         self.log = {}                       # (node-id, channel) -> deque[(t, us)]
     def add(self, nid, ch, nu, us):
         d = self.log.setdefault((nid, ch), deque())
         d.append((nu, us))
-        while d and d[0][0] <= nu - self.venster:
+        while d and d[0][0] <= nu - self.window:
             d.popleft()
-    def gebruik(self, nid, ch, nu):
-        return sum(us for t, us in self.log.get((nid, ch), ()) if t > nu - self.venster)
+    def usage(self, nid, ch, nu):
+        return sum(us for t, us in self.log.get((nid, ch), ()) if t > nu - self.window)
 
 # ---------------- node list and link budget (scenario layer) -----------
 # Radio model (Proposal; NL calibration: Open, see design 14.1):
@@ -108,22 +108,22 @@ TX_DBM = 27.0          # ERP in the 869.4-869.65 MHz sub-band (500 mW)
 RX_MIN_DBM = -110.0    # reception threshold incl. fade margin
 FSPL_1KM_DB = 91.2    # free-space loss at 869 MHz over 1 km
 
-def load_nodes_csv(pad):
+def load_nodes_csv(path):
     """Node list with GPS position and height. Format per line:
     id,lat,lon,height_m,name — '#' is a comment."""
     nodes = []
-    with open(pad) as f:
-        for regel in f:
-            regel = regel.strip()
-            if not regel or regel.startswith('#'):
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
                 continue
-            d = [v.strip() for v in regel.split(',')]
+            d = [v.strip() for v in line.split(',')]
             nodes.append({'id': int(d[0], 0), 'lat': float(d[1]),
                           'lon': float(d[2]), 'h': float(d[3]),
-                          'naam': d[4] if len(d) > 4 else ''})
+                          'name': d[4] if len(d) > 4 else ''})
     return nodes
 
-def projecteer(lat, lon, lat0, lon0):
+def project(lat, lon, lat0, lon0):
     """Local flat projection in meters around (lat0, lon0): distances
     within a region are small enough for an approximation with cos(lat0)."""
     x = math.radians(lon - lon0) * 6371000.0 * math.cos(math.radians(lat0))
@@ -169,8 +169,8 @@ class Radio:  # virtual radio + clock
             if until_us is None and not self.q: return True
         return True
     def tx(self, node, ch, pkt, airtime):
-        radio_log(f"[{self.now/1e6:8.3f}s] node {node.id:#06x} zendt type {pkt[0]:#04x} "
-                  f"({len(pkt)} B, {airtime//1000} ms) op kanaal {ch}")
+        radio_log(f"[{self.now/1e6:8.3f}s] node {node.id:#06x} transmits type {pkt[0]:#04x} "
+                  f"({len(pkt)} B, {airtime//1000} ms) on channel {ch}")
         self.airtime[ch] += airtime
         ptype = pkt[0] & 0x0F
         if ptype == 1: self.hello_air[ch] += airtime
@@ -279,23 +279,23 @@ class Node:
             # the whole packet must have been heard: on the channel, and the
             # own transmission/switch must be past before the start of this packet
             if self.ch == ch and start >= self.deaf_until:
-                stooring = self.radio.wire.check(self.radio.now, self.id, tx_id, ch, start, self.radio.now)
-                if stooring:
-                    reden, door = stooring
+                disturbance = self.radio.wire.check(self.radio.now, self.id, tx_id, ch, start, self.radio.now)
+                if disturbance:
+                    reason, by = disturbance
                     self.collided += 1
                     self.radio.wire.collided[ch] += 1
                     if hello: self.hello_missed += 1
                     radio_log(f"[{self.radio.now/1e6:8.3f}s] node {self.id:#06x} verliest "
-                              f"type {pkt[0]:#04x} op kanaal {ch} ({reden} {door:#06x})")
+                              f"type {pkt[0]:#04x} on channel {ch} ({reason} {by:#06x})")
                     return
                 if hello: self.hello_rx += 1
                 self.core.rx((ch, rssi, pkt)); return
             if ch == HOME(self.id) or self.ch == ch:
                 if hello: self.hello_missed += 1
-                reden = ("bezig met eigen zending" if start < self.deaf_until
-                         else "van huis (exchange)")
+                reason = ("busy with own transmission" if start < self.deaf_until
+                          else "away from home (exchange)")
                 radio_log(f"[{self.radio.now/1e6:8.3f}s] node {self.id:#06x} hoort niets "
-                          f"op kanaal {ch} ({reden})")
+                          f"on channel {ch} ({reason})")
         self.radio.schedule(delay, deliver)
 
 # ---------------------------------------------------------------------------
@@ -402,7 +402,7 @@ class CCore:
         payload = text.encode()
         rc = self.lib.mimeshi_send_data(ctypes.byref(self.mn), dst, payload, len(payload), ack3)
         if rc != 0:
-            out(f"[sim] node {self.n.id:#06x}: zending geweigerd (rc={rc})")
+            out(f"[sim] node {self.n.id:#06x}: transmission refused (rc={rc})")
         return rc
 
 def sym_count(node):
@@ -427,7 +427,7 @@ def main():
     ap.add_argument('--so', default=os.path.join(os.path.dirname(__file__), '..', 'build', 'libmimeshi.so'))
     args = ap.parse_args()
     if not os.path.exists(args.so):
-        out(f"libmimeshi.so niet gevonden ({args.so}); bouw met gcc (zie README).")
+        out(f"libmimeshi.so not found ({args.so}); build with gcc (see README).")
         sys.exit(1)
     # let printf of the C core appear directly after the Python prints
     try:
@@ -442,7 +442,7 @@ def main():
     lib = load_lib(args.so)
     a.core = CCore(a, lib); b.core = CCore(b, lib)
 
-    out("=== Scenario 1: koppeltest (2 nodes, SF7, 62,5 kHz) ===")
+    out("=== Scenario 1: link test (2 nodes, SF7, 62.5 kHz) ===")
     a.core.start()
     radio.schedule(500_000, b.core.start)   # real nodes never start on the same
     # microsecond; 0.5 s keeps the first rounds free of overlap so the
@@ -451,24 +451,24 @@ def main():
     radio.run(until_us=1_500_000)           # first hello round + acks
 
     out("\n--- unicast A -> B (A knows B from the hello round) ---")
-    a.core.send_data(0x0101, "hallo mesh", ack3=True)
+    a.core.send_data(0x0101, "hello mesh", ack3=True)
     radio.run(until_us=3_000_000)          # hello-ack from A shows B the map
 
     out("\n--- unicast B -> A (after hello-ack: B knows A) ---")
-    b.core.send_data(0x0100, "terugbericht", ack3=True)
+    b.core.send_data(0x0100, "reply message", ack3=True)
     radio.run(until_us=50_000_000)         # second hello rounds (30 s + jitter)
 
-    out("\n=== Metingen ===")
+    out("\n=== Measurements ===")
     for c in range(N_CH):
-        out(f"kanaal {c}: airtime {radio.airtime[c]/1e6:.3f} s, "
-            f"verloren ontvangsten {radio.wire.collided[c]}")
+        out(f"channel {c}: airtime {radio.airtime[c]/1e6:.3f} s, "
+            f"lost receptions {radio.wire.collided[c]}")
     for nid, nd in radio.nodes.items():
         sym = sym_count(nd)
-        out(f"node {nid:#06x}: thuis-doofheid {nd.away_total/1e6:.3f} s "
-            f"({100*nd.away_total/max(radio.now,1):.2f}% van de tijd), "
-            f"hellos gehoord {nd.hello_rx}, gemist {nd.hello_missed}, "
-            f"botsingen {nd.collided}"
-            + (f", symmetrisch bevestigd {sym}" if sym is not None else ""))
+        out(f"node {nid:#06x}: home-deafness {nd.away_total/1e6:.3f} s "
+            f"({100*nd.away_total/max(radio.now,1):.2f}% of the time), "
+            f"hellos heard {nd.hello_rx}, missed {nd.hello_missed}, "
+            f"collisions {nd.collided}"
+            + (f", confirmed symmetric {sym}" if sym is not None else ""))
 
 if __name__ == '__main__':
     main()

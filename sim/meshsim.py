@@ -20,7 +20,7 @@ import argparse, os, sys
 import simpy
 
 from sim1 import (radio_log, Node, CCore, load_lib, Wire, sym_count, nbr_counts,
-                  load_nodes_csv, projecteer, linkbudget, RX_MIN_DBM, DutyLedger, N_CH)
+                  load_nodes_csv, project, linkbudget, RX_MIN_DBM, DutyLedger, N_CH)
 
 class Radio:  # simpy version of the virtual radio; interface equal to sim1.Radio
     def __init__(self):
@@ -48,8 +48,8 @@ class Radio:  # simpy version of the virtual radio; interface equal to sim1.Radi
             while self.env.peek() <= until_us:
                 self.env.step()
     def tx(self, node, ch, pkt, airtime):
-        radio_log(f"[{self.now/1e6:8.3f}s] node {node.id:#06x} zendt type {pkt[0]:#04x} "
-                  f"({len(pkt)} B, {airtime//1000} ms) op kanaal {ch}")
+        radio_log(f"[{self.now/1e6:8.3f}s] node {node.id:#06x} transmits type {pkt[0]:#04x} "
+                  f"({len(pkt)} B, {airtime//1000} ms) on channel {ch}")
         self.airtime[ch] += airtime
         self.wire.begin(self.now, ch, node.id, airtime)
         ptype = pkt[0] & 0x0F
@@ -81,20 +81,20 @@ def set_jitter(core, jitter_us):
     return core
 
 def report(radio):
-    out("\n=== Metingen ===")
+    out("\n=== Measurements ===")
     for c in range(N_CH):
-        out(f"kanaal {c}: airtime {radio.airtime[c]/1e6:.3f} s, "
-            f"verloren ontvangsten {radio.wire.collided[c]}")
+        out(f"channel {c}: airtime {radio.airtime[c]/1e6:.3f} s, "
+            f"lost receptions {radio.wire.collided[c]}")
     for nid, nd in radio.nodes.items():
         sym = sym_count(nd)
-        out(f"node {nid:#06x}: thuis-doofheid {nd.away_total/1e6:.3f} s "
-            f"({100*nd.away_total/max(radio.now,1):.2f}% van de tijd), "
-            f"hellos gehoord {nd.hello_rx}, gemist {nd.hello_missed}, "
-            f"botsingen {nd.collided}"
-            + (f", symmetrisch bevestigd {sym}" if sym is not None else ""))
+        out(f"node {nid:#06x}: home-deafness {nd.away_total/1e6:.3f} s "
+            f"({100*nd.away_total/max(radio.now,1):.2f}% of the time), "
+            f"hellos heard {nd.hello_rx}, missed {nd.hello_missed}, "
+            f"collisions {nd.collided}"
+            + (f", confirmed symmetric {sym}" if sym is not None else ""))
 
-@scenario("koppeltest", "2 nodes: hello's, unicast A->B and B->A with ack1/ack2/ack3")
-def koppeltest(mk, jitter):
+@scenario("link-test", "2 nodes: hellos, unicast A->B and B->A with ack1/ack2/ack3")
+def link_test(mk, jitter):
     """Same scenario as sim1.py: also serves as the equivalence check of the engines."""
     radio = Radio()
     a = Node(radio, 0x0100)   # home channel 1
@@ -106,11 +106,11 @@ def koppeltest(mk, jitter):
     radio.run(until_us=1_500_000)           # the first rounds (see sim1.py)
 
     out("\n--- unicast A -> B (A knows B from the hello round) ---")
-    a.core.send_data(0x0101, "hallo mesh", ack3=True)
+    a.core.send_data(0x0101, "hello mesh", ack3=True)
     radio.run(until_us=3_000_000)          # hello-ack from A shows B the map
 
     out("\n--- unicast B -> A (after hello-ack: B knows A) ---")
-    b.core.send_data(0x0100, "terugbericht", ack3=True)
+    b.core.send_data(0x0100, "reply message", ack3=True)
     radio.run(until_us=50_000_000)         # second hello rounds (30 s + jitter)
     report(radio)
 
@@ -130,7 +130,7 @@ def jitter_sweep(mk, _jitter):
     """Measures per jitter range how many hellos a node hears and misses
     from the other (own round / away from home). Preparation for scenario 2;
     the CLI jitter stands outside this, the sweep determines it itself."""
-    out(f"{'jitter':>9s} {'A hoort':>8s} {'A mist':>7s} {'B hoort':>8s} {'B mist':>7s}")
+    out(f"{'jitter':>9s} {'A hears':>8s} {'A misses':>8s} {'B hears':>8s} {'B misses':>8s}")
     for j in (0, 100_000, 500_000, 1_000_000, 5_000_000):
         radio = Radio()
         a = Node(radio, 0x0100); b = Node(radio, 0x0101)
@@ -138,11 +138,11 @@ def jitter_sweep(mk, _jitter):
         a.core.start()
         radio.schedule(137_000, b.core.start)
         radio.run(until_us=1_000_000_000) # rounds up to ~930 s (30-60-120-240-480 s)
-        out(f"{j/1e6:>9.3f} {a.hello_rx:>8d} {a.hello_missed:>7d} "
-            f"{b.hello_rx:>8d} {b.hello_missed:>7d}")
+        out(f"{j/1e6:>9.3f} {a.hello_rx:>8d} {a.hello_missed:>8d} "
+            f"{b.hello_rx:>8d} {b.hello_missed:>8d}")
 
-@scenario("nieuwkomer", "stable R1/R2 + newcomer at 5 s: who proves symmetry and when")
-def nieuwkomer(mk, jitter):
+@scenario("newcomer", "stable R1/R2 + newcomer at 5 s: who proves symmetry and when")
+def newcomer(mk, jitter):
     """Demonstrates the proof asymmetry after startup (4.2/4.3): the
     newcomer N gets its symmetry proofs within seconds (acks on its own
     round, addressed to it); the responders R1/R2 then still have N as
@@ -164,7 +164,7 @@ def nieuwkomer(mk, jitter):
     radio.wire.links[(0x0101, 0x0102)] = -68   # R2 -> N
     radio.wire.links[(0x0102, 0x0101)] = -58   # N -> R2
     nn = [None]
-    def start_nieuwkomer():
+    def start_newcomer():
         nn[0] = Node(radio, 0x0102)   # home 0
         nn[0].core = set_jitter(mk(nn[0]), jitter)
         nn[0].core.start()
@@ -172,34 +172,34 @@ def nieuwkomer(mk, jitter):
         out(f"[sym] {label}: R1={sym_count(r1)} R2={sym_count(r2)} N={sym_count(nn[0])}")
     r1.core.start()
     radio.schedule(500_000, r2.core.start)
-    radio.schedule(5_000_000, start_nieuwkomer)
-    radio.schedule(10_000_000, lambda: symstatus("t=10 s, na acks op de nieuwkomer"))
-    radio.schedule(40_000_000, lambda: symstatus("t=40 s, na ronde 2 (hello-proces)"))
-    radio.schedule(100_000_000, lambda: symstatus("t=100 s, na ronde 3"))
+    radio.schedule(5_000_000, start_newcomer)
+    radio.schedule(10_000_000, lambda: symstatus("t=10 s, after acks on the newcomer"))
+    radio.schedule(40_000_000, lambda: symstatus("t=40 s, after round 2 (hello process)"))
+    radio.schedule(100_000_000, lambda: symstatus("t=100 s, after round 3"))
     radio.run(until_us=100_000_000)
     report(radio)
 
-_ARGS = None   # CLI context for scenarios (lokaal-net reads --nodes/--duur)
+_ARGS = None   # CLI context for scenarios (local-net reads --nodes/--duration)
 
-@scenario("lokaal-net", "GPS node list (position+height) -> link budget; hello/ack measurement")
-def lokaal_net(mk, jitter):
+@scenario("local-net", "GPS node list (position+height) -> link budget; hello/ack measurement")
+def local_net(mk, jitter):
     """Design 14.1 scenario 2: 30-50 nodes at real density. Measures
     hello and ack airtime (startup vs stable), ack collisions, and the
     seen/confirmed ratio (symmetry), plus duty cycle (10%/hour)."""
-    lijst = load_nodes_csv(_ARGS.nodes)
-    duur_us = _ARGS.duur * 3_600_000_000
+    nodes_list = load_nodes_csv(_ARGS.nodes)
+    duration_us = _ARGS.duration * 3_600_000_000
     radio = Radio()
     radio.wire.open = False    # closed world: only link-budget pairs exist
-    lat0 = sum(n['lat'] for n in lijst) / len(lijst)
-    lon0 = sum(n['lon'] for n in lijst) / len(lijst)
-    pos = {n['id']: (*projecteer(n['lat'], n['lon'], lat0, lon0), n['h']) for n in lijst}
+    lat0 = sum(n['lat'] for n in nodes_list) / len(nodes_list)
+    lon0 = sum(n['lon'] for n in nodes_list) / len(nodes_list)
+    pos = {n['id']: (*project(n['lat'], n['lon'], lat0, lon0), n['h']) for n in nodes_list}
     nodes = []
-    for i, nd in enumerate(lijst):
+    for i, nd in enumerate(nodes_list):
         kn = Node(radio, nd['id'])
         kn.core = set_jitter(mk(kn), jitter)
         nodes.append(kn)
         radio.schedule(i * 250_000, kn.core.start)   # never start synchronously
-    ids = [n['id'] for n in lijst]
+    ids = [n['id'] for n in nodes_list]
     for a in ids:
         for b in ids:
             if a == b: continue
@@ -209,50 +209,50 @@ def lokaal_net(mk, jitter):
             r = raw + fade
             if r >= RX_MIN_DBM:
                 radio.wire.links[(a, b)] = max(-128, min(120, round(r)))
-    paren = {(a, b) if a < b else (b, a) for (a, b) in radio.wire.links}
-    bidir = sum(1 for (a, b) in paren
+    pairs = {(a, b) if a < b else (b, a) for (a, b) in radio.wire.links}
+    bidir = sum(1 for (a, b) in pairs
                 if (a, b) in radio.wire.links and (b, a) in radio.wire.links)
-    graad = {i: 0 for i in ids}
-    for (a, b) in paren:
-        graad[a] += 1; graad[b] += 1
-    out(f"{len(lijst)} nodes uit {_ARGS.nodes}")
-    out(f"topologie: {len(paren)} links ({bidir} in beide richtingen), "
-        f"gemiddelde graad {sum(graad.values())/len(ids):.1f}, "
-        f"min {min(graad.values())}, max {max(graad.values())}")
-    fase = {}
-    def fasegrens():   # after the startup rounds (last at ~1890 s); after that only keepalive (4.1)
-        fase.update(air=radio.airtime[:], hello=radio.hello_air[:],
-                    ack=radio.ack_air[:], t=radio.now)
-    radio.schedule(3_700_000_000, fasegrens)
-    radio.run(until_us=duur_us)
-    out("\n=== Metingen ===")
-    t1 = fase.get('t', radio.now)
-    out(f"fase 1: opstart 0-{t1/1e6:.0f} s | fase 2: stabiel "
-        f"{t1/1e6:.0f}-{radio.now/1e6:.0f} s (laatste gebeurtenis op {radio.now/1e6:.0f} s)")
+    degree = {i: 0 for i in ids}
+    for (a, b) in pairs:
+        degree[a] += 1; degree[b] += 1
+    out(f"{len(nodes_list)} nodes from {_ARGS.nodes}")
+    out(f"topology: {len(pairs)} links ({bidir} in both directions), "
+        f"average degree {sum(degree.values())/len(ids):.1f}, "
+        f"min {min(degree.values())}, max {max(degree.values())}")
+    phase = {}
+    def phase_border():   # after the startup rounds (last at ~1890 s); after that only keepalive (4.1)
+        phase.update(air=radio.airtime[:], hello=radio.hello_air[:],
+                     ack=radio.ack_air[:], t=radio.now)
+    radio.schedule(3_700_000_000, phase_border)
+    radio.run(until_us=duration_us)
+    out("\n=== Measurements ===")
+    t1 = phase.get('t', radio.now)
+    out(f"phase 1: startup 0-{t1/1e6:.0f} s | phase 2: stable "
+        f"{t1/1e6:.0f}-{radio.now/1e6:.0f} s (last event at {radio.now/1e6:.0f} s)")
     for c in range(N_CH):
-        a1 = fase['air'][c] if fase else 0
-        h1 = fase['hello'][c] if fase else 0
-        k1 = fase['ack'][c] if fase else 0
+        a1 = phase['air'][c] if phase else 0
+        h1 = phase['hello'][c] if phase else 0
+        k1 = phase['ack'][c] if phase else 0
         a2, h2, k2 = radio.airtime[c]-a1, radio.hello_air[c]-h1, radio.ack_air[c]-k1
-        stabiel_us = max(radio.now - t1, 1)
-        out(f"kanaal {c}: opstart {a1/1e6:6.1f} s lucht (hello {h1/1e6:5.1f}, ack {k1/1e6:5.1f}) | "
-            f"stabiel {a2/1e6:6.1f} s — hello {100*h2/stabiel_us:.2f}% en "
-            f"ack {100*k2/stabiel_us:.2f}% van de kanaaltijd")
+        stable_us = max(radio.now - t1, 1)
+        out(f"channel {c}: startup {a1/1e6:6.1f} s air (hello {h1/1e6:5.1f}, ack {k1/1e6:5.1f}) | "
+            f"stable {a2/1e6:6.1f} s — hello {100*h2/stable_us:.2f}% and "
+            f"ack {100*k2/stable_us:.2f}% of channel time")
     stats = [nbr_counts(kn) for kn in nodes]
-    gez = [s[0] for s in stats]; bef = [s[1] for s in stats]
-    out(f"buren per node: gezien gem {sum(gez)/len(gez):.1f} (min {min(gez)}, max {max(gez)}), "
-        f"bevestigd symmetrisch gem {sum(bef)/len(bef):.1f}")
-    out(f"nodes zonder bevestigde buur: {sum(1 for b in bef if b == 0)} van {len(bef)}")
-    out(f"botsingen: {sum(radio.wire.collided)} verloren ontvangsten, "
-        f"{sum(kn.hello_missed for kn in nodes)} gemiste hellos")
-    gebruik = {(n, c): radio.duty.gebruik(n, c, radio.now) for n in ids for c in range(N_CH)}
-    top = sorted(gebruik.values(), reverse=True)[:5]
-    out(f"duty (schuivend uurvenster, grens 10% = 360 s): max {top[0]/1e6:.1f} s, "
-        f"hoogste 5: {[f'{u/1e6:.1f}' for u in top]} s, "
-        f"boven de grens: {sum(1 for u in gebruik.values() if u > 360_000_000)}")
+    seen = [s[0] for s in stats]; conf = [s[1] for s in stats]
+    out(f"neighbors per node: seen avg {sum(seen)/len(seen):.1f} (min {min(seen)}, max {max(seen)}), "
+        f"confirmed symmetric avg {sum(conf)/len(conf):.1f}")
+    out(f"nodes without confirmed neighbor: {sum(1 for b in conf if b == 0)} of {len(conf)}")
+    out(f"collisions: {sum(radio.wire.collided)} lost receptions, "
+        f"{sum(kn.hello_missed for kn in nodes)} missed hellos")
+    usage = {(n, c): radio.duty.usage(n, c, radio.now) for n in ids for c in range(N_CH)}
+    top = sorted(usage.values(), reverse=True)[:5]
+    out(f"duty (sliding hour window, limit 10% = 360 s): max {top[0]/1e6:.1f} s, "
+        f"top 5: {[f'{u/1e6:.1f}' for u in top]} s, "
+        f"above the limit: {sum(1 for u in usage.values() if u > 360_000_000)}")
 
-@scenario("botsing", "3 nodes: synchronous hellos collide; capture at >= 6 dB difference")
-def botsing(mk, jitter):
+@scenario("collision", "3 nodes: synchronous hellos collide; capture at >= 6 dB difference")
+def collision(mk, jitter):
     """Power outage case (design 4.1): A and B share a home channel and
     start exactly synchronously (jitter 0) — their hellos overlap on all
     three channels. Round 1: equal strength, so C loses both (collision).
@@ -266,11 +266,11 @@ def botsing(mk, jitter):
     c.core = set_jitter(mk(c), jitter)
     a.core.start(); b.core.start()   # exactly simultaneous: the 4.1 edge case
     radio.schedule(500_000, c.core.start)
-    out("\n--- ronde 1: gelijke sterkte (default -60) -> botsingen bij C ---")
+    out("\n--- round 1: equal strength (default -60) -> collisions at C ---")
     radio.run(until_us=1_000_000)
     radio.wire.links[(a.id, c.id)] = -66
     radio.wire.links[(b.id, c.id)] = -60
-    out("\n--- ronde 2 (30 s): B >= 6 dB sterker -> C vangt B, verliest A ---")
+    out("\n--- round 2 (30 s): B >= 6 dB stronger -> C captures B, loses A ---")
     radio.run(until_us=31_000_000)
     report(radio)
 
@@ -278,17 +278,17 @@ def botsing(mk, jitter):
 
 def main():
     ap = argparse.ArgumentParser(description="Meshimeshi scenarios on simpy")
-    ap.add_argument('scenario', nargs='?', default='koppeltest',
-                    help="scenario name (default: koppeltest)")
+    ap.add_argument('scenario', nargs='?', default='link-test',
+                    help="scenario name (default: link-test)")
     ap.add_argument('--list', action='store_true', help="show available scenarios")
     ap.add_argument('--so', default=os.path.join(os.path.dirname(__file__), '..', 'build', 'libmimeshi.so'))
     ap.add_argument('-q', '--quiet', action='store_true', help='no radio logs, only [core] lines')
     ap.add_argument('--jitter', type=int, default=None, metavar='US',
                     help='max hello phase jitter in microseconds (default: core value, 1 s)')
     ap.add_argument('--nodes', default=os.path.join(os.path.dirname(__file__), 'nodes', 'utrecht40.csv'),
-                    help='node list (id,lat,lon,height_m,name) for lokaal-net')
-    ap.add_argument('--duur', type=int, default=8, metavar='UUR',
-                    help='simulation duration in hours (lokaal-net, default 8)')
+                    help='node list (id,lat,lon,height_m,name) for local-net')
+    ap.add_argument('--duration', type=int, default=8, metavar='HOURS',
+                    help='simulation duration in hours (local-net, default 8)')
     args = ap.parse_args()
     global _ARGS
     _ARGS = args
@@ -298,9 +298,9 @@ def main():
             out(f"{name:16s} {desc}")
         return
     if args.scenario not in SCENARIOS:
-        ap.error(f"onbekend scenario '{args.scenario}' (kies uit: {', '.join(SCENARIOS)})")
+        ap.error(f"unknown scenario '{args.scenario}' (choose from: {', '.join(SCENARIOS)})")
     if not os.path.exists(args.so):
-        out(f"libmimeshi.so niet gevonden ({args.so}); bouw met gcc (zie README).")
+        out(f"libmimeshi.so not found ({args.so}); build with gcc (see README).")
         sys.exit(1)
     # let printf of the C core appear directly after the Python prints
     import ctypes
@@ -318,7 +318,7 @@ def main():
     mk = lambda nd: CCore(nd, lib)
 
     fn, desc = SCENARIOS[args.scenario]
-    out(f"=== Scenario '{args.scenario}': {desc} (C-kern, SF7, 62,5 kHz) ===")
+    out(f"=== Scenario '{args.scenario}': {desc} (C core, SF7, 62.5 kHz) ===")
     fn(mk, args.jitter)
 
 if __name__ == '__main__':

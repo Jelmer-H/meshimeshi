@@ -194,7 +194,7 @@ static void bound_send(mimeshi_node *n, uint8_t ch, const uint8_t *pkt, uint16_t
         }
     }
     bctx_drops++;
-    printf("[core] node %u: bound-pool vol, zending vervalt (teller %u)\n", n->id, bctx_drops);
+    printf("[core] node %u: bound-pool full, transmission dropped (counter %u)\n", n->id, bctx_drops);
 }
 
 /* ---------------- hello (4.1) ---------------- */
@@ -395,7 +395,7 @@ static void ack1_timeout(mimeshi_node *n, void *ud) {
         p->tries_left = MC_RETRY_TX;      /* next attempt series */
         if (p->budget_left == 0) {
             p->active = 0;
-            printf("[core] node %u: FAIL msg %u (budget op, geen ack1)\n", n->id, p->msg_id);
+            printf("[core] node %u: FAIL msg %u (budget exhausted, no ack1)\n", n->id, p->msg_id);
         } else {
             p->budget_left--;
             pending_try(n, p);            /* neighbor choice: real core ETX-driven (10.2) */
@@ -521,7 +521,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                 p->active = 0;                     /* hop succeeded; ack2 arrives on its own on our home channel */
                 mimeshi_neighbor *nb = nbr_find(n, rd16(pkt + 5));
                 if (nb) { nb->sym = 1; nb->ack_try = 0; }  /* confirmed symmetric (4.2, 10.1) */
-                printf("[core] node %u: ACK1 voor msg %u\n", n->id, msg_id);
+                printf("[core] node %u: ACK1 for msg %u\n", n->id, msg_id);
                 return;
             }
         }
@@ -531,14 +531,14 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         /* confirmation of the next hop toward the previous one (7.2).
          * For now only visible; the T_ack2 window and the pending
          * handling on the sender (7.3) belong to building block 2. */
-        printf("[core] node %u: ACK2 %s voor msg %u\n", n->id,
-               (flags & F_NEG_ACK2) ? "NEGATIEF" : "positief", rd16(pkt + 1));
+        printf("[core] node %u: ACK2 %s for msg %u\n", n->id,
+               (flags & F_NEG_ACK2) ? "NEGATIVE" : "positive", rd16(pkt + 1));
         break;
     }
     case PKT_ACK3: {
         /* final destination has had the message delivered (11): routed
          * back to the source, here still without routing logic. */
-        printf("[core] node %u: ACK3 — afgeleverd bij bestemming\n", n->id);
+        printf("[core] node %u: ACK3 — delivered at destination\n", n->id);
         break;
     }
     case PKT_DATA: {
@@ -547,7 +547,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         /* dedup before the acks: a retry of the same hop must not
          * yield ack1/ack2/ack3 again. */
         if (!dedup_fresh(n, msg_id, src)) return;
-        printf("[core] node %u: DATA van %u: '%.*s'\n", n->id, src, (int)(len - 10), (const char *)(pkt + 10));
+        printf("[core] node %u: DATA from %u: '%.*s'\n", n->id, src, (int)(len - 10), (const char *)(pkt + 10));
         ack1_send(n, msg_id, src, ch);             /* same channel */
         ack2_send(n, msg_id, src, prev, false);    /* home channel previous hop */
         if (flags & F_ACK3_REQ) {

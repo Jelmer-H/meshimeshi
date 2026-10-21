@@ -92,7 +92,7 @@ int main(void) {
     pump_until(1000000);
 
     /* hello-ack from A toward B: exchange to B's home channel (1). */
-    assert(mimeshi_send_data(&B, 0x0102, (const uint8_t *)"hallo mesh", 10, true) == 0);
+    assert(mimeshi_send_data(&B, 0x0102, (const uint8_t *)"hello mesh", 10, true) == 0);
     pump_until(100000); /* switch (5 ms) + tx; not up to the ack1 timeout */
     /* B transmits data on A's home channel 0. */
     assert(last_ch == 0 && (last_type & 0x0F) == 5);
@@ -124,21 +124,21 @@ int main(void) {
      * ack addressed to US proves symmetry — the responder received our
      * hello and its ack reached us. An overheard ack (for someone else)
      * puts the sender at most on "seen" (4.2). */
-    uint8_t hack_voor_a[7] = { 2, 0x02,0x01, 0x00,0x01, 1,0 };  /* from B, for A */
-    mimeshi_rx(&A, 0, -70, hack_voor_a, 7);
+    uint8_t hack_for_a[7] = { 2, 0x02,0x01, 0x00,0x01, 1,0 };  /* from B, for A */
+    mimeshi_rx(&A, 0, -70, hack_for_a, 7);
     {
         int sym_b = 0;
         for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
             if (A.nbr[i].alive && A.nbr[i].id == 0x0100) sym_b = A.nbr[i].sym;
         assert(sym_b == 1);
     }
-    uint8_t hack_voor_c[7] = { 2, 0x05,0x01, 0x07,0x01, 1,0 };  /* from 0x0107, for 0x0105: snooping */
-    mimeshi_rx(&A, 0, -70, hack_voor_c, 7);
+    uint8_t hack_for_c[7] = { 2, 0x05,0x01, 0x07,0x01, 1,0 };  /* from 0x0107, for 0x0105: snooping */
+    mimeshi_rx(&A, 0, -70, hack_for_c, 7);
     {
-        int gezien = -1;
+        int seen = -1;
         for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
-            if (A.nbr[i].alive && A.nbr[i].id == 0x0107) gezien = A.nbr[i].sym;
-        assert(gezien == 0);              /* seen, not confirmed */
+            if (A.nbr[i].alive && A.nbr[i].id == 0x0107) seen = A.nbr[i].sym;
+        assert(seen == 0);              /* seen, not confirmed */
     }
 
     /* --- keepalive (4.1): after the startup rounds (0-3810 s; the
@@ -165,6 +165,6 @@ int main(void) {
     assert(hello_cnt_A[1] == rA[1] + 1);       /* after all exactly one keepalive */
     assert(hello_cnt_B[0] == rB[0] + 1);       /* B gets no second: counter resets on the call */
 
-    printf("koppeltest: OK (tx=%d, hellos=%d, switches=%d)\n", tx_count, hello_seen, switch_count);
+    printf("link-test: OK (tx=%d, hellos=%d, switches=%d)\n", tx_count, hello_seen, switch_count);
     return 0;
 }
