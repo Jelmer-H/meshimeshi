@@ -161,6 +161,7 @@ class Radio:  # virtual radio + clock
         self.hello_air = [0]*N_CH   # airtime of hellos (type 1) per channel
         self.ack_air = [0]*N_CH     # airtime of hello-acks (type 2) per channel
         self.proof_air = [0]*N_CH   # airtime of proof lists (type 3) per channel
+        self.chunk_air = [0]*N_CH   # airtime of table chunks (type 4) per channel
         self.duty = DutyLedger()
         self.wire = Wire()
         self.seq = 0
@@ -184,6 +185,7 @@ class Radio:  # virtual radio + clock
         if ptype == 1: self.hello_air[ch] += airtime
         elif ptype == 2: self.ack_air[ch] += airtime
         elif ptype == 3: self.proof_air[ch] += airtime
+        elif ptype == 4: self.chunk_air[ch] += airtime
         self.duty.add(node.id, ch, self.now, airtime)
         self.wire.begin(self.now, ch, node.id, airtime)
         for r in self.nodes.values():
