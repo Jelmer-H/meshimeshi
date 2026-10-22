@@ -731,28 +731,6 @@ static mimeshi_2hop *known_upsert(mimeshi_node *n, uint16_t id, uint16_t via,
  * (about -108 dBm). */
 #define MC_ROUTE_MIN_QUALITY 10
 
-/* Effective quality of a learned link (a, b): the minimum of both
- * advertised directions. Entry a's link to b carries b->a (a measured);
- * entry b's link to a carries a->b (b measured). min = the bottleneck. */
-static uint8_t link_eff_quality(mimeshi_node *n, uint16_t a, uint16_t b) {
-    mimeshi_2hop *ha = known_find(n, a);
-    uint8_t q = 0;
-    if (ha) {
-        for (uint8_t l = 0; l < ha->nlinks; l++)
-            if (ha->link[l] == b) { q = ha->lq[l]; break; }   /* direction b->a */
-    }
-    mimeshi_2hop *hb = known_find(n, b);
-    if (hb) {
-        for (uint8_t l = 0; l < hb->nlinks; l++) {
-            if (hb->link[l] == a) {                          /* direction a->b */
-                if (!q || hb->lq[l] < q) q = hb->lq[l];
-                break;
-            }
-        }
-    }
-    return q;
-}
-
 /* Directional thresholds (asymmetric links, decided): the DATA travels
  * us->neighbour and must pass MC_ROUTE_MIN_QUALITY. The ACK travels back
  * (7 B, a fraction of the airtime) and survives a weaker link: it needs
@@ -843,15 +821,33 @@ static mimeshi_neighbor *route_path(mimeshi_node *n, uint16_t dst, mimeshi_neigh
                 }
             }
         } else {
-            /* the learned links of this known node */
+            /* the learned links of this known node. Directional thresholds
+             * apply here too (10.1): the plan must be walkable. A learned
+             * link passes only when the DATA direction of the hop that will
+             * physically transmit meets MC_ROUTE_MIN_QUALITY -- otherwise
+             * the plan says 'reachable' and the forwarding hop refuses:
+             * measured as the gap between the 93.6% reachable graph and
+             * the actual delivery. Both advertised directions carry the
+             * qualities (a->b as b measured, b->a as a measured, 4.3):
+             * the direction of travel decides. */
             for (int k = 0; k < MC_MAX_KNOWN; k++) {
                 mimeshi_2hop *h = &n->known[k];
                 if (!h->alive || h->id != ids[u]) continue;
                 for (uint8_t l = 0; l < h->nlinks; l++) {
                     int v = IDX(h->link[l]);
                     if (v < 0) continue;
-                    uint8_t lq2 = link_eff_quality(n, ids[u], h->link[l]);
-                    int32_t nd = dist[u] + dij_cost(lq2 ? lq2 : h->quality);
+                    /* the quality of the direction ids[u] -> link[l] as the
+                     * receiver (link[l]) measured it: that value sits in
+                     * the entry OF link[l] (its link to ids[u], 4.3). */
+                    uint8_t qfwd = 0;   /* ids[u] -> link[l] direction */
+                    mimeshi_2hop *hr = known_find(n, h->link[l]);
+                    if (hr) {
+                        for (uint8_t r = 0; r < hr->nlinks; r++)
+                            if (hr->link[r] == ids[u]) { qfwd = hr->lq[r]; break; }
+                    }
+                    if (!qfwd) qfwd = h->lq[l];       /* fall back to the stored direction */
+                    if (qfwd && qfwd < MC_ROUTE_MIN_QUALITY) continue;  /* walkability (10.1) */
+                    int32_t nd = dist[u] + dij_cost(qfwd ? qfwd : h->quality);
                     if (nd < dist[v]) {
                         dist[v] = nd;
                         first[v] = first[u] ? first[u] : ids[u];   /* propagate the first hop */
