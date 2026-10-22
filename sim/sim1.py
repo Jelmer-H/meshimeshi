@@ -322,7 +322,7 @@ class C2Hop(ctypes.Structure):
                 ("geox", ctypes.c_int16), ("geoy", ctypes.c_int16),
                 ("alive", ctypes.c_uint8), ("sym", ctypes.c_uint8),
                 ("nlinks", ctypes.c_uint8),
-                ("link", ctypes.c_uint16 * 5), ("lq", ctypes.c_uint8 * 5)]
+                ("link", ctypes.c_uint16 * 10), ("lq", ctypes.c_uint8 * 10)]
 
 class CPending(ctypes.Structure):
     _fields_ = [("active", ctypes.c_uint8), ("state", ctypes.c_uint8),
@@ -363,6 +363,7 @@ CNode._fields_ = [
     ("chunk_ctr_last", ctypes.c_uint32),  # table counter at the last chunk push (4.3)
     ("chunk_ticks", ctypes.c_uint8),       # tail repetition counter (4.3)
     ("chunk_rr", ctypes.c_uint8),          # round-robin cursor over the known map (4.3)
+    ("chunk_rr_ch", ctypes.c_uint8),       # channel rotation of the stable tail (4.3)
     ("proof_wait", ctypes.c_uint8 * 3),  # flush countdown per channel (4.2)
     ("tx", TX_FN), ("timer", TIMER_FN), ("switch_ch", SWITCH_FN), ("rand", RAND_FN),
     ("user", ctypes.c_void_p),

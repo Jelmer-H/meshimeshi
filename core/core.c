@@ -461,9 +461,15 @@ static void chunk_tick(mimeshi_node *n, void *ud) {
              * graph, 4.3); the periodic tail repeats geo+quality only --
              * the link graph fills via the mutation pushes, the tail
              * keeps the map fresh at 8 B per entry */
-            chunk_send(n, n->home_ch, 1);   /* always with links (4.3): the tail
-                                               * keeps BOTH the map and the graph fresh;
-                                               * an empty graph is worth nothing */
+            /* stable tail: ROTATE over the channels (4.3). One slice per
+             * repetition -- the airtime stays one slice, the rotation only
+             * broadens where it lands, so every channel community receives
+             * the map over the course of three repetitions. Without this,
+             * links between nodes on different home channels never enter
+             * anyone's graph (measured: the dominant void cause). */
+            uint8_t ch = n->chunk_rr_ch;
+            chunk_send(n, ch, 1);
+            n->chunk_rr_ch = (uint8_t)((n->chunk_rr_ch + 1) % MC_N_CHANNELS);
         }
     }
     n->timer(n, MC_CHUNK_PERIOD_US + (n->rand(n) % 1000000ull), chunk_tick, 0);

@@ -157,6 +157,8 @@ struct mimeshi_node {
                                          the slow tail repetition counter */
     uint8_t  chunk_rr;                  /* round-robin cursor over the known map
                                          (4.3): every entry gets its turn */
+    uint8_t  chunk_rr_ch;               /* channel rotation of the stable tail
+                                         (4.3): each repetition on the next channel */
     uint8_t  proof_wait[MC_N_CHANNELS];/* countdown to the flush moment
                                          per channel (4.2), staggered 20
                                          min apart; restarts at 1 h on
