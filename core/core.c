@@ -836,18 +836,25 @@ static mimeshi_neighbor *route_path(mimeshi_node *n, uint16_t dst, mimeshi_neigh
                 for (uint8_t l = 0; l < h->nlinks; l++) {
                     int v = IDX(h->link[l]);
                     if (v < 0) continue;
-                    /* the quality of the direction ids[u] -> link[l] as the
-                     * receiver (link[l]) measured it: that value sits in
-                     * the entry OF link[l] (its link to ids[u], 4.3). */
-                    uint8_t qfwd = 0;   /* ids[u] -> link[l] direction */
+                    /* The FULL physical check (10.1), exactly what the
+                     * forwarding hop will apply -- a plan may only contain
+                     * edges that survive execution. Both directions must
+                     * be MEASURED (no fallbacks: a one-direction view
+                     * caused the -110 dBm leaks). The DATA direction
+                     * (u->v) is what the receiver v measured: its entry's
+                     * link to u. The ack direction (v->u) is what u
+                     * measured: u's own link entry. */
+                    uint8_t qfwd = 0;   /* u -> v, as v measured */
+                    uint8_t qback = h->lq[l];   /* v -> u, as u measured (this entry's own link) */
                     mimeshi_2hop *hr = known_find(n, h->link[l]);
                     if (hr) {
                         for (uint8_t r = 0; r < hr->nlinks; r++)
                             if (hr->link[r] == ids[u]) { qfwd = hr->lq[r]; break; }
                     }
-                    if (!qfwd) qfwd = h->lq[l];       /* fall back to the stored direction */
-                    if (qfwd && qfwd < MC_ROUTE_MIN_QUALITY) continue;  /* walkability (10.1) */
-                    int32_t nd = dist[u] + dij_cost(qfwd ? qfwd : h->quality);
+                    if (!qfwd || !qback) continue;               /* both directions must be measured */
+                    if (qfwd < MC_ROUTE_MIN_QUALITY) continue;  /* DATA direction */
+                    if (qback < MC_ACK_MIN_QUALITY) continue;   /* ack direction */
+                    int32_t nd = dist[u] + dij_cost((int32_t)(qfwd + qback) / 2);
                     if (nd < dist[v]) {
                         dist[v] = nd;
                         first[v] = first[u] ? first[u] : ids[u];   /* propagate the first hop */
@@ -883,7 +890,10 @@ static mimeshi_neighbor *route_next(mimeshi_node *n, uint16_t dst,
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
         mimeshi_neighbor *nb = &n->nbr[i];
         if (!nb->alive || nb == excl) continue;
-        if (nb->id == dst && nb->sym) return nb;
+        if (nb->id == dst && nb->sym) return nb;   /* the destination is a direct
+                                                       neighbour: take it (the hop
+                                                       thresholds apply at the
+                                                       forwarding decision) */
     }
     /* 2. path on the learned link graph (10.2): with the links from the
      * chunks (4.3) the node computes a real path -- the first hop of the
@@ -893,13 +903,17 @@ static mimeshi_neighbor *route_next(mimeshi_node *n, uint16_t dst,
     if (ph) return ph;
 
     /* 2b. fallback: the known map without links -- the entry names a via;
-     * if that via is a confirmed direct neighbour it is the hop candidate
-     * (the graph was incomplete; this is the old behaviour). */
+     * if that via is a confirmed direct neighbour AND passes the routing
+     * thresholds, it is the hop candidate (the graph was incomplete).
+     * route_score == -1 means the link failed the check (10.1): a failed
+     * via must not become 'best' -- measured as the 5.7% correlated
+     * no-link attempts (all 6 retries died on the same dead hop). */
     mimeshi_2hop *h = known_find(n, dst);
     if (h) {
         mimeshi_neighbor *via = nbr_find(n, h->via);
         if (via && via->sym && via != excl) {
-            best = via; best_score = route_score(n, via) + 64;
+            int vs = route_score(n, via);
+            if (vs >= 0) { best = via; best_score = vs + 64; }
         }
     }
     /* 3. geo-greedy via the tandem (10.2, decided): every hop only needs
@@ -982,6 +996,7 @@ static void ack2_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint16_t p
 static void pending_try(mimeshi_node *n, mimeshi_pending *p);
 static void record_fail(mimeshi_node *n, mimeshi_pending *p);
 static void pending_retry_timer(mimeshi_node *n, void *ud);
+static uint64_t retry_wait_us(mimeshi_node *n, uint8_t attempt);
 static int send_data_internal(mimeshi_node *n, uint16_t dst, int16_t cgx, int16_t cgy,
                               const uint8_t *payload, uint16_t len, bool ack3, uint8_t no_report);
 
@@ -1020,7 +1035,7 @@ static void ack1_timeout(mimeshi_node *n, void *ud) {
          * wait longer than the airtime of the next packet */
         p->budget_left--;
         if (p->budget_left == 0) { record_fail(n, p); return; }
-        n->timer(n, (n->rand(n) % 500000ull) + 100000ull, pending_retry_timer, p);
+        n->timer(n, retry_wait_us(n, p->attempts), pending_retry_timer, p);
         return;
     }
     /* candidate exhausted: recompute the best next hop without the failed one */
@@ -1049,7 +1064,7 @@ static void ack1_timeout(mimeshi_node *n, void *ud) {
         p->tries_left = MC_RETRY_TX;
         p->budget_left--;
         if (p->budget_left == 0) { record_fail(n, p); return; }
-        n->timer(n, (n->rand(n) % 500000ull) + 100000ull, pending_retry_timer, p);
+        n->timer(n, retry_wait_us(n, p->attempts), pending_retry_timer, p);
         return;
     }
     p->next_hop = nx->id;
@@ -1084,6 +1099,16 @@ static void ack2_timeout(mimeshi_node *n, void *ud) {
 
 static void pending_retry_timer(mimeshi_node *n, void *ud) {
     pending_try(n, (mimeshi_pending *)ud);
+}
+
+/* Wait between hop attempts (7.4): longer than the airtime of the next
+ * packet, randomized. Exponential backoff was measured: the longer waits
+ * let the retry series run into each other under load and blew the duty
+ * peak (998 s on a loaded hub) for no delivery gain -- the hop losses are
+ * correlated no-link attempts, not deaf windows. */
+static uint64_t retry_wait_us(mimeshi_node *n, uint8_t attempt) {
+    (void)attempt;
+    return 100000ull + (n->rand(n) % 500000ull);
 }
 
 /* One transmit attempt: update the budget in the header (offset 9,
