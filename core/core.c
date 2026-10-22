@@ -932,7 +932,8 @@ static mimeshi_neighbor *route_next(mimeshi_node *n, uint16_t dst,
          * message converges gateway by gateway. This routes AROUND
          * concave gaps through known territory -- no perimeter mode needed
          * at this scale (the graph is full). */
-        if (!best && excl == 0) {
+        if (!best) {                   /* also on retries: excl only filters direct
+                                            neighbour steps, never the map plan */
             uint16_t gw = 0; int32_t gw_d = own_dst;
             for (int i = 0; i < MC_MAX_KNOWN; i++) {
                 mimeshi_2hop *e = &n->known[i];
@@ -941,7 +942,7 @@ static mimeshi_neighbor *route_next(mimeshi_node *n, uint16_t dst,
                 if (d < gw_d) { gw_d = d; gw = e->id; }
             }
             if (gw) {
-                mimeshi_neighbor *ph = route_path(n, gw, 0);
+                mimeshi_neighbor *ph = route_path(n, gw, excl);
                 if (ph) best = ph;
             }
         }
