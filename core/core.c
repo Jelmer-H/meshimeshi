@@ -100,6 +100,7 @@ enum {
 };
 #define F_ACK3_REQ 0x10   /* requested by the source of the message (11) */
 #define F_TAIL     0x10   /* table chunk flag: tail chunk - 2-hop entries (4.3) */
+#define F_DELTA    0x20   /* table chunk flag: delta - one changed entry (4.3) */
 #define F_NEG_ACK2 0x40   /* next hop could not forward (7.2) */
 
 /* little-endian reading/writing of 16-bit fields (6.1) */
@@ -422,6 +423,16 @@ static void tbl_mark_dirty(mimeshi_node *n) {
     }
 }
 
+static void delta_send(mimeshi_node *n, uint16_t id);
+
+/* Neighbour addition (4.3): the delta goes out immediately (one tiny
+ * packet, quality-gated like every confirmation); the table round
+ * follows in the normal cadence. */
+static void tbl_nbr_added(mimeshi_node *n, uint16_t id) {
+    delta_send(n, id);
+    tbl_mark_dirty(n);
+}
+
 /* ---------------- table chunks (4.3) ----------------
  * Prefix chunk, node-centric and self-contained (4.3):
  *   header: type(1) owner-id(2) chunk-nr(1) n-entries(1)
@@ -462,6 +473,37 @@ static uint8_t map_age_eff(mimeshi_node *n, mimeshi_mapnode *m) {
     return (uint8_t)(a > 255 ? 255 : a);
 }
 
+
+/* Delta chunk (4.3): a single changed entry, for neighbour
+ * additions. A new neighbour has no links in our link store yet (they
+ * appear only once its own chunks arrive), so the delta is tiny: 19 B,
+ * 173 ms - versus ceil(sym/8) x 869 ms for a whole-prefix round. The
+ * receiver processes it like any prefix entry (self-contained chunks),
+ * and the full prefix still follows in the normal cadence: the delta
+ * buys speed, the rounds buy consistency. */
+static void delta_send(mimeshi_node *n, uint16_t id) {
+    mimeshi_neighbor *nb = nbr_find(n, id);
+    if (!nb || !nb->alive || !nb->sym) return;
+    uint8_t p[19 + 3 * 4];
+    wr16(p + 1, n->id);
+    p[3] = n->chunk_nr++;
+    p[4] = 1;                                     /* one entry */
+    wr16(p + 5, n->geo_lat); wr16(p + 7, n->geo_lon);
+    p[9] = 1;
+    p[10] = (uint8_t)(PKT_TABLE_CHUNK | F_DELTA);
+    wr16(p + 11, nb->id);
+    p[13] = (uint8_t)((adv_class_of(nb->quality) << 4) | adv_class_of(nb->rev_quality));
+    p[14] = 0;                                    /* direct measurement: fresh */
+    mimeshi_mapnode *m = map_find(n, nb->id);
+    if (m && m->geo_lat) { wr16(p + 15, m->geo_lat); wr16(p + 17, m->geo_lon); }
+    else { wr16(p + 15, 0); wr16(p + 17, 0); }
+    p[19] = 0;                                    /* link count: a new neighbour has none yet */
+    for (uint8_t k = 0; k < MC_N_CHANNELS; k++) {
+        uint8_t c = (uint8_t)((n->home_ch + 1 + k) % MC_N_CHANNELS);
+        bound_send(n, c, p, 20, t_data_us(20));
+        ka_called(n, c);
+    }
+}
 
 /* Tail chunk (4.3): the 2-hop map as full entries. Same format as the
  * prefix chunk, flagged with F_TAIL. Entries are map nodes that are NOT
@@ -639,7 +681,7 @@ static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t 
                 uint8_t oq = quality_from_class(cls);
                 nb->rev_quality = quality_ewma(nb->rev_quality ? nb->rev_quality : oq, oq);
                 if (quality_ok(nb->quality)) {
-                    if (!nb->sym) tbl_mark_dirty(n);
+                    if (!nb->sym) tbl_nbr_added(n, owner);
                     nb->sym = 1; nb->ack_try = 0;
                 }
             }
@@ -957,7 +999,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                                      : nb->rev_quality;
             }
             if (dst == n->id && quality_ok(nb->quality)) {
-                if (!nb->sym) tbl_mark_dirty(n);       /* new advertised neighbour (4.3) */
+                if (!nb->sym) tbl_nbr_added(n, from);  /* delta + table round (4.3) */
                 nb->sym = 1; nb->ack_try = 0;          /* confirmed symmetric (4.2, 10.1) */
             }
         }
@@ -985,7 +1027,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         for (uint16_t i = 0; i < ids; i++) {
             if (rd16(pkt + 3 + 2 * i) == n->id && nb) {
                 nb->proven_age_us = 0;
-                if (quality_ok(nb->quality) && !nb->sym) { nb->sym = 1; nb->ack_try = 0; tbl_mark_dirty(n); }
+                if (quality_ok(nb->quality) && !nb->sym) { nb->sym = 1; nb->ack_try = 0; tbl_nbr_added(n, from); }
             }
         }
         break;
@@ -1016,7 +1058,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                         nb->rev_quality = quality_ewma(nb->rev_quality ? nb->rev_quality : pkt[7], pkt[7]);
                     }
                     if (quality_ok(nb->quality)) {
-                        if (!nb->sym) tbl_mark_dirty(n);
+                        if (!nb->sym) tbl_nbr_added(n, rd16(pkt + 5));
                         nb->sym = 1; nb->ack_try = 0;
                     }
                 }
