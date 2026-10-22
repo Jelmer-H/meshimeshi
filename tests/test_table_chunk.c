@@ -114,7 +114,10 @@ int main(void) {
     pump_until(70000000);                                   /* > 30 s window + jitter */
     assert(chunk_seen == before + MC_N_CHANNELS);           /* one push: a chunk per channel */
     assert(last_tx_node == 0x0102);
-    assert(last_ch == MC_N_CHANNELS - 1);                   /* fixed order: round ends on the last channel */
+    /* round starts at (home+1)%3 and ends on the OWN home channel (2):
+     * S = 0x0102 has home 0 -> order 1,2,0 */
+    assert(last_ch == 0);
+    assert(last_tx_node == 0x0102);
     assert((last_pkt[0] & 0x0F) == PKT_TABLE_CHUNK_VALUE);
     assert(t_rd16(last_pkt + 1) == 0x0102);                 /* owner id */
     /* entries: B yes, W no (no heard-only) */

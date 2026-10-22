@@ -511,8 +511,12 @@ static void chunk_send(mimeshi_node *n) {
      * links that Gabriel and route choice need. Cost per chunk: 3 x
      * 869 ms air per push round; a full tower table stays far under the
      * duty limit. The push bundling (one chunk per window) caps the
-     * rate; the pool has a slot per transmission like the hello round. */
-    for (uint8_t c = 0; c < MC_N_CHANNELS; c++) {
+     * rate; the pool has a slot per transmission like the hello round.
+     * The round STARTS at (home + 1) mod 3 and thereby ENDS on the own
+     * home channel: no switch left over, and the neighbours there can
+     * react (snooping, later the generalised ack, 12.16) immediately. */
+    for (uint8_t k = 0; k < MC_N_CHANNELS; k++) {
+        uint8_t c = (uint8_t)((n->home_ch + 1 + k) % MC_N_CHANNELS);
         bound_send(n, c, p, len, t_data_us(len));
         ka_called(n, c);                          /* own call on c (4.1) */
     }
