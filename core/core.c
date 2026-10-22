@@ -54,8 +54,8 @@
 #define MC_RETRY_TX         2              /* transmit attempts per neighbor per series (7.4) */
 #define MC_ACK1_MARGIN_US   80000ull       /* processing + margin on top of t_data + t_ack (7.3) */
 #define MC_S_SWITCH_US      5000ull        /* channel switch incl. settling (14.1) */
-#define MC_CTS_BACKOFF_US   20000ull       /* clear-to-send backoff: random 0..19 ms */
-#define MC_CTS_MAX_TRIES    8u             /* ask at most 8x per transmission; then transmit anyway */
+#define MC_CAD_BACKOFF_US   20000ull       /* CAD backoff: random 0..19 ms (2) */
+#define MC_CAD_MAX_TRIES    8u             /* ask at most 8x per transmission; then transmit anyway */
 
 /* ---------------- airtime (SF7, 62.5 kHz, CR4/5) ----------------
  * Fixed values from the table in 14.1. The core passes the airtime to
@@ -179,24 +179,25 @@ static bool dedup_fresh(mimeshi_node *n, uint16_t msg_id, uint16_t src) {
 #ifndef MC_BOUND_POOL
 #define MC_BOUND_POOL MC_MAX_PENDING
 #endif
-typedef struct { uint8_t ch; uint8_t cts_tries; uint16_t len; uint64_t airtime; uint8_t pkt[10 + MC_MAX_PAYLOAD]; } bound_ctx;
+typedef struct { uint8_t ch; uint8_t cad_tries; uint16_t len; uint64_t airtime; uint8_t pkt[10 + MC_MAX_PAYLOAD]; } bound_ctx;
 static bound_ctx bctx[MC_BOUND_POOL]; /* pool per transmission; small and fixed */
 static uint32_t bctx_drops;          /* full pool = defect, never silent */
 
 static void bound_fire(mimeshi_node *n, void *ud) {
     bound_ctx *c = (bound_ctx *)ud;
-    /* Clear-to-send (14, open point 8): after the switch the radio is on
-     * channel and can sense the carrier. Busy = wait with random backoff
-     * on the channel and ask again; the pool slot stays reserved, so a
-     * busy channel delays but never drops the transmission. After
-     * MC_CTS_MAX_TRIES the transmission goes anyway: a permanently busy
-     * channel must not block the node forever (hello round, proof list).
-     * Ack1 never comes through here: it is a direct reply and goes
-     * without a switch and without a check via tx() (7.1). */
-    if (n->channel_free && c->cts_tries < MC_CTS_MAX_TRIES &&
+    /* CAD, channel activity detection (2): after the switch the radio
+     * is on channel and can sense the carrier. Busy = wait with random
+     * backoff on the channel and ask again; the pool slot stays
+     * reserved, so a busy channel delays but never drops the
+     * transmission. After MC_CAD_MAX_TRIES the transmission goes
+     * anyway: a permanently busy channel must not block the node
+     * forever (hello round, proof list). Ack1 never comes through here:
+     * it is a direct reply and goes without a switch and without a
+     * check via tx() (7.1). Not RTS/CTS against hidden nodes (8). */
+    if (n->channel_free && c->cad_tries < MC_CAD_MAX_TRIES &&
         !n->channel_free(n, c->ch)) {
-        c->cts_tries++;
-        n->timer(n, 1 + (n->rand(n) % MC_CTS_BACKOFF_US), bound_fire, c);
+        c->cad_tries++;
+        n->timer(n, 1 + (n->rand(n) % MC_CAD_BACKOFF_US), bound_fire, c);
         return;
     }
     n->tx(n, c->ch, c->pkt, c->len, c->airtime);
@@ -209,7 +210,7 @@ static void bound_fire(mimeshi_node *n, void *ud) {
 static void bound_send(mimeshi_node *n, uint8_t ch, const uint8_t *pkt, uint16_t len, uint64_t airtime) {
     for (int i = 0; i < MC_BOUND_POOL; i++) {
         if (bctx[i].len == 0) {
-            bctx[i].ch = ch; bctx[i].cts_tries = 0; bctx[i].len = len; bctx[i].airtime = airtime;
+            bctx[i].ch = ch; bctx[i].cad_tries = 0; bctx[i].len = len; bctx[i].airtime = airtime;
             memcpy(bctx[i].pkt, pkt, len);
             n->switch_ch(n, ch, MC_S_SWITCH_US, bound_fire, &bctx[i]);
             return;
@@ -652,13 +653,13 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
  * reserve it statically — hence the zeroing here. */
 void mimeshi_init(mimeshi_node *n, uint16_t id, mimeshi_tx_fn tx, mimeshi_timer_fn timer,
                 mimeshi_switch_fn sw, mimeshi_rand_fn rnd,
-                mimeshi_channel_free_fn cts, void *user) {
+                mimeshi_channel_free_fn cad, void *user) {
     memset(n, 0, sizeof(*n));
     n->id = id; n->home_ch = (uint8_t)(id % MC_N_CHANNELS);
     n->local_tbl_ctr = 1; n->hello_interval_us = MC_HELLO_START_US;
     n->hello_jitter_us = MC_HELLO_JITTER_US;
     n->tx = tx; n->timer = timer; n->switch_ch = sw; n->rand = rnd; n->user = user;
-    n->channel_free = cts;
+    n->channel_free = cad;
 }
 
 /* First hello round immediately (fast map building, 4.1), then the

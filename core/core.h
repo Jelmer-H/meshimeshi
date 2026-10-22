@@ -69,13 +69,15 @@ typedef void (*mimeshi_switch_fn)(mimeshi_node *n, uint8_t channel, uint64_t s_u
                                 void (*done)(mimeshi_node *, void *), void *ud);
 typedef uint32_t (*mimeshi_rand_fn)(mimeshi_node *n);
 
-/* Clear-to-send (14, open point 8): the platform layer answers whether
- * the channel is free at this moment (carrier sense). The core asks
- * before every transmission that is not a direct reply: if busy, it
- * waits with random backoff on the channel and asks again. Ack1 is the
- * exception (7.1): it is a direct reply within the ongoing exchange,
- * the partner is already waiting there, so it goes without a check.
- * NULL = no carrier sense available (stub platform): transmit as before. */
+/* CAD, channel activity detection (2): the platform layer answers
+ * whether the channel is free at this moment (carrier sense). The core
+ * asks before every transmission that is not a direct reply: if busy,
+ * it waits with random backoff on the channel and asks again. Ack1 is
+ * the exception (7.1): it is a direct reply within the ongoing
+ * exchange, the partner is already waiting there, so it goes without a
+ * check. Not an RTS/CTS system against hidden nodes (open point 8):
+ * CAD only avoids transmissions onto an occupied channel.
+ * NULL = no CAD available (stub platform): transmit as before. */
 typedef bool (*mimeshi_channel_free_fn)(mimeshi_node *n, uint8_t channel);
 
 /* ---------------- node ---------------------------------------------- */
@@ -107,7 +109,7 @@ struct mimeshi_node {
     mimeshi_timer_fn  timer;
     mimeshi_switch_fn switch_ch;
     mimeshi_rand_fn   rand;
-    mimeshi_channel_free_fn channel_free;  /* carrier sense (CTS); NULL = off */
+    mimeshi_channel_free_fn channel_free;  /* CAD (carrier sense); NULL = off */
     void *user;                       /* own data of platform/simulator */
 };
 
@@ -115,7 +117,7 @@ struct mimeshi_node {
 /* Initializes the node (zeroing + callbacks). The id determines the home channel. */
 void mimeshi_init(mimeshi_node *n, uint16_t id, mimeshi_tx_fn tx, mimeshi_timer_fn timer,
                 mimeshi_switch_fn sw, mimeshi_rand_fn rnd,
-                mimeshi_channel_free_fn cts, void *user);
+                mimeshi_channel_free_fn cad, void *user);
 
 /* First hello round immediately, then startup rounds with random phase
  * (jitter). After the startup phase the hello no longer exists:
