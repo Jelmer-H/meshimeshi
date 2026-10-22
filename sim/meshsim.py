@@ -571,7 +571,7 @@ def multihop(mk, jitter):
         base_rx(self, arg)
     CCore.rx = rx
 
-    rng = random.Random(2028)
+    rng = random.Random(_ARGS.seed)
     payload = bytes(_ARGS.payload)
     interval = 3_600_000_000 // max(_ARGS.rate, 1)
     by_id = {kn.id: kn for kn in nodes}
@@ -677,6 +677,8 @@ def main():
                     help='multihop: any node to any node (direct pairs included)')
     ap.add_argument('--warmup', type=int, default=0, metavar='HOURS',
                     help='multihop: hours of traffic-free convergence before the measurement traffic starts')
+    ap.add_argument('--seed', type=int, default=2028, metavar='N',
+                    help='multihop: RNG seed of the traffic generator (A/B runs)')
     args = ap.parse_args()
     global _ARGS
     _ARGS = args
