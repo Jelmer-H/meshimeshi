@@ -526,10 +526,15 @@ static void chunk_recv(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *
             snb->sym = 1; snb->ack_try = 0; snb->proven_age_us = 0;
         } else if (x == from) {
             /* the SENDER's own first entry: its links are the sender's
-             * complete degree (4.3 node-centric). We are a direct neighbour
-             * -- our own table has the same links, but for the graph the
-             * completeness of the sender's entry matters: store it as a
-             * known entry so the sender's full degree is in our graph. */
+             * complete degree (4.3 node-centric), each quality being the
+             * direction the SENDER measures (4.3: quality per direction).
+             * A link to US carries their measurement of our transmissions:
+             * that is the us->sender direction -> quality_back. */
+            for (uint8_t j = 0; j < take; j++) {
+                if (links[j] == n->id && snb) {
+                    if (lq[j]) snb->quality_back = lq[j];
+                }
+            }
             known_upsert(n, from, from, 63, gx, gy, links, lq, take);
         } else {
             known_upsert(n, x, from, e[2], gx, gy, links, lq, take);
@@ -707,11 +712,44 @@ static mimeshi_2hop *known_upsert(mimeshi_node *n, uint16_t id, uint16_t via,
  * must prefer the slightly longer reliable path. Threshold: quality 10
  * (about -108 dBm). */
 #define MC_ROUTE_MIN_QUALITY 10
+
+/* Effective quality of a direct link (10.1: each direction proven by its
+ * receiver): the minimum of both directions. quality = neighbour->us as we
+ * measure; quality_back = us->neighbour as the neighbour measures (learned
+ * from its self-entry, 4.3). Until quality_back is learned, our own
+ * measurement is all we have -- a one-direction view. */
+static uint8_t nbr_eff_quality(mimeshi_neighbor *nb) {
+    if (nb->quality_back && nb->quality_back < nb->quality) return nb->quality_back;
+    return nb->quality;
+}
+
+/* Effective quality of a learned link (a, b): the minimum of both
+ * advertised directions. Entry a's link to b carries b->a (a measured);
+ * entry b's link to a carries a->b (b measured). min = the bottleneck. */
+static uint8_t link_eff_quality(mimeshi_node *n, uint16_t a, uint16_t b) {
+    mimeshi_2hop *ha = known_find(n, a);
+    uint8_t q = 0;
+    if (ha) {
+        for (uint8_t l = 0; l < ha->nlinks; l++)
+            if (ha->link[l] == b) { q = ha->lq[l]; break; }   /* direction b->a */
+    }
+    mimeshi_2hop *hb = known_find(n, b);
+    if (hb) {
+        for (uint8_t l = 0; l < hb->nlinks; l++) {
+            if (hb->link[l] == a) {                          /* direction a->b */
+                if (!q || hb->lq[l] < q) q = hb->lq[l];
+                break;
+            }
+        }
+    }
+    return q;
+}
+
 static int route_score(mimeshi_node *n, mimeshi_neighbor *nb) {
     (void)n;
     if (!nb->sym) return -1;                 /* only confirmed links (10.1) */
-    if (nb->quality < MC_ROUTE_MIN_QUALITY) return -1;   /* under the threshold (10.1) */
-    return nb->quality - (nb->penalty << 3); /* penalty weighs heavily (10.4) */
+    if (nbr_eff_quality(nb) < MC_ROUTE_MIN_QUALITY) return -1;   /* threshold on BOTH directions (10.1) */
+    return nbr_eff_quality(nb) - (nb->penalty << 3); /* penalty weighs heavily (10.4) */
 }
 
 /* Path computation on the learned link graph (10.2). The graph: our own
@@ -771,10 +809,10 @@ static mimeshi_neighbor *route_path(mimeshi_node *n, uint16_t dst, mimeshi_neigh
             for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
                 mimeshi_neighbor *nb = &n->nbr[i];
                 if (!nb->alive || !nb->sym) continue;
-                if (nb->quality < MC_ROUTE_MIN_QUALITY) continue;   /* threshold (10.1) */
+                if (nbr_eff_quality(nb) < MC_ROUTE_MIN_QUALITY) continue;   /* threshold (10.1) */
                 int v = IDX(nb->id);
                 if (v < 0) continue;
-                int32_t nd = dist[0] + dij_cost(nb->quality);
+                int32_t nd = dist[0] + dij_cost(nbr_eff_quality(nb));
                 if (nd < dist[v]) {
                     dist[v] = nd;
                     first[v] = nb->id;            /* the first hop on the path to v */
@@ -788,7 +826,8 @@ static mimeshi_neighbor *route_path(mimeshi_node *n, uint16_t dst, mimeshi_neigh
                 for (uint8_t l = 0; l < h->nlinks; l++) {
                     int v = IDX(h->link[l]);
                     if (v < 0) continue;
-                    int32_t nd = dist[u] + dij_cost(h->lq[l] ? h->lq[l] : h->quality);
+                    uint8_t lq2 = link_eff_quality(n, ids[u], h->link[l]);
+                    int32_t nd = dist[u] + dij_cost(lq2 ? lq2 : h->quality);
                     if (nd < dist[v]) {
                         dist[v] = nd;
                         first[v] = first[u] ? first[u] : ids[u];   /* propagate the first hop */
@@ -804,7 +843,7 @@ static mimeshi_neighbor *route_path(mimeshi_node *n, uint16_t dst, mimeshi_neigh
     if (t < 0 || dist[t] == MC_DIJ_INF || first[t] == 0) return 0;
     mimeshi_neighbor *hop = nbr_find(n, first[t]);
     if (!hop || !hop->sym || hop == excl) return 0;
-    if (hop->quality < MC_ROUTE_MIN_QUALITY) return 0;   /* threshold (10.1) */
+    if (nbr_eff_quality(hop) < MC_ROUTE_MIN_QUALITY) return 0;   /* threshold (10.1) */
     return hop;
     #undef IDX
 }
@@ -864,7 +903,7 @@ static mimeshi_neighbor *route_next(mimeshi_node *n, uint16_t dst,
         for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
             mimeshi_neighbor *nb = &n->nbr[i];
             if (!nb->alive || !nb->sym || nb == excl) continue;
-            if (nb->quality < MC_ROUTE_MIN_QUALITY) continue;   /* threshold (10.1) */
+            if (nbr_eff_quality(nb) < MC_ROUTE_MIN_QUALITY) continue;   /* threshold (10.1) */
             if (nb->geox == MC_GEO_UNKNOWN) continue;
             if (geo_dist2(nb->geox, nb->geoy, tgx, tgy) >= own_gw) continue;  /* no progress: void guard */
             int s = route_score(n, nb) - (geo_dist2(nb->geox, nb->geoy, tgx, tgy) >> 12);

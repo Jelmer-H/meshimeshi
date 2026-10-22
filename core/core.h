@@ -50,7 +50,13 @@
 /* ---------------- internal types (visible for fixed allocation) ---- */
 typedef struct {
     uint16_t id;
-    uint8_t  quality;      /* derived from RSSI, updated per hello/proof list */
+    uint8_t  quality;      /* derived from RSSI, updated per hello/proof list:
+                              the signal of the NEIGHBOUR as we measure it
+                              (direction neighbour->us) */
+    uint8_t  quality_back; /* what the neighbour measures of OUR transmissions
+                              (direction us->neighbour), learned from its
+                              self-entry links (4.3: quality per direction);
+                              0 = not yet learned */
     uint8_t  ack_try;      /* counter per neighbor (4.1): every identifying
                               transmission of the neighbor counts; ack
                               attempts at counter values 1, 2, 4, 8, 16,
