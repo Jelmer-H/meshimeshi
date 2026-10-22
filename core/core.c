@@ -53,6 +53,11 @@
 #define MC_BUDGET_INIT     32              /* initial value budget byte (9) */
 #define MC_RETRY_TX         2              /* transmit attempts per neighbor per series (7.4) */
 #define MC_ACK1_MARGIN_US   80000ull       /* processing + margin on top of t_data + t_ack (7.3) */
+#define MC_RETRY_WAIT_US    2000000ull     /* between the two attempts of one series: 2 s (7.4) */
+#define MC_RETRY_JITTER_US  1000000ull     /* + random 0..1 s on top (7.4) */
+#define MC_ROUTE_ALT        2u             /* alternative-hop series after the first choice (7.4: max 3 neighbours) */
+#define MC_T_ACK2_US        15000000ull    /* fixed ack2 timeout (7.3): 15 s; then -6 budget, next series */
+#define MC_ACK2_BUDGET_PENALTY 6u           /* budget units charged on the T_ack2 timeout (7.3) */
 #define MC_S_SWITCH_US      5000ull        /* channel switch incl. settling (14.1) */
 #define MC_SYM_QUALITY_MIN  14u            /* symmetry requires this quality (10.1):
                                                quality_of(-100 dBm); 10 dB above the
@@ -85,8 +90,10 @@ static uint64_t t_data_us(uint16_t l) { return l <= 40 ? 173000ull : l <= 150 ? 
  *   PROOF       3+2n B type, node-id(2), n x neighbour-id(2), n <= 17 (4.2).
  *                     Reactionless keepalive + symmetry flush; an empty list
  *                     is the minimal keepalive beacon (type + node-id).
- *   DATA      10+n B  type+F_ACK3_REQ, msg-id(2), source(2), destination(2),
- *                     previous-hop(2), budget(1, offset 9), payload(n)  (6.1)
+ *   DATA      12+n B  type+F_ACK3_REQ+F_DEST_GEO, msg-id(2), source(2),
+ *                     destination(2), previous-hop(2), budget(1, offset 9),
+ *                     next-hop(2, offset 10), [dest geo 4 B when F_DEST_GEO,
+ *                     offset 12 (5, 10.2)], payload(n)  (6.1)
  *   ACK1        7 B   type, msg-id(2), source of the message(2), sender(2) (6.2)
  *   ACK2        7 B   same as ACK1; F_NEG_ACK2 makes it negative       (6.2, 7.2)
  *   ACK3       14 B   DATA format, payload 4 B: the original msg-id (6.2, 11)
@@ -99,6 +106,9 @@ enum {
     PKT_DATA, PKT_ACK1, PKT_ACK2, PKT_ACK3, PKT_FAIL_RPT
 };
 #define F_ACK3_REQ 0x10   /* requested by the source of the message (11) */
+#define F_DEST_GEO 0x20   /* destination geo present: 4 B after the fixed
+                             header (6.1, 10.2) - every hop can recompute
+                             the bridge node toward an unknown destination */
 #define F_TAIL     0x10   /* table chunk flag: tail chunk - 2-hop entries (4.3) */
 #define F_DELTA    0x20   /* table chunk flag: delta - one changed entry (4.3) */
 #define F_NEG      0x40   /* table chunk flag: negative delta - one entry gone (4.4) */
@@ -208,7 +218,7 @@ static bool dedup_fresh(mimeshi_node *n, uint16_t msg_id, uint16_t src) {
 #ifndef MC_BOUND_POOL
 #define MC_BOUND_POOL MC_MAX_PENDING
 #endif
-typedef struct { uint8_t ch; uint8_t cad_tries; uint16_t len; uint64_t airtime; uint8_t pkt[10 + MC_MAX_PAYLOAD]; } bound_ctx;
+typedef struct { uint8_t ch; uint8_t cad_tries; uint16_t len; uint64_t airtime; uint8_t pkt[16 + MC_MAX_PAYLOAD]; } bound_ctx;
 static bound_ctx bctx[MC_BOUND_POOL]; /* pool per transmission; small and fixed */
 static uint32_t bctx_drops;          /* full pool = defect, never silent */
 
@@ -508,6 +518,217 @@ static void lnk_set_class(mimeshi_node *n, uint16_t from, uint16_t to, uint8_t c
     else           l->q = (uint8_t)((l->q & 0xF0) | cls);
 }
 
+/* ---------------- route computation (10.2, building block 2) ------
+ * Stateless per message: no path in the header, every hop computes its
+ * own first step on the own known graph. Cost model (decided, Oct
+ * 2026): ETX per link = 1/p on the integer scale x16, one lookup table
+ * indexed on the advertised quality class; the route cost is the sum
+ * over the path, so the computation minimises the expected number of
+ * transmissions. Age multiplier (10.2): an endpoint above half of
+ * T_active makes the edge 1.5x as expensive, above T_active itself
+ * 3x - stale knowledge loses against fresh. First step (hard
+ * requirement, 10.1): only confirmed symmetric neighbours above the
+ * quality threshold. */
+#define MC_ROUTE_SCALE 16u                /* cost 1.0 (10.2) */
+static const uint16_t mc_etx_class[8] = {
+    0,                                /* class 0: not routable (10.2) */
+    228, 145, 94, 64, 43, 29, 20      /* classes 1..7: cost x16 (10.2 table) */
+};
+
+/* Age multiplier on an edge endpoint: follows the effective age of the
+ * map entry (4.4), in proof ticks (~56 s). Returns 2 = 1.5x, 3 = 3x. */
+static uint16_t route_age_mult(uint32_t age) {
+    if (age >= MC_T_ACTIVE_TICKS) return 3;
+    if (age >= MC_T_ACTIVE_TICKS / 2) return 2;
+    return 0;
+}
+
+static uint32_t mult_apply(uint32_t c, uint16_t m) {
+    if (m == 3) return c * 3;
+    if (m == 2) return c * 3 / 2;
+    return c;
+}
+
+/* Cost of the own edge toward a confirmed neighbour: the measured
+ * quality class (finer than the advertised classes), with the age
+ * addition of the map entry when we have one. Penalty (10.4) follows
+ * in a later building step. */
+static uint32_t route_edge_own(mimeshi_node *n, mimeshi_neighbor *nb) {
+    uint8_t cls = adv_class_of(nb->quality);
+    uint32_t c = (cls < 8 && mc_etx_class[cls]) ? mc_etx_class[cls] : MC_ROUTE_SCALE;
+    mimeshi_mapnode *m = map_find(n, nb->id);
+    if (m) c = mult_apply(c, route_age_mult(map_age_ticks(n, m)));
+    return c;
+}
+
+/* Dijkstra scratch: bounded like the map (13.2); static because the
+ * core has no heap and is single-threaded per node (13b). */
+#define MC_DIST_INF 0x7FFFFFFFu
+static uint32_t r_dist[MC_MAP_NODES];
+static uint16_t r_prev[MC_MAP_NODES];   /* predecessor map slot; 0xFFFE = own edge */
+static uint8_t  r_done[MC_MAP_NODES];
+
+static int r_idx(mimeshi_node *n, uint16_t id) {
+    for (int i = 0; i < MC_MAP_NODES; i++)
+        if (n->map[i].alive && n->map[i].id == id) return i;
+    return -1;
+}
+
+/* The first hop toward dst on the own known graph, or 0 when dst is
+ * unreachable. The first step runs only over confirmed symmetric
+ * neighbours above the quality threshold (10.1); further edges run
+ * over the link store, direction of travel known, endpoints not
+ * expired (4.4). A confirmed direct neighbour is its own first hop
+ * even without a map slot: it is the destination itself.
+ * `excl` (excl_cnt entries) are next hops that already failed for
+ * THIS message: cumulative exclusion per series (7.4) - the
+ * computation must not propose a hop the series has buried. */
+static uint16_t route_next_hop_ex(mimeshi_node *n, uint16_t dst,
+                                  const uint16_t *excl, uint8_t excl_cnt) {
+    if (dst == n->id) return n->id;
+    int di = r_idx(n, dst);
+    /* A direct neighbour is NOT its own first hop by definition: its
+     * own edge competes in the computation like every other edge, and
+     * two good hops beat one bad hop (10.2, ETX). But a confirmed
+     * neighbour without a map slot must still be able to WIN that
+     * competition when it is the destination itself - otherwise a
+     * fresh symmetric neighbour is unreachable until its chunk
+     * arrives (measured: 'no candidate hop' losses under load). */
+    mimeshi_neighbor *dnb = nbr_find(n, dst);
+    int direct_ok = (dnb && dnb->sym && quality_ok(dnb->quality));
+    if (di < 0) {
+        if (direct_ok) {
+            for (uint8_t e = 0; e < excl_cnt; e++) if (excl[e] == dst) return 0;
+            return dst;                          /* the only edge toward it is the own one */
+        }
+        return 0;                                /* not in the graph: no flood (10.2) */
+    }
+    for (int i = 0; i < MC_MAP_NODES; i++) { r_dist[i] = MC_DIST_INF; r_prev[i] = 0xFFFF; r_done[i] = 0; }
+    for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {           /* own edges (virtual start) */
+        mimeshi_neighbor *nb = &n->nbr[i];
+        if (!nb->alive || !nb->sym || !quality_ok(nb->quality)) continue;
+        int ex = 0;
+        for (uint8_t e = 0; e < excl_cnt; e++) if (excl[e] == nb->id) { ex = 1; break; }
+        if (ex) continue;                          /* failed for this message (7.4) */
+        int bi = r_idx(n, nb->id);
+        if (bi < 0) continue;                     /* no map slot: no further edges */
+        uint32_t c = route_edge_own(n, nb);
+        if (c < r_dist[bi]) { r_dist[bi] = c; r_prev[bi] = 0xFFFE; }
+    }
+    for (;;) {
+        int u = -1;
+        for (int i = 0; i < MC_MAP_NODES; i++)
+            if (!r_done[i] && r_dist[i] < MC_DIST_INF && (u < 0 || r_dist[i] < r_dist[u])) u = i;
+        if (u < 0 || u == di) break;              /* nothing left, or target settled */
+        r_done[u] = 1;
+        uint16_t mult_u = route_age_mult(map_age_ticks(n, &n->map[u]));
+        for (int j = 0; j < MC_MAX_LINKS; j++) {           /* relax the edges of map[u] */
+            mimeshi_link *l = &n->lnk[j];
+            if (!l->alive) continue;
+            uint16_t from = n->map[u].id;
+            if (l->a != from && l->b != from) continue;
+            uint8_t cf = (l->a == from) ? (uint8_t)((l->q >> 4) & 0x0F) : (uint8_t)(l->q & 0x0F);
+            if (cf == 0) continue;                          /* direction of travel unknown */
+            uint32_t c = mc_etx_class[cf & 7];
+            if (!c) continue;
+            c = mult_apply(c, mult_u);                     /* stale endpoint u */
+            uint16_t o = (l->a == from) ? l->b : l->a;
+            int oi = r_idx(n, o);
+            if (oi < 0 || r_done[oi]) continue;
+            c = mult_apply(c, route_age_mult(map_age_ticks(n, &n->map[oi])));
+            if (r_dist[u] + c < r_dist[oi]) { r_dist[oi] = r_dist[u] + c; r_prev[oi] = (uint16_t)u; }
+        }
+    }
+    if (r_dist[di] >= MC_DIST_INF) return 0;     /* unreachable in the graph */
+    int cur = di;                                 /* walk back to the own edge */
+    while (r_prev[cur] != 0xFFFE) {
+        cur = r_prev[cur];
+        if (cur == 0xFFFF) return 0;
+    }
+    return n->map[cur].id;
+}
+
+static uint16_t route_bridge_node(mimeshi_node *n, uint16_t lat, uint16_t lon,
+                                  const uint16_t *excl, uint8_t excl_cnt);
+
+/* Plain variant: no exclusions (first choice, 10.2). */
+static uint16_t route_next_hop(mimeshi_node *n, uint16_t dst) {
+    return route_next_hop_ex(n, dst, 0, 0);
+}
+
+/* First hop toward dst with, when known, the dest geo (10.2): the
+ * graph decides when the destination lies in it; otherwise the
+ * bridge-node rule routes toward the closest graph node near the
+ * dest geo (15% candidate band, best route cost wins). geo (0,0)
+ * = unknown: then a destination outside the graph is refused. */
+static uint16_t route_next_hop_geo(mimeshi_node *n, uint16_t dst,
+                                  uint16_t lat, uint16_t lon,
+                                  const uint16_t *excl, uint8_t excl_cnt) {
+    uint16_t nh = route_next_hop_ex(n, dst, excl, excl_cnt);
+    if (nh) return nh;
+    if (!lat && !lon) return 0;               /* no geo: no flood (10.2) */
+    uint16_t bridge = route_bridge_node(n, lat, lon, excl, excl_cnt);
+    if (!bridge) return 0;
+    return route_next_hop_ex(n, bridge, excl, excl_cnt);
+}
+
+/* Squared distance on the coarse 16-bit geo grid (5): comparison only,
+ * so no sqrt. Longitude steps shrink with cos(latitude); at the NL
+ * latitudes the factor is roughly 3/4 - folded into a fixed weight,
+ * good enough to rank bridge-node candidates (10.2). */
+static uint32_t geo_dist2(uint16_t lat1, uint16_t lon1, uint16_t lat2, uint16_t lon2) {
+    int32_t dlat = (int32_t)lat1 - (int32_t)lat2;
+    int32_t dlon = ((int32_t)lon1 - (int32_t)lon2) * 3 / 4;
+    return (uint32_t)(dlat * dlat + dlon * dlon);
+}
+
+/* Route cost toward dst on the own graph (10.2), or MC_DIST_INF when
+ * unreachable. Shares the Dijkstra scratch with route_next_hop_ex: a
+ * run settles every reachable node, so the cost of any candidate can
+ * be read from r_dist afterwards. */
+static uint32_t route_cost_to(mimeshi_node *n, uint16_t dst,
+                              const uint16_t *excl, uint8_t excl_cnt) {
+    if (!route_next_hop_ex(n, dst, excl, excl_cnt)) return MC_DIST_INF;
+    int di = r_idx(n, dst);
+    if (di < 0) return MC_DIST_INF;
+    return r_dist[di];
+}
+
+/* Bridge-node rule (10.2, decided Oct 2026): the destination lies
+ * outside the own graph but its geo is known. Candidates: all graph
+ * nodes within 15% of the distance of the closest one (the margin
+ * grows with the absolute distance - far from the destination there
+ * is more freedom to pick a better path); among the candidates the
+ * best route cost wins. Distance comparison on the square: 1.15^2 =
+ * 1.3225, so the margin is +32.25% on d2. */
+static uint16_t route_bridge_node(mimeshi_node *n, uint16_t lat, uint16_t lon,
+                                  const uint16_t *excl, uint8_t excl_cnt) {
+    uint32_t best_d = 0;
+    int have = 0;
+    for (int i = 0; i < MC_MAP_NODES; i++) {
+        if (!n->map[i].alive || !n->map[i].geo_lat) continue;   /* no geo: no candidate (5) */
+        uint32_t d = geo_dist2(n->map[i].geo_lat, n->map[i].geo_lon, lat, lon);
+        if (!have || d < best_d) { best_d = d; have = 1; }
+    }
+    if (!have) return 0;                       /* no geo material at all */
+    uint32_t margin = best_d + best_d * 3225u / 10000u;
+    /* first pass: find the best (minimum) route cost among the
+     * candidates; the Dijkstra scratch is filled per candidate run.
+     * Candidates are usually few; the closest-first scan keeps the
+     * result deterministic. */
+    uint16_t pick = 0;
+    uint32_t pick_cost = MC_DIST_INF;
+    for (int i = 0; i < MC_MAP_NODES; i++) {
+        if (!n->map[i].alive || !n->map[i].geo_lat) continue;
+        uint32_t d = geo_dist2(n->map[i].geo_lat, n->map[i].geo_lon, lat, lon);
+        if (d > margin) continue;              /* outside the 15% band (10.2) */
+        uint32_t c = route_cost_to(n, n->map[i].id, excl, excl_cnt);
+        if (c < pick_cost) { pick_cost = c; pick = n->map[i].id; }
+    }
+    return pick;                                /* 0 when no candidate routable */
+}
+
+
 
 
 /* Delta chunk (4.3): a single changed entry, for neighbour
@@ -584,7 +805,11 @@ static void tail_chunk_send(mimeshi_node *n) {
         if (!m->alive) continue;
         if (nbr_find(n, m->id)) continue;               /* direct neighbours: prefix work */
         wr16(p + len, m->id);
-        p[len + 2] = 0;                                  /* class: no direct measurement */
+        /* both directions in one byte, like the prefix (6.2, 4.3): the
+         * forwarded class in the high nibble - the class our source
+         * advertised for owner->entry; reverse nibble 0 = not reported
+         * by the entry itself. A class 0 only when never reported. */
+        p[len + 2] = (uint8_t)(adv_class_of(m->quality) << 4);
         p[len + 3] = map_age_eff(n, m);
         wr16(p + len + 4, m->geo_lat); wr16(p + len + 6, m->geo_lon);
         uint16_t lcnt_off = len + 8;
@@ -761,8 +986,12 @@ static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t 
             if (em) {
                 if (gl) { em->geo_lat = gl; em->geo_lon = go; }   /* (0,0) = none (5) */
                 uint8_t travelled = age;
-                if (!em->quality || travelled < map_age_eff(n, em)) {
-                    em->quality = quality_from_class(cls);        /* fresh beats old (4.3) */
+                if (cls && (!em->quality || travelled < map_age_eff(n, em))) {
+                    /* forwarded non-zero class beats old (4.3); a class 0
+                     * never overwrites a stored quality (the geo above
+                     * still refreshes; the age belongs to the quality
+                     * evidence): no source ever reported it */
+                    em->quality = quality_from_class(cls);
                     em->age_ticks = travelled; em->arrived_tick = n->tick;
                 }
             }
@@ -966,44 +1195,92 @@ static void ack1_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint8_t ch
 }
 
 /* Ack2 to the previous hop, on ITS home channel (2, 7.1): the previous
- * hop listens there without its own window. Positive = received (not
- * necessarily forwarded, 7.2); negative = forwarding failed, via
- * F_NEG_ACK2. */
-static void ack2_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint16_t prev, bool neg) {
-    uint8_t p[7] = { (uint8_t)(PKT_ACK2 | (neg ? F_NEG_ACK2 : 0)), 0,0, 0,0, 0,0 };
+ * hop listens there without its own window. Positive = the own next
+ * hop has ack1'd, so the message is two hops along (7.1/7.2, revised
+ * Oct 2026); negative = forwarding failed after every series, via
+ * F_NEG_ACK2, with the spent budget of the message in byte 7 (7.4):
+ * the previous hop sees what is left and can stop against an
+ * exhausted budget. */
+static void ack2_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint16_t prev,
+                      bool neg, uint8_t budget_left) {
+    uint8_t p[8] = { (uint8_t)(PKT_ACK2 | (neg ? F_NEG_ACK2 : 0)), 0,0, 0,0, 0,0, 0 };
     wr16(p + 1, msg_id); wr16(p + 3, src); wr16(p + 5, n->id);
-    bound_send(n, (uint8_t)(prev % MC_N_CHANNELS), p, 7, t_ack_us()); /* HOME of previous hop */
+    p[7] = budget_left;                       /* spent budget travels along (6.2, 7.4) */
+    bound_send(n, (uint8_t)(prev % MC_N_CHANNELS), p, 8, t_ack_us()); /* HOME of previous hop */
     ka_called(n, (uint8_t)(prev % MC_N_CHANNELS));  /* own call there (4.1) */
 }
 
 static void pending_try(mimeshi_node *n, mimeshi_pending *p);
+static void series_fail(mimeshi_node *n, mimeshi_pending *p);
 
-/* Ack1 stayed out (7.3/7.4). structure of the retries:
- *  - tries_left > 0:  next attempt toward THE SAME next hop,
- *                      tries and budget decrease by 1 per attempt;
- *  - tries exhausted: new attempt series (toward a different neighbor,
- *                      as soon as routing exists — 10.2), budget first
- *                      checks whether there is still room;
- *  - budget exhausted: drop the message. The real failed delivery
- *                      report (10.5, routed message to the source) comes
- *                      with building block 2; for now only the message
- *                      on stdout. */
+/* The wait between the two attempts of one series (7.4): 2 s + a
+ * random 0..1 s - the collision damper. The retry itself goes through
+ * pending_try, so the ack1 window runs again. */
+static void retry_fire(mimeshi_node *n, void *ud) {
+    mimeshi_pending *p = (mimeshi_pending *)ud;
+    if (!p->active || p->acked1) return;
+    p->tries_left--; p->budget_left--;
+    pending_try(n, p);
+}
+
+/* Ack1 stayed out (7.3/7.4). Structure of the series (decided Oct 2026):
+ *  - tries_left > 0: after 2 s + jitter the second attempt toward the
+ *    SAME next hop follows (retry_fire);
+ *  - tries exhausted: the series toward this hop failed. The hop goes
+ *    into the cumulative exclusion of this message, and the
+ *    computation proposes the next hop (immediately, no extra wait);
+ *  - source-is-next-hop: the recomputation proposes the previous hop -
+ *    the route has no forward option left: fail immediately with a
+ *    negative ack2 (spent budget along);
+ *  - no alternatives or budget left: definitive fail. The failed
+ *    delivery report (10.5) follows in a later building step. */
 static void ack1_timeout(mimeshi_node *n, void *ud) {
     mimeshi_pending *p = (mimeshi_pending *)ud;
-    if (!p->active) return;
+    if (!p->active || p->acked1) return;
     if (p->tries_left > 0) {
-        p->tries_left--; p->budget_left--;
-        pending_try(n, p);
-    } else {
-        p->tries_left = MC_RETRY_TX;      /* next attempt series */
-        if (p->budget_left == 0) {
-            p->active = 0;
-            printf("[core] node %u: FAIL msg %u (budget exhausted, no ack1)\n", n->id, p->msg_id);
-        } else {
-            p->budget_left--;
-            pending_try(n, p);            /* neighbor choice: real core ETX-driven (10.2) */
-        }
+        n->timer(n, MC_RETRY_WAIT_US + (n->rand(n) % MC_RETRY_JITTER_US), retry_fire, p);
+        return;
     }
+    series_fail(n, p);
+}
+
+/* A series toward p->next_hop failed (both attempts without ack1).
+ * Cumulative exclusion, recompute, next series - or definitive fail
+ * (7.4). */
+static void series_fail(mimeshi_node *n, mimeshi_pending *p) {
+    printf("[core] node %u: series toward %u failed (msg %u)\n", n->id, p->next_hop, p->msg_id);
+    if (p->excl_cnt < 3) p->excl[p->excl_cnt++] = p->next_hop;   /* cumulative (7.4) */
+    mimeshi_neighbor *fnb = nbr_find(n, p->next_hop);
+    if (fnb && fnb->penalty < 255) fnb->penalty++;               /* long-term lesson (10.4) */
+    if (p->alt_left == 0 || p->budget_left == 0) {
+        p->active = 0;
+        printf("[core] node %u: FAIL msg %u (no series left, budget %u)\n",
+               n->id, p->msg_id, p->budget_left);
+        if (p->prev_hop != n->id)
+            ack2_send(n, p->msg_id, p->src, p->prev_hop, true, p->budget_left);
+        return;
+    }
+    p->alt_left--;
+    uint16_t nh = route_next_hop_geo(n, p->dst, rd16(p->pkt + 12), rd16(p->pkt + 14),
+                                    p->excl, p->excl_cnt);   /* dest geo along when present (10.2) */
+    if (nh == p->prev_hop && p->prev_hop != n->id) {
+        /* source-is-next-hop (7.4): the route inverts; no forward
+         * option left. Fail immediately, negative ack2 with budget. */
+        p->active = 0;
+        printf("[core] node %u: FAIL msg %u (source is next hop)\n", n->id, p->msg_id);
+        ack2_send(n, p->msg_id, p->src, p->prev_hop, true, p->budget_left);
+        return;
+    }
+    if (!nh) {
+        p->active = 0;
+        printf("[core] node %u: FAIL msg %u (no candidate hop)\n", n->id, p->msg_id);
+        if (p->prev_hop != n->id)
+            ack2_send(n, p->msg_id, p->src, p->prev_hop, true, p->budget_left);
+        return;
+    }
+    p->tries_left = MC_RETRY_TX; p->budget_left--;
+    p->next_hop = nh;
+    pending_try(n, p);                 /* next series, immediately (7.4) */
 }
 
 /* One transmit attempt: update the budget in the header (offset 9,
@@ -1012,8 +1289,26 @@ static void ack1_timeout(mimeshi_node *n, void *ud) {
  * moment of submission. Assumption: the platform layer delivers the
  * transmission quickly (queue short); if the switch takes longer, the
  * timeout fires too early and the attempt counts as failed. */
+/* T_ack2 timeout (7.3, fixed 15 s): the next hop received (ack1 came)
+ * but its own forwarding stayed silent beyond every series. The
+ * silence counts as a failed series toward this hop: 6 units off the
+ * budget, then the 7.4 structure takes over - next-best hop if
+ * attempts remain, otherwise the definitive fail. */
+static void ack2_timeout(mimeshi_node *n, void *ud) {
+    mimeshi_pending *p = (mimeshi_pending *)ud;
+    if (!p->active || !p->acked1) return;
+    printf("[core] node %u: T_ack2 timeout for msg %u (budget %u -> %u)\n",
+           n->id, p->msg_id, p->budget_left,
+           (uint8_t)(p->budget_left > MC_ACK2_BUDGET_PENALTY ? p->budget_left - MC_ACK2_BUDGET_PENALTY : 0));
+    p->budget_left = (uint8_t)(p->budget_left > MC_ACK2_BUDGET_PENALTY ? p->budget_left - MC_ACK2_BUDGET_PENALTY : 0);
+    p->acked1 = 0;
+    p->tries_left = 0;              /* the wait was the second attempt (7.3) */
+    series_fail(n, p);
+}
+
 static void pending_try(mimeshi_node *n, mimeshi_pending *p) {
     p->pkt[9] = p->budget_left;
+    wr16(p->pkt + 10, p->next_hop);           /* next hop in the header (6.1) */
     bound_send(n, (uint8_t)(p->next_hop % MC_N_CHANNELS), p->pkt, p->pkt_len, t_data_us(p->pkt_len));
     ka_called(n, (uint8_t)(p->next_hop % MC_N_CHANNELS));   /* data as prev_hop (4.1) */
     n->timer(n, MC_S_SWITCH_US + t_data_us(p->pkt_len) + t_ack_us() + MC_ACK1_MARGIN_US, ack1_timeout, p);
@@ -1034,22 +1329,37 @@ static void pending_try(mimeshi_node *n, mimeshi_pending *p) {
  * demand that confirmation before forwarding; until then this direct
  * sending is bounded by retries+budget and fails visibly on the ack1
  * timeout. */
-int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uint16_t len, bool ack3) {
-    if (!nbr_find(n, dst)) return -1;          /* not in the map: do not flood (10.2) */
+int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uint16_t len, bool ack3,
+                      uint16_t dest_lat, uint16_t dest_lon) {
+    /* routing (10.2): the first hop follows from the own known graph -
+     * a direct neighbour only when its link is confirmed symmetric
+     * (10.1), otherwise the computation decides; a destination outside
+     * the graph routes via the bridge-node rule when the client
+     * supplied its geo, and is refused without geo (no flood). */
+    uint16_t nh = route_next_hop_geo(n, dst, dest_lat, dest_lon, 0, 0);
+    if (!nh) return -1;                        /* not in the graph, no usable geo: no flood (10.2) */
     if (len > MC_MAX_PAYLOAD) return -3;
     mimeshi_pending *p = 0;
     for (int i = 0; i < MC_MAX_PENDING; i++) if (!n->pend[i].active) { p = &n->pend[i]; break; }
     if (!p) return -2;
     memset(p, 0, sizeof(*p));
     p->active = 1; p->tries_left = MC_RETRY_TX; p->budget_left = MC_BUDGET_INIT;
+    p->alt_left = MC_ROUTE_ALT;            /* 2 alternative series after the first choice (7.4) */
     p->msg_id = (uint16_t)n->rand(n);
-    p->src = n->id; p->dst = dst; p->prev_hop = n->id; p->next_hop = dst;
+    p->src = n->id; p->dst = dst; p->prev_hop = n->id; p->next_hop = nh;
     uint8_t *k = p->pkt;
-    k[0] = (uint8_t)(PKT_DATA | (ack3 ? F_ACK3_REQ : 0));
+    bool geo = (dest_lat || dest_lon);
+    k[0] = (uint8_t)(PKT_DATA | (ack3 ? F_ACK3_REQ : 0) | (geo ? F_DEST_GEO : 0));
     wr16(k + 1, p->msg_id); wr16(k + 3, n->id); wr16(k + 5, dst); wr16(k + 7, n->id);
     k[9] = p->budget_left;                 /* header: budget at offset 9 (section 6.1) */
-    memcpy(k + 10, payload, len);
-    p->pkt_len = (uint16_t)(10 + len);
+    wr16(k + 10, nh);                      /* next hop at offset 10 (6.1) */
+    uint8_t off = 12;
+    if (geo) {                              /* dest geo after the fixed header (6.1, 10.2) */
+        wr16(k + 12, dest_lat); wr16(k + 14, dest_lon);
+        off = 16;
+    }
+    memcpy(k + off, payload, len);
+    p->pkt_len = (uint16_t)(off + len);
     pending_try(n, p);
     return 0;
 }
@@ -1154,12 +1464,13 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         uint16_t msg_id = rd16(pkt + 1);
         for (int i = 0; i < MC_MAX_PENDING; i++) {
             mimeshi_pending *p = &n->pend[i];
-            if (p->active && p->msg_id == msg_id) {
-                p->active = 0;                     /* hop succeeded; ack2 arrives on its own on our home channel */
+            if (p->active && p->msg_id == msg_id && !p->acked1) {
+                p->acked1 = 1;                     /* the own hop succeeded (7.1) */
                 mimeshi_neighbor *nb = nbr_find(n, rd16(pkt + 5));
                 if (nb) {                               /* confirmed symmetric (4.2, 10.1) */
                     nb->quality = quality_of(rssi);     /* the ack1 itself is the measurement (its direction) */
                     nb->proven_age_us = 0;
+                    if (nb->penalty) nb->penalty--;      /* recovery via ordinary traffic (10.4) */
                     if (len >= 8 && pkt[7]) {            /* what the acker measured on OUR data (6.2) */
                         nb->rev_quality = quality_ewma(nb->rev_quality ? nb->rev_quality : pkt[7], pkt[7]);
                     }
@@ -1169,17 +1480,47 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                     }
                 }
                 printf("[core] node %u: ACK1 for msg %u\n", n->id, msg_id);
+                if (p->prev_hop != n->id) {
+                    /* forwarder (7.1, revised Oct 2026): the ack2 goes
+                     * out NOW - two hops of progress per ack2 - and the
+                     * record closes. */
+                    ack2_send(n, msg_id, p->src, p->prev_hop, false, p->budget_left);
+                    p->active = 0;
+                } else {
+                    /* source: the hop is done; ack2 comes back on the
+                     * own home channel. T_ack2 (15 s) is the safety
+                     * net (7.3). */
+                    n->timer(n, MC_T_ACK2_US, ack2_timeout, p);
+                }
                 return;
             }
         }
         break;
     }
     case PKT_ACK2: {
-        /* confirmation of the next hop toward the previous one (7.2).
-         * For now only visible; the T_ack2 window and the pending
-         * handling on the sender (7.3) belong to building block 2. */
-        printf("[core] node %u: ACK2 %s for msg %u\n", n->id,
-               (flags & F_NEG_ACK2) ? "NEGATIVE" : "positive", rd16(pkt + 1));
+        /* Ack2 from the next hop (7.1/7.2, revised Oct 2026). Positive
+         * = two hops of progress: the next hop received AND its own hop
+         * succeeded - the pending record closes. Negative = its
+         * forwarding failed after every series; the spent budget
+         * travels along (byte 7, 7.4): weigh the own alternatives
+         * against what is left, stop when it is gone. */
+        uint16_t msg_id = rd16(pkt + 1);
+        for (int i = 0; i < MC_MAX_PENDING; i++) {
+            mimeshi_pending *p = &n->pend[i];
+            if (p->active && p->acked1 && p->msg_id == msg_id) {
+                printf("[core] node %u: ACK2 %s for msg %u (budget left %u)\n", n->id,
+                       (flags & F_NEG_ACK2) ? "NEGATIVE" : "positive", msg_id,
+                       len >= 8 ? pkt[7] : 0);
+                p->active = 0;
+                if (flags & F_NEG_ACK2) {
+                    if (len >= 8 && pkt[7] < p->budget_left) p->budget_left = pkt[7];
+                    p->acked1 = 0;
+                    p->tries_left = 0;          /* the series toward this hop is done */
+                    series_fail(n, p);          /* exclusion + next series (7.4) */
+                }
+                return;
+            }
+        }
         break;
     }
     case PKT_ACK3: {
@@ -1194,23 +1535,65 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
     }
     case PKT_DATA: {
         uint16_t msg_id = rd16(pkt + 1), src = rd16(pkt + 3), dst = rd16(pkt + 5), prev = rd16(pkt + 7);
-        if (dst != n->id) return;                  /* forwarding: next building block */
-        /* dedup before the acks: a retry of the same hop must not
-         * yield ack1/ack2/ack3 again. */
-        if (!dedup_fresh(n, msg_id, src)) return;
-        printf("[core] node %u: DATA from %u: '%.*s'\n", n->id, src, (int)(len - 10), (const char *)(pkt + 10));
-        ack1_send(n, msg_id, src, ch, rssi);       /* same channel; quality of the data travels along */
-        ack2_send(n, msg_id, src, prev, false);    /* home channel previous hop */
-        if (flags & F_ACK3_REQ) {
-            /* ack3 as a routed message (6.2): DATA format, payload = the
-             * original msg-id (4 B incl. reservation), back toward the
-             * previous hop — until there is real routing (building
-             * block 2). */
-            uint8_t a[14] = { PKT_ACK3, 0,0, 0,0, 0,0, 0,0, 0, 0,0, 0,0 };
-            wr16(a + 1, (uint16_t)n->rand(n)); wr16(a + 3, n->id);
-            wr16(a + 5, src); wr16(a + 7, n->id); a[9] = MC_BUDGET_INIT; wr16(a + 10, msg_id);
-            bound_send(n, (uint8_t)(prev % MC_N_CHANNELS), a, 14, t_data_us(14));
-            ka_called(n, (uint8_t)(prev % MC_N_CHANNELS));   /* own call (4.1) */
+        /* next-hop addressing (6.1): only the hop the sender chose
+         * processes the packet; other hearers on the home channel
+         * snoop (liveness, quality) - a routed unicast must not
+         * multiply. */
+        if (rd16(pkt + 10) != n->id) return;
+        /* dedup gates the processing (no second delivery, no second
+         * forward), but a retry STILL gets its ack1 (7.4, decided Oct
+         * 2026): the most likely reason for the retry is a lost ack1,
+         * not a lost data packet - silence would make the sender
+         * declare the link dead and detour. */
+        bool fresh = dedup_fresh(n, msg_id, src);
+        if (!fresh) { ack1_send(n, msg_id, src, ch, rssi); return; }
+        if (dst == n->id) {
+            uint8_t poff = (flags & F_DEST_GEO) ? 16 : 12;   /* geo sits between header and payload (6.1) */
+            printf("[core] node %u: DATA from %u: '%.*s\n", n->id, src, (int)(len - poff), (const char *)(pkt + poff));
+            ack1_send(n, msg_id, src, ch, rssi);       /* same channel; quality of the data travels along (7.1) */
+            /* No ack2 from the destination: the positive ack2 of this
+             * final hop goes out by the previous forwarder on OUR
+             * ack1 (7.1, revised Oct 2026: two hops per ack2). */
+            if (flags & F_ACK3_REQ) {
+                /* ack3 as a routed message (6.2): DATA format, payload
+                 * = the original msg-id, back toward the source - with
+                 * routing, via the first hop computation. */
+                uint16_t ah = route_next_hop(n, src);
+                if (ah) {
+                    uint8_t a[16] = { PKT_ACK3, 0,0, 0,0, 0,0, 0,0, 0, 0,0, 0,0, 0,0 };
+                    wr16(a + 1, (uint16_t)n->rand(n)); wr16(a + 3, n->id);
+                    wr16(a + 5, src); wr16(a + 7, n->id); a[9] = MC_BUDGET_INIT;
+                    wr16(a + 10, ah); wr16(a + 12, msg_id);
+                    bound_send(n, (uint8_t)(ah % MC_N_CHANNELS), a, 16, t_data_us(16));
+                    ka_called(n, (uint8_t)(ah % MC_N_CHANNELS));   /* own call (4.1) */
+                }
+            }
+            break;
+        }
+        /* forwarding (10.2, stateless per message): ack the previous
+         * hop, then recompute the own first step toward the
+         * destination. The budget bounds the chain (9); the next-hop
+         * field in the header makes the chain unambiguous (6.1). */
+        if (len < 12 || src == n->id) return;    /* malformed, or our own message echoed back */
+        uint8_t budget = pkt[9];
+        ack1_send(n, msg_id, src, ch, rssi);      /* the exchange of this hop (7.1) */
+        if (budget == 0) return;                  /* budget spent: the chain stops here */
+        uint16_t gl = 0, go = 0;
+        if (flags & F_DEST_GEO) { gl = rd16(pkt + 12); go = rd16(pkt + 14); }   /* geo stays in the header (10.2) */
+        uint16_t nh = route_next_hop_geo(n, dst, gl, go, 0, 0);
+        if (!nh) return;                          /* no routable path: the hop fails (negative ack2 / report follow in step 3) */
+        {
+            mimeshi_pending *p = 0;
+            for (int i = 0; i < MC_MAX_PENDING; i++) if (!n->pend[i].active) { p = &n->pend[i]; break; }
+            if (!p) return;                       /* no slot: cannot forward (step 3 sends the negative ack2) */
+            memset(p, 0, sizeof(*p));
+            p->active = 1; p->tries_left = MC_RETRY_TX; p->budget_left = (uint8_t)(budget - 1);
+            p->alt_left = MC_ROUTE_ALT;     /* 2 alternative series after the first choice (7.4) */
+            p->msg_id = msg_id; p->src = src; p->dst = dst; p->prev_hop = prev; p->next_hop = nh;
+            memcpy(p->pkt, pkt, len); p->pkt_len = len;
+            p->pkt[7] = (uint8_t)(n->id & 0xFF); p->pkt[8] = (uint8_t)(n->id >> 8);  /* prev hop = us */
+            printf("[core] node %u: FORWARD msg %u from %u to %u via %u\n", n->id, msg_id, src, dst, nh);
+            pending_try(n, p);
         }
         break;
     }

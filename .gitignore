@@ -1,1 +1,4 @@
 docs/intern.md
+.venv/
+
+__pycache__/

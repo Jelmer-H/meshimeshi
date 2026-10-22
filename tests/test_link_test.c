@@ -93,6 +93,7 @@ static uint32_t vrrand(mimeshi_node *n) { (void)n; return 42u; }
 
 
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
     static mimeshi_node A, B;
     qn = 0; now = 0;
 
@@ -111,7 +112,7 @@ int main(void) {
     assert(hello_seen == 6);
 
     /* Assert 2: refuse a unicast to an unknown destination (10.2: no flooding). */
-    assert(mimeshi_send_data(&A, 0x0BEE, (const uint8_t *)"x", 1, false) == -1);
+    assert(mimeshi_send_data(&A, 0x0BEE, (const uint8_t *)"x", 1, false, 0, 0) == -1);
 
     /* Assert 3: after a received hello, B is a neighbor of A and vice
      * versa. Each hello is injected here on the home channel of the
@@ -122,6 +123,29 @@ int main(void) {
     mimeshi_rx(&B, 1, -60, helloA, 3);
     pump_until(1000000);
 
+    /* Assert 4: a neighbor learned via hello stands at "seen": one
+     * direction, symmetry not yet proven (4.2). B knew A from the
+     * injected hello. */
+    {
+        int seen = 0;
+        for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
+            if (B.nbr[i].alive && B.nbr[i].id == 0x0102) seen = B.nbr[i].sym;
+        assert(seen == 0);
+    }
+
+    /* Routing (10.1/10.2): a unicast goes only over confirmed
+     * symmetric links. A hello proves one direction; the hello-ack
+     * addressed to us proves the other (4.2). Give B that proof
+     * before the unicast tests. */
+    uint8_t hackA[6] = { 2, 0x00,0x01, 0x02,0x01, 0 };  /* hello-ack from A (0x0102) to B (0x0100) */
+    mimeshi_rx(&B, 1, -60, hackA, 6);
+    {
+        int sym = 0;
+        for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
+            if (B.nbr[i].alive && B.nbr[i].id == 0x0102) sym = B.nbr[i].sym;
+        assert(sym == 1);                     /* confirmed via the hello-ack */
+    }
+
     /* Assert 2b: CAD (2). A bound transmission asks
      * about the channel after the switch and waits with backoff on
      * "busy"; on "free" the tx follows immediately. */
@@ -130,7 +154,7 @@ int main(void) {
         for (int i = 0; i < MC_MAX_PENDING; i++)
             if (B.pend[i].active && (B.pend[i].pkt[0] & 0x0F) == 5) before_data_tx++;
         cad_busy_left = 2;                       /* channel twice busy, then free */
-        assert(mimeshi_send_data(&B, 0x0102, (const uint8_t *)"cad test", 8, false) == 0);
+        assert(mimeshi_send_data(&B, 0x0102, (const uint8_t *)"cad test", 8, false, 0, 0) == 0);
         pump_until(1000000);
         assert(cad_busy_cycles == 2);            /* 2x waited with backoff */
         int data_tx = 0;
@@ -140,12 +164,12 @@ int main(void) {
         /* exactly one transmission of THIS data followed the "free"
          * (bound_fire transmits immediately; last_len is the data length) */
         assert(cad_tx_after_free >= 1);
-        assert(last_len == 18);                  /* 10 + 8 B payload, unswitched duplicate excluded */
+        assert(last_len == 20);                  /* 12 + 8 B payload, unswitched duplicate excluded */
         /* ack1 as a direct reply goes WITHOUT a CAD question (7.1): B
          * answers A's data on the same channel, without a switch. */
-        uint8_t dat[11] = { 5, 7,0, 0x02,0x01, 0x00,0x01, 0x00,0x01, 32, 'y' };
+        uint8_t dat[13] = { 5, 7,0, 0x02,0x01, 0x00,0x01, 0x00,0x01, 32, 0x00,0x01, 'y' };  /* next hop = B (0x0100) */
         int calls_before_ack1 = cad_calls;
-        mimeshi_rx(&B, 1, -60, dat, 11);
+        mimeshi_rx(&B, 1, -60, dat, 13);
         pump_until(now + 500000);
         assert(ack1_seen > 0 && cad_at_last_ack1 == calls_before_ack1);  /* ack1: no question */
         /* retire the test pending: no ack1 comes for it, and its retries
@@ -156,20 +180,10 @@ int main(void) {
 
     /* hello-ack from A toward B: exchange to B's home channel (1). The
      * hello-ack is 6 B incl. the quality byte (6.2). */
-    assert(mimeshi_send_data(&B, 0x0102, (const uint8_t *)"hello mesh", 10, true) == 0);
-    pump_until(100000); /* switch (5 ms) + tx; not up to the ack1 timeout */
+    assert(mimeshi_send_data(&B, 0x0102, (const uint8_t *)"hello mesh", 10, true, 0, 0) == 0);
+    pump_until(now + 100000); /* switch (5 ms) + tx; not up to the ack1 timeout */
     /* B transmits data on A's home channel 0. */
     assert(last_ch == 0 && (last_type & 0x0F) == 5);
-
-    /* Assert 4: a neighbor learned via hello stands at "seen": one
-     * direction, symmetry not yet proven (4.2). B knew A from the
-     * injected hello. */
-    {
-        int seen = 0;
-        for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
-            if (B.nbr[i].alive && B.nbr[i].id == 0x0102) seen = B.nbr[i].sym;
-        assert(seen == 0);
-    }
 
     /* Assert 5: a received ack1 confirms the symmetry of the sender
      * (4.2): the neighbor received our message and its ack reached us.

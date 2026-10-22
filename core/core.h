@@ -57,12 +57,27 @@ typedef struct {
                                0 = only seen, one direction (4.2, 10.1) */
     uint8_t  adv_class;     /* last advertised quality class (3 bits,
                                hysteresis >= 2 steps, 4.3) */
+    uint8_t  penalty;       /* local failure counter (10.4): +1 per failed
+                              series toward this neighbour, -1 per ack1,
+                              floor 0; raises the own-edge route cost.
+                              Never transmitted. */
 } mimeshi_neighbor;
 
 typedef struct {
     uint8_t  active, tries_left, budget_left;
+    uint8_t  acked1;        /* ack1 of the own next hop is in (7.1): a
+                              forwarder now sends its ack2 and closes;
+                              the source enters the T_ack2 wait (7.3) */
+    uint8_t  alt_left;      /* remaining alternative-hop series (7.4: at
+                              most 3 neighbours per hop, so 2 after the
+                              first choice) */
+    uint8_t  excl_cnt;      /* failed next hops of THIS message (7.4:
+                              cumulative exclusion per message, no
+                              protocol field - the penalty 10.4 carries
+                              the long-term lesson) */
     uint16_t msg_id, src, dst, prev_hop, next_hop;
-    uint8_t  pkt[10 + MC_MAX_PAYLOAD];
+    uint16_t excl[3];       /* the failed hops (7.4) */
+    uint8_t  pkt[16 + MC_MAX_PAYLOAD];
     uint16_t pkt_len;
 } mimeshi_pending;
 
@@ -177,10 +192,16 @@ void mimeshi_init(mimeshi_node *n, uint16_t id, mimeshi_tx_fn tx, mimeshi_timer_
  * keepalive role (4.1, 4.2). */
 void mimeshi_start(mimeshi_node *n);
 
-/* Unicast to dst. 0 = accepted, -1 = dst not in the map (no flood),
- * -2 = no free pending slot, -3 = payload too large. */
+/* Unicast to dst. 0 = accepted, -1 = dst not in the map and no
+ * usable dest geo (no flood, 10.2), -2 = no free pending slot,
+ * -3 = payload too large. dest_lat/dest_lon: the destination geo in
+ * the 16-bit grid of section 5 (0,0) = unknown - the client supplies
+ * it; the source attaches it to the header when known (10.2), so
+ * every hop can apply the bridge-node rule when the destination lies
+ * outside its own graph. */
 int  mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload,
-                     uint16_t len, bool want_ack3);
+                     uint16_t len, bool want_ack3,
+                     uint16_t dest_lat, uint16_t dest_lon);
 
 /* Own geo in the 16-bit grid of section 5 (0..65535 each); (0,0) =
  * invalid/none. Travel with every table chunk header (4.3). Call
