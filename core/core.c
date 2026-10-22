@@ -924,6 +924,27 @@ static mimeshi_neighbor *route_next(mimeshi_node *n, uint16_t dst,
             int s = route_score(n, nb) - (int)(d >> 14);   /* prefer the closest hop, quality first */
             if (s > best_score) { best_score = s; best = nb; }
         }
+        /* No neighbour step toward the geo (a concave corner, 10.3)? The
+         * tandem continues ON THE MAP (10.2): find the known node closest
+         * to the destination geo -- the gateway -- and plan a Dijkstra
+         * path TOWARD THE GATEWAY through the full learned graph (walkable
+         * per 10.1). Only the first hop of that plan transmits here; the
+         * message converges gateway by gateway. This routes AROUND
+         * concave gaps through known territory -- no perimeter mode needed
+         * at this scale (the graph is full). */
+        if (!best && excl == 0) {
+            uint16_t gw = 0; int32_t gw_d = own_dst;
+            for (int i = 0; i < MC_MAX_KNOWN; i++) {
+                mimeshi_2hop *e = &n->known[i];
+                if (!e->alive || e->geox == MC_GEO_UNKNOWN || e->id == n->id) continue;
+                int32_t d = geo_dist2(e->geox, e->geoy, dgx, dgy);
+                if (d < gw_d) { gw_d = d; gw = e->id; }
+            }
+            if (gw) {
+                mimeshi_neighbor *ph = route_path(n, gw, 0);
+                if (ph) best = ph;
+            }
+        }
     }
     return best;                              /* 0 = void or unknown (10.2/10.3) */
 }
