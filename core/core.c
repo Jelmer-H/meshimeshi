@@ -359,8 +359,24 @@ static void chunk_send(mimeshi_node *n, uint8_t ch, uint8_t with_links) {
     wr16(p + 3, (uint16_t)n->geox); wr16(p + 5, (uint16_t)n->geoy);  /* owner geo (4.3) */
     uint16_t off = 8;
     uint8_t cnt = 0;
-    /* confirmed direct neighbours first (10.1): their links are our own
-     * direct table -- the freshest and most accurate */
+    /* FIRST entry: ourselves (4.3 node-centric: our own links -- the only
+     * place where our full degree exists; every receiver learns our
+     * complete link set from this single entry) */
+    {
+        uint16_t mylinks[MC_CHUNK_LINKS]; uint8_t myq[MC_CHUNK_LINKS];
+        uint8_t ml = 0;
+        for (int i = 0; i < MC_MAX_NEIGHBORS && ml < MC_CHUNK_LINKS; i++) {
+            mimeshi_neighbor *nb = &n->nbr[i];
+            if (!nb->alive || !nb->sym) continue;
+            mylinks[ml] = nb->id; myq[ml] = nb->quality; ml++;
+        }
+        off += chunk_entry_put(n, p + off, n->id, 0, n->geox, n->geoy, mylinks, myq, ml);
+        cnt++;
+    }
+    /* confirmed direct neighbours (10.1): the entry carries the links of
+     * that neighbour as we know them -- our edge to it plus everything we
+     * learned FROM its own adverts (its full degree lives in its own
+     * first entry; we propagate what we received) */
     uint16_t lbuf[MC_CHUNK_LINKS]; uint8_t qbuf[MC_CHUNK_LINKS];
     for (int i = 0; i < MC_MAX_NEIGHBORS && cnt < MC_CHUNK_ENTRIES; i++) {
         mimeshi_neighbor *nb = &n->nbr[i];
@@ -488,13 +504,15 @@ static void chunk_recv(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *
             /* an entry for US in the neighbour's chunk is reverse evidence
              * (4.3): "I hear X" confirms at X both directions. */
             snb->sym = 1; snb->ack_try = 0; snb->proven_age_us = 0;
-        } else if (x != from) {
+        } else if (x == from) {
+            /* the SENDER's own first entry: its links are the sender's
+             * complete degree (4.3 node-centric). We are a direct neighbour
+             * -- our own table has the same links, but for the graph the
+             * completeness of the sender's entry matters: store it as a
+             * known entry so the sender's full degree is in our graph. */
+            known_upsert(n, from, from, 63, gx, gy, links, lq, take);
+        } else {
             known_upsert(n, x, from, e[2], gx, gy, links, lq, take);
-            /* the sender itself is a link endpoint of x: store that too */
-            if (nl > 0) {
-                mimeshi_2hop *xh = known_find(n, x);
-                (void)xh;
-            }
         }
         e += 8 + 3 * nl;
     }
@@ -895,8 +913,10 @@ static void ack1_timeout(mimeshi_node *n, void *ud) {
         n->timer(n, (n->rand(n) % 500000ull) + 100000ull, pending_retry_timer, p);  /* wait > airtime (7.4) */
         return;
     }
-    /* neighbour exhausted: next neighbour in the series (7.4); the
-     * packet never goes straight back to prev_hop (7.2) */
+    /* neighbour exhausted: next neighbour in the series (7.4) -- recomputed
+     * as a PATH with the failed neighbour excluded: the second attempt is
+     * again the best available path, not a greedy guess. The packet never
+     * goes straight back to prev_hop (7.2). */
     if (p->series + 1 < MC_MAX_ROUTE_NBR) {
         p->series++;
         p->tries_left = MC_RETRY_TX;
@@ -907,7 +927,7 @@ static void ack1_timeout(mimeshi_node *n, void *ud) {
         else { dgx = p->dst_geox; dgy = p->dst_geoy; }
         mimeshi_neighbor *nx = route_next(n, p->dst, dgx, dgy, excl);
         if (nx == back) nx = 0;                /* no ping-pong (7.2) */
-        if (nx) {
+        if (nx && nx != excl) {
             p->next_hop = nx->id;
             p->budget_left--;
             if (p->budget_left == 0) { record_fail(n, p); return; }
@@ -1226,8 +1246,9 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         p->active = 1; p->state = 0; p->fwd = 1;
         p->no_report = (flags & F_NO_REPORT) ? 1 : 0;   /* reports never report (10.5) */
         p->tries_left = MC_RETRY_TX; p->series = 0;
-        p->budget_left = pkt[10];                      /* budget from the header (10) */
-        if (p->budget_left > 8) p->budget_left = 8;    /* half of the standard: the way back must stay possible */
+        p->budget_left = pkt[10];                      /* budget from the header (10): one shared
+                                                            budget for the whole path (7.4, 9); the
+                                                            fail reports have their own half budget (10.5) */
         p->msg_id = msg_id; p->src = src; p->dst = dst;
         p->prev_hop = prev; p->next_hop = nx->id;
         p->dst_geox = dgx; p->dst_geoy = dgy;
