@@ -525,6 +525,133 @@ def traffic(mk, jitter):
         f"top 5 {[f'{u/1e6:.1f}' for u in top]} s, "
         f"above limit: {sum(1 for u in usage.values() if u > 360_000_000)}")
 
+@scenario("load", "24 h warmup (convergence), then a unicast every N seconds from a random node to a random node")
+def load(mk, jitter):
+    """Heavy-load routing test (10.2, steps 1-3): after a warmup in
+    which the network converges (neighbour tables, map, link store),
+    a message goes out every --interval seconds - source and
+    destination both random, so most messages are routed over
+    multiple hops. Measures delivery ratio, refused sends per reason
+    (-1 not in the graph, -2 no pending slot), retries, latency at
+    the last hop, airtime, collisions, home-deafness and duty against
+    the 10% limit.
+    CLI: --nodes --warmup (h, default 24) --duration (h, the load
+    phase, default 6) --interval (s, default 10) --payload (bytes)."""
+    nodes_list = load_nodes_csv(_ARGS.nodes)
+    warmup_us = _ARGS.warmup * 3_600_000_000
+    duration_us = _ARGS.duration * 3_600_000_000
+    interval_us = _ARGS.interval * 1_000_000
+    payload_b = _ARGS.payload
+    radio = Radio()
+    radio.wire.open = False
+    lat0 = sum(n['lat'] for n in nodes_list) / len(nodes_list)
+    lon0 = sum(n['lon'] for n in nodes_list) / len(nodes_list)
+    pos = {n['id']: (*project(n['lat'], n['lon'], lat0, lon0), n['h']) for n in nodes_list}
+    nodes = []
+    for i, nd in enumerate(nodes_list):
+        kn = Node(radio, nd['id'])
+        kn.core = set_jitter(mk(kn), jitter)
+        nodes.append(kn)
+        radio.schedule(i * 250_000, kn.core.start)
+    ids = [n['id'] for n in nodes_list]
+    for a in ids:
+        for b in ids:
+            if a == b: continue
+            raw = linkbudget(pos[a], pos[b])
+            if raw is None: continue
+            fade = ((a * 31 + b * 17) % 11) - 5
+            r = raw + fade
+            if r >= RX_MIN_DBM:
+                radio.wire.links[(a, b)] = max(-128, min(120, round(r)))
+    out(f"{len(nodes_list)} nodes from {_ARGS.nodes}, "
+        f"warmup {_ARGS.warmup} h, load {_ARGS.duration} h, "
+        f"one unicast per {_ARGS.interval} s, payload {payload_b} B")
+
+    # delivery bookkeeping on the raw bytes, before the core's own
+    # next-hop filter and dedup: a DATA reception at the destination
+    # counts once per (msg-id, source); further receptions of the same
+    # pair are last-hop retries.
+    attempted = [0]; refused_graph = [0]; refused_slot = [0]
+    delivered = [0]; retries_seen = [0]
+    sent_at = {}
+    first_rx = {}
+    base_rx = CCore.rx
+    def rx(self, arg):
+        ch, rssi, pkt = arg
+        if pkt and (pkt[0] & 0x0F) == 5 and len(pkt) > 12:
+            dst = pkt[5] | (pkt[6] << 8)
+            if dst == self.n.id:
+                src = pkt[3] | (pkt[4] << 8)
+                mid = pkt[1] | (pkt[2] << 8)
+                key = (mid, src)
+                if not hasattr(rx, '_seen'): rx._seen = set()
+                if key not in rx._seen:
+                    rx._seen.add(key)
+                    delivered[0] += 1
+                    t0 = sent_at.get(key)
+                    if t0 is not None:
+                        first_rx[key] = (radio.now - t0) / 1e6
+                else:
+                    retries_seen[0] += 1
+        base_rx(self, arg)
+    CCore.rx = rx
+
+    # msg-id bookkeeping: read the pending right after a successful send
+    base_send = CCore.send_data
+    def send_probe(self, dst, data, ack3=True):
+        rc = base_send(self, dst, data, ack3=ack3)
+        if rc == 0:
+            for p in self.mn.pend:
+                if p.active and p.dst == dst:
+                    sent_at[(p.msg_id, p.src)] = radio.now
+                    break
+        elif rc == -1: refused_graph[0] += 1
+        elif rc == -2: refused_slot[0] += 1
+        return rc
+    CCore.send_data = send_probe
+
+    payload = bytes(range(1, payload_b + 1))[:payload_b] if payload_b else b'x' * 8
+    rng = random.Random(2026)
+
+    def gen():
+        # no offer that would fall in the last interval (measured
+        # before: a send at the very end gets no airtime and shows up
+        # as a false loss)
+        if radio.now + interval_us <= warmup_us + duration_us and radio.now >= warmup_us:
+            kn = rng.choice(nodes)
+            dst = rng.choice(ids)
+            if dst != kn.id:
+                kn.core.send_data(dst, bytes(payload), ack3=False)
+                attempted[0] += 1
+        radio.schedule(interval_us, gen)
+    radio.schedule(interval_us, gen)
+    radio.run(until_us=warmup_us + duration_us)
+
+    out("\n=== Measurements (load phase) ===")
+    att, dlv = attempted[0], delivered[0]
+    out(f"unicast attempts {att}, refused: dst not in graph {refused_graph[0]}, "
+        f"no pending slot {refused_slot[0]}; delivered {dlv} "
+        f"({100*dlv/max(att,1):.1f}% of attempts, last-hop retries seen {retries_seen[0]})")
+    if first_rx:
+        ls = sorted(first_rx.values())
+        out(f"latency (last hop delivery): median {ls[len(ls)//2]:.1f} s, "
+            f"p95 {ls[max(0,int(0.95*len(ls))-1)]:.1f} s, max {ls[-1]:.1f} s")
+    for c in range(N_CH):
+        out(f"channel {c}: airtime {radio.airtime[c]/1e6:.3f} s, "
+            f"lost receptions {radio.wire.collided[c]}")
+    stats = [nbr_counts(kn) for kn in nodes]
+    conf = [s2[1] for s2 in stats]
+    out(f"confirmed symmetric avg {sum(conf)/len(conf):.1f}, "
+        f"nodes without confirmed neighbor: {sum(1 for b in conf if b == 0)}")
+    away = [kn.away_total for kn in nodes]
+    out(f"home-deafness: avg {sum(away)/len(away)/1e6:.1f} s, max {max(away)/1e6:.1f} s "
+        f"({100*max(away)/max(radio.now,1):.2f}% of the time)")
+    usage = {(n, c): radio.duty.usage(n, c, radio.now) for n in ids for c in range(N_CH)}
+    top = sorted(usage.values(), reverse=True)[:5]
+    out(f"duty (sliding hour, limit 360 s): max {top[0]/1e6:.1f} s, "
+        f"top 5 {[f'{u/1e6:.1f}' for u in top]} s, "
+        f"above limit: {sum(1 for u in usage.values() if u > 360_000_000)}")
+
 # ---------------- CLI -------------------------------------------------------
 
 def main():
@@ -544,6 +671,10 @@ def main():
                     help='unicasts per hour per node (traffic, default 6)')
     ap.add_argument('--payload', type=int, default=20, metavar='BYTES',
                     help='unicast payload size in bytes (traffic/newcomer-traffic, default 20)')
+    ap.add_argument('--warmup', type=int, default=24, metavar='HOURS',
+                    help='convergence warmup before the load phase (load, default 24)')
+    ap.add_argument('--interval', type=int, default=10, metavar='SECONDS',
+                    help='seconds between unicasts (load, default 10)')
     ap.add_argument('--join-at', type=int, default=5400, metavar='SECONDS',
                     help='newcomer start time in seconds (newcomer-traffic, default 5400)')
     args = ap.parse_args()
