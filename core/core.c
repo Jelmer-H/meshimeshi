@@ -998,9 +998,10 @@ static void ack1_timeout(mimeshi_node *n, void *ud) {
     if (!p->active || p->state != 0) return;
     mimeshi_neighbor *nb = nbr_find(n, p->next_hop);
     if (nb && nb->penalty < 255) nb->penalty++;               /* 10.4 */
+    p->attempts++;                                           /* the hop attempt cap (7.4) */
     p->tries_left--;                                        /* attempts within this candidate */
     if (p->tries_left > 0) {
-        /* second attempt toward the SAME candidate (7.4), after a random
+        /* another attempt toward the SAME candidate (7.4), after a random
          * wait longer than the airtime of the next packet */
         p->budget_left--;
         if (p->budget_left == 0) { record_fail(n, p); return; }
@@ -1014,10 +1015,26 @@ static void ack1_timeout(mimeshi_node *n, void *ud) {
     if (p->dst_geox == MC_GEO_UNKNOWN) route_dst_geo(n, p->dst, &dgx, &dgy);
     else { dgx = p->dst_geox; dgy = p->dst_geoy; }
     mimeshi_neighbor *nx = route_next(n, p->dst, dgx, dgy, excl);
-    if (nx == back || !nx) {
-        /* the best remaining route points back toward the source, or there
-         * is none: negative ack2 upstream (7.4). The message hands over. */
+    if (nx == back) {
+        /* the best remaining route points back toward the source: negative
+         * ack2 upstream (7.4). The message hands over. */
         record_fail(n, p);
+        return;
+    }
+    if (!nx && p->attempts >= MC_HOP_ATTEMPTS) {
+        /* no alternative candidate AND the 6 attempts of this hop are used:
+         * negative ack2 upstream (7.4). */
+        record_fail(n, p);
+        return;
+    }
+    if (!nx) {
+        /* no alternative candidate, but attempts remain (7.4: 'and so on,
+         * up to 6 attempts'): the failure may have been a one-off collision
+         * -- retry the same candidate with fresh attempts. */
+        p->tries_left = MC_RETRY_TX;
+        p->budget_left--;
+        if (p->budget_left == 0) { record_fail(n, p); return; }
+        n->timer(n, (n->rand(n) % 500000ull) + 100000ull, pending_retry_timer, p);
         return;
     }
     p->next_hop = nx->id;
@@ -1089,7 +1106,7 @@ static int send_data_internal(mimeshi_node *n, uint16_t dst, int16_t cgx, int16_
     for (int i = 0; i < MC_MAX_PENDING; i++) if (!n->pend[i].active) { p = &n->pend[i]; break; }
     if (!p) return -2;
     memset(p, 0, sizeof(*p));
-    p->active = 1; p->state = 0; p->tries_left = MC_RETRY_TX;
+    p->active = 1; p->state = 0; p->tries_left = MC_RETRY_TX; p->attempts = 0;
     p->budget_left = MC_BUDGET_INIT;
     p->msg_id = (uint16_t)n->rand(n);
     p->src = n->id; p->dst = dst; p->prev_hop = n->id; p->next_hop = nx->id;
@@ -1348,7 +1365,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         memset(p, 0, sizeof(*p));
         p->active = 1; p->state = 0; p->fwd = 1;
         p->no_report = (flags & F_NO_REPORT) ? 1 : 0;   /* reports never report (10.5) */
-        p->tries_left = MC_RETRY_TX;
+        p->tries_left = MC_RETRY_TX; p->attempts = 0;
         p->budget_left = pkt[10];                      /* budget from the header (10): one shared
                                                             budget for the whole path (7.4, 9); the
                                                             fail reports have their own half budget (10.5) */

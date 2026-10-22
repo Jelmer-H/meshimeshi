@@ -326,7 +326,7 @@ class C2Hop(ctypes.Structure):
 
 class CPending(ctypes.Structure):
     _fields_ = [("active", ctypes.c_uint8), ("state", ctypes.c_uint8),
-                ("tries_left", ctypes.c_uint8), ("series", ctypes.c_uint8),
+                ("tries_left", ctypes.c_uint8), ("attempts", ctypes.c_uint8),
                 ("msg_id", ctypes.c_uint16),
                 ("src", ctypes.c_uint16), ("dst", ctypes.c_uint16),
                 ("prev_hop", ctypes.c_uint16), ("next_hop", ctypes.c_uint16),

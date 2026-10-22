@@ -30,6 +30,8 @@
 #define MC_RETRY_TX        2             /* transmit attempts per candidate (7.4) */
 #define MC_ACK2_CHARGE     6             /* budget cost of a failed sub-route, charged at
                                             the node receiving the negative ack2 (7.4/9) */
+#define MC_HOP_ATTEMPTS     6             /* total attempts per hop, whatever happens
+                                            (7.4: 'and so on, up to 6 attempts') */
 #define MC_MAX_KNOWN     256            /* known map entries (10.1) */
 #define MC_CHUNK_PERIOD_US 120000000ull /* 2 min: the chunk check tick (4.3) */
 #define MC_CHUNK_REPEAT_TICKS 10         /* slow tail repetition: slices every
@@ -104,8 +106,9 @@ typedef struct {
 typedef struct {
     uint8_t  active, state;  /* state: 0 = attempts running, 1 = ack1 done,
                                 waiting for ack2 (7.1/7.3) */
-    uint8_t  tries_left, series;   /* attempts per neighbor / neighbor index
-                                in the series (max MC_MAX_ROUTE_NBR, 7.4) */
+    uint8_t  tries_left;          /* attempts left for the current candidate (7.4) */
+    uint8_t  attempts;            /* total attempts used at this hop: up to
+                                MC_HOP_ATTEMPTS = 6, whatever happens (7.4) */
     uint16_t msg_id, src, dst, prev_hop, next_hop, last_hop;
     uint8_t  budget_left;
     uint8_t  fwd;            /* 1 = forwarding record (7.2): after the own ack1,
