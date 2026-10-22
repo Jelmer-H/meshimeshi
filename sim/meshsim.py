@@ -483,9 +483,13 @@ def traffic(mk, jitter):
 
     # traffic generator: every interval a random node sends to a random
     # confirmed symmetric neighbor (10.1); skipped if none yet (startup).
+    # The last interval before the end of the run stays free: a send at
+    # the very end would get no transmit window inside the simulated
+    # time and show up as a false loss.
     rng = random.Random(2026)
     interval = 3_600_000_000 // max(rate_per_h, 1)
     def gen():
+        if radio.now + interval > duration_us: return   # no send in the last interval
         cand = []
         for kn in nodes:
             if sym_count(kn):
