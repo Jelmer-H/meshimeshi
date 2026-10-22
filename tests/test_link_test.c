@@ -47,15 +47,29 @@ static void pump_until(uint64_t until) {
 }
 
 /* --- record what the core does ---------------------------------------- */
-static int tx_count, hello_seen, switch_count, proof_seen;
+static int tx_count, hello_seen, switch_count, proof_seen, ack1_seen;
+static int cad_calls;            /* times the core asked about the channel */
+static int cad_busy_cycles;      /* questions answered with "busy" */
+static int cad_busy_left;        /* program how often "busy" comes first */
+static int cad_tx_after_free;    /* tx count right after the "free" answer */
+static int cad_at_last_ack1 = -1; /* cad_calls when the last ack1 went out */
 static uint8_t last_type, last_ch;
 static uint16_t last_len;
 static int hello_cnt_A[3], hello_cnt_B[3];   /* hellos per channel per node */
 static int proof_cnt_A[3];                   /* proof lists per channel (A) */
 
+static bool vrcad(mimeshi_node *n, uint8_t ch) {
+    (void)n; (void)ch;
+    cad_calls++;
+    if (cad_busy_left > 0) { cad_busy_left--; cad_busy_cycles++; return false; }
+    cad_tx_after_free = tx_count;   /* tx follows immediately after "free" */
+    return true;
+}
+
 static void vrtx(mimeshi_node *n, uint8_t ch, const uint8_t *pkt, uint16_t len, uint64_t air) {
     (void)air;
     tx_count++; last_type = pkt[0]; last_ch = ch; last_len = len;
+    if ((pkt[0] & 0x0F) == 6) { ack1_seen++; cad_at_last_ack1 = cad_calls; }  /* PKT_ACK1: direct reply, no CAD (7.1) */
     if ((pkt[0] & 0x0F) == 1) {              /* PKT_HELLO */
         hello_seen++;
         if (n->id == 0x0102) { hello_cnt_A[ch]++; assert(len == 3); }
@@ -75,14 +89,15 @@ static void vrswitch(mimeshi_node *n, uint8_t ch, uint64_t s, void (*done)(mimes
 }
 static uint32_t vrrand(mimeshi_node *n) { (void)n; return 42u; }
 
+
 int main(void) {
     static mimeshi_node A, B;
     qn = 0; now = 0;
 
     /* Home channel = id mod 3 (section 2). 0x0102 = 258 -> home 0,
      * 0x0100 = 256 -> home 1: exactly the channels this test expects. */
-    mimeshi_init(&A, 0x0102, vrtx, sched, vrswitch, vrrand, 0);
-    mimeshi_init(&B, 0x0100, vrtx, sched, vrswitch, vrrand, 0);
+    mimeshi_init(&A, 0x0102, vrtx, sched, vrswitch, vrrand, vrcad, 0);
+    mimeshi_init(&B, 0x0100, vrtx, sched, vrswitch, vrrand, vrcad, 0);
     assert(A.home_ch == 0 && B.home_ch == 1);
 
     mimeshi_start(&A);
@@ -104,6 +119,38 @@ int main(void) {
     uint8_t helloA[3] = { 1, 0x02, 0x01 };       /* PKT_HELLO from 0x0102 */
     mimeshi_rx(&B, 1, -60, helloA, 3);
     pump_until(1000000);
+
+    /* Assert 2b: CAD (2). A bound transmission asks
+     * about the channel after the switch and waits with backoff on
+     * "busy"; on "free" the tx follows immediately. */
+    {
+        int before_data_tx = 0;
+        for (int i = 0; i < MC_MAX_PENDING; i++)
+            if (B.pend[i].active && (B.pend[i].pkt[0] & 0x0F) == 5) before_data_tx++;
+        cad_busy_left = 2;                       /* channel twice busy, then free */
+        assert(mimeshi_send_data(&B, 0x0102, (const uint8_t *)"cad test", 8, false) == 0);
+        pump_until(1000000);
+        assert(cad_busy_cycles == 2);            /* 2x waited with backoff */
+        int data_tx = 0;
+        for (int i = 0; i < MC_MAX_PENDING; i++)
+            if (B.pend[i].active && (B.pend[i].pkt[0] & 0x0F) == 5) data_tx++;
+        (void)before_data_tx; (void)data_tx;
+        /* exactly one transmission of THIS data followed the "free"
+         * (bound_fire transmits immediately; last_len is the data length) */
+        assert(cad_tx_after_free >= 1);
+        assert(last_len == 18);                  /* 10 + 8 B payload, unswitched duplicate excluded */
+        /* ack1 as a direct reply goes WITHOUT a CAD question (7.1): B
+         * answers A's data on the same channel, without a switch. */
+        uint8_t dat[11] = { 5, 7,0, 0x02,0x01, 0x00,0x01, 0x00,0x01, 32, 'y' };
+        int calls_before_ack1 = cad_calls;
+        mimeshi_rx(&B, 1, -60, dat, 11);
+        pump_until(now + 500000);
+        assert(ack1_seen > 0 && cad_at_last_ack1 == calls_before_ack1);  /* ack1: no question */
+        /* retire the test pending: no ack1 comes for it, and its retries
+         * must not disturb the assertions below (internal field). */
+        for (int i = 0; i < MC_MAX_PENDING; i++)
+            if (B.pend[i].active) { B.pend[i].active = 0; break; }
+    }
 
     /* hello-ack from A toward B: exchange to B's home channel (1). The
      * hello-ack is 5 B (6.2). */
