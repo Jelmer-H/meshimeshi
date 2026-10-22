@@ -686,11 +686,18 @@ static mimeshi_2hop *known_upsert(mimeshi_node *n, uint16_t id, uint16_t via,
     return h;
 }
 
-/* Candidate for the next hop: quality, penalised on failures (10.4). */
+/* Candidate for the next hop: quality, penalised on failures (10.4).
+ * Links under the quality threshold are no candidates at all (10.1):
+ * "links are used only if they are above a quality threshold". A link at
+ * the receive edge (-110 dBm ~ quality 9) drops half its packets; routing
+ * must prefer the slightly longer reliable path. Threshold: quality 10
+ * (about -108 dBm). */
+#define MC_ROUTE_MIN_QUALITY 10
 static int route_score(mimeshi_node *n, mimeshi_neighbor *nb) {
     (void)n;
-    int q = nb->sym ? nb->quality : -1;      /* only confirmed links (10.1) */
-    return q - (nb->penalty << 3);          /* penalty weighs heavily (10.4) */
+    if (!nb->sym) return -1;                 /* only confirmed links (10.1) */
+    if (nb->quality < MC_ROUTE_MIN_QUALITY) return -1;   /* under the threshold (10.1) */
+    return nb->quality - (nb->penalty << 3); /* penalty weighs heavily (10.4) */
 }
 
 /* Path computation on the learned link graph (10.2). The graph: our own
@@ -750,6 +757,7 @@ static mimeshi_neighbor *route_path(mimeshi_node *n, uint16_t dst, mimeshi_neigh
             for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
                 mimeshi_neighbor *nb = &n->nbr[i];
                 if (!nb->alive || !nb->sym) continue;
+                if (nb->quality < MC_ROUTE_MIN_QUALITY) continue;   /* threshold (10.1) */
                 int v = IDX(nb->id);
                 if (v < 0) continue;
                 int32_t nd = dist[0] + dij_cost(nb->quality);
@@ -782,6 +790,7 @@ static mimeshi_neighbor *route_path(mimeshi_node *n, uint16_t dst, mimeshi_neigh
     if (t < 0 || dist[t] == MC_DIJ_INF || first[t] == 0) return 0;
     mimeshi_neighbor *hop = nbr_find(n, first[t]);
     if (!hop || !hop->sym || hop == excl) return 0;
+    if (hop->quality < MC_ROUTE_MIN_QUALITY) return 0;   /* threshold (10.1) */
     return hop;
     #undef IDX
 }
@@ -841,6 +850,7 @@ static mimeshi_neighbor *route_next(mimeshi_node *n, uint16_t dst,
         for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
             mimeshi_neighbor *nb = &n->nbr[i];
             if (!nb->alive || !nb->sym || nb == excl) continue;
+            if (nb->quality < MC_ROUTE_MIN_QUALITY) continue;   /* threshold (10.1) */
             if (nb->geox == MC_GEO_UNKNOWN) continue;
             if (geo_dist2(nb->geox, nb->geoy, tgx, tgy) >= own_gw) continue;  /* no progress: void guard */
             int s = route_score(n, nb) - (geo_dist2(nb->geox, nb->geoy, tgx, tgy) >> 12);
@@ -1285,6 +1295,7 @@ void mimeshi_init(mimeshi_node *n, uint16_t id, mimeshi_tx_fn tx, mimeshi_timer_
     memset(n, 0, sizeof(*n));
     n->id = id; n->home_ch = (uint8_t)(id % MC_N_CHANNELS);
     n->local_tbl_ctr = 1; n->hello_interval_us = MC_HELLO_START_US;
+    n->chunk_rr_ch = n->home_ch;               /* tail rotation starts at home */
     n->hello_jitter_us = MC_HELLO_JITTER_US;
     n->tx = tx; n->timer = timer; n->switch_ch = sw; n->rand = rnd; n->user = user;
 }

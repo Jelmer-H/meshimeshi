@@ -601,9 +601,13 @@ def multihop(mk, jitter):
         return False
 
     all_pairs = _ARGS.all_pairs
+    warmup_us = _ARGS.warmup * 3_600_000_000
     submitted = {}      # (mid, src) -> routable-at-submission (True/False)
     refused = [0]
     def gen():
+        if radio.now < warmup_us:
+            radio.schedule(interval, gen)   # warmup: converge without traffic
+            return
         # --all-pairs: any confirmed node to any other (direct included);
         # default: only non-direct pairs (the routing case)
         cand = [(a, b) for a in ids for b in ids
@@ -624,6 +628,8 @@ def multihop(mk, jitter):
         radio.schedule(interval, gen)
     radio.schedule(600_000_000, gen)
     radio.run(until_us=duration_us)
+    # note: --duration must cover warmup + measurement; the traffic phase
+    # starts after --warmup hours of silence
 
     out("\n=== Measurements ===")
     nsub = len(submitted)
@@ -669,6 +675,8 @@ def main():
                     help='newcomer start time in seconds (newcomer-traffic, default 5400)')
     ap.add_argument('--all-pairs', action='store_true',
                     help='multihop: any node to any node (direct pairs included)')
+    ap.add_argument('--warmup', type=int, default=0, metavar='HOURS',
+                    help='multihop: hours of traffic-free convergence before the measurement traffic starts')
     args = ap.parse_args()
     global _ARGS
     _ARGS = args
