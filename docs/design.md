@@ -526,6 +526,7 @@ Threads could use a shorter limit, for example three bits. That provides some ex
 
 - Per node: the direct neighbours with full table, and the neighbours of neighbours as ID, geo and link. That is the 2-hop map. Beyond that, a node knows nothing.
 - Links are used only if they are above a quality threshold and work in both directions.
+- **Quality gate on confirmation (decided, Oct 2026):** a confirmation (hello ack addressed to us, proof list naming us, ack1 on our data) makes a link symmetric only when the measured quality of that reception is above the threshold. Each node can only measure the direction toward itself; the neighbour applies the same gate to its own direction. The combined effect: a link is confirmed symmetric only when BOTH directions are above the threshold — the core value is `MC_SYM_QUALITY_MIN`, quality_of(−100 dBm), 10 dB above the reception threshold including fade margin. A weak link stays "seen": liveness and quality remain stored, the proof refreshes the reverse evidence, but routing never selects it. The proof list only sends confirmed links (4.2), so weak links are also never advertised to third parties as working.
 - Each direction must be proven by the receiver of that direction:
   - A hello or an overheard hello ack proves only sender→receiver ("seen").
   - The reverse direction comes exclusively from the neighbour itself: via a hello ack addressed to us, via its table chunks (4.3), or via a successful unicast with ack1 ("confirmed").

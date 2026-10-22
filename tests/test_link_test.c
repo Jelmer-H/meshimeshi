@@ -203,6 +203,42 @@ int main(void) {
         assert(seen == 0);              /* seen, not confirmed */
     }
 
+    /* Assert 6b: the quality gate (10.1). A confirmation (hello-ack
+     * addressed to us, proof list naming us, ack1 on our data) only
+     * makes the link symmetric when the measured quality is above the
+     * threshold; a weak link stays "seen". -105 dBm is below the gate
+     * (quality 11 < 14 = quality_of(-100 dBm)). */
+    uint8_t hack_weak[5] = { 2, 0x02,0x01, 0x06,0x01 };    /* from 0x0106, addressed to A (us) */
+    mimeshi_rx(&A, 0, -105, hack_weak, 5);
+    {
+        int seen = -1;
+        for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
+            if (A.nbr[i].alive && A.nbr[i].id == 0x0106) seen = A.nbr[i].sym;
+        assert(seen == 0);              /* weak link: seen, NOT confirmed */
+    }
+    uint8_t proof_weak[5] = { 3, 0x06,0x01, 0x02,0x01 };  /* proof list from 0x0106 naming A */
+    mimeshi_rx(&A, 0, -105, proof_weak, 5);
+    {
+        int seen = -1;
+        for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
+            if (A.nbr[i].alive && A.nbr[i].id == 0x0106) seen = A.nbr[i].sym;
+        assert(seen == 0);              /* weak link: seen, NOT confirmed (liveness refreshed, still weak) */
+    }
+    /* ack1 on our data: the weak ack also fails to confirm. A has a
+     * pending toward B (msg 42, vrrand); the ack1 arrives at -105 dBm. */
+    {
+        mimeshi_neighbor *nb = 0;
+        for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
+            if (A.nbr[i].alive && A.nbr[i].id == 0x0100) nb = &A.nbr[i];
+        assert(nb);
+        int was_sym = nb->sym;
+        nb->sym = 0;                            /* internal field: start the check clean */
+        uint8_t ack1_weak[7] = { 6, 42,0, 0x00,0x01, 0x00,0x01 };  /* msg 42, source A, sender B */
+        mimeshi_rx(&A, 1, -105, ack1_weak, 7);
+        assert(nb->sym == 0);                   /* weak ack: no confirmation */
+        nb->sym = (uint8_t)was_sym;             /* restore for the assertions below */
+    }
+
     /* --- keepalive via the proof list (4.1/4.2): after the startup
      * rounds (0-3810 s) the hello no longer exists. A channel that is
      * silent for T_keepalive gets its next proof-list moment pulled

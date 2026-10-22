@@ -54,6 +54,9 @@
 #define MC_RETRY_TX         2              /* transmit attempts per neighbor per series (7.4) */
 #define MC_ACK1_MARGIN_US   80000ull       /* processing + margin on top of t_data + t_ack (7.3) */
 #define MC_S_SWITCH_US      5000ull        /* channel switch incl. settling (14.1) */
+#define MC_SYM_QUALITY_MIN  14u            /* symmetry requires this quality (10.1):
+                                               quality_of(-100 dBm); 10 dB above the
+                                               reception threshold incl. fade margin */
 #define MC_CAD_BACKOFF_US   20000ull       /* CAD backoff: random 0..19 ms (2) */
 #define MC_CAD_MAX_TRIES    8u             /* ask at most 8x per transmission; then transmit anyway */
 
@@ -129,6 +132,15 @@ static mimeshi_neighbor *nbr_find(mimeshi_node *n, uint16_t id) {
 static uint8_t quality_of(int8_t rssi) {
     return (uint8_t)(rssi < 0 ? (rssi + 128) >> 1 : 63);
 }
+
+/* Quality gate for symmetry confirmation (10.1): a link is used only
+ * when it is above the quality threshold and works in both directions.
+ * Each node can only measure the direction toward itself (the RSSI of
+ * the received transmissions); the neighbour measures the opposite
+ * direction itself and gates its own confirmation with the same rule.
+ * The combined effect: a link is confirmed symmetric only when BOTH
+ * directions are above the threshold. */
+static bool quality_ok(uint8_t q) { return q >= MC_SYM_QUALITY_MIN; }
 
 /* Add a neighbor (from a hello, hello-ack or proof list). Full = return 0;
  * the caller continues without the neighbor. A new entry starts as "seen":
@@ -549,7 +561,8 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
             nb->last_seen = 0;
             nb->quality = quality_of(rssi);
             nb->proven_age_us = 0;      /* fresh reception of an identifying transmission */
-            if (dst == n->id) { nb->sym = 1; nb->ack_try = 0; }   /* confirmed symmetric (4.2) */
+            if (dst == n->id && quality_ok(nb->quality))
+                { nb->sym = 1; nb->ack_try = 0; }   /* confirmed symmetric (4.2, 10.1: quality gate) */
         }
         break;
     }
@@ -570,10 +583,12 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
             nb->last_seen = 0;
             nb->quality = quality_of(rssi);
         }
-        /* appearing in the list = reverse evidence refreshed (4.2) */
+        /* appearing in the list = reverse evidence refreshed (4.2);
+         * symmetry only above the quality threshold (10.1) */
         for (uint16_t i = 0; i < ids; i++) {
             if (rd16(pkt + 3 + 2 * i) == n->id && nb) {
-                nb->sym = 1; nb->ack_try = 0; nb->proven_age_us = 0;
+                nb->proven_age_us = 0;
+                if (quality_ok(nb->quality)) { nb->sym = 1; nb->ack_try = 0; }
             }
         }
         break;
@@ -597,7 +612,11 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
             if (p->active && p->msg_id == msg_id) {
                 p->active = 0;                     /* hop succeeded; ack2 arrives on its own on our home channel */
                 mimeshi_neighbor *nb = nbr_find(n, rd16(pkt + 5));
-                if (nb) { nb->sym = 1; nb->ack_try = 0; nb->proven_age_us = 0; }  /* confirmed symmetric (4.2, 10.1) */
+                if (nb) {                               /* confirmed symmetric (4.2, 10.1) */
+                    nb->quality = quality_of(rssi);     /* the ack1 itself is the measurement (its direction) */
+                    nb->proven_age_us = 0;
+                    if (quality_ok(nb->quality)) { nb->sym = 1; nb->ack_try = 0; }
+                }
                 printf("[core] node %u: ACK1 for msg %u\n", n->id, msg_id);
                 return;
             }
