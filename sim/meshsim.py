@@ -598,8 +598,8 @@ def load(mk, jitter):
 
     # msg-id bookkeeping: read the pending right after a successful send
     base_send = CCore.send_data
-    def send_probe(self, dst, data, ack3=True):
-        rc = base_send(self, dst, data, ack3=ack3)
+    def send_probe(self, dst, data, ack3=True, geo=None):
+        rc = base_send(self, dst, data, ack3=ack3, geo=geo)
         if rc == 0:
             for p in self.mn.pend:
                 if p.active and p.dst == dst:
@@ -612,6 +612,7 @@ def load(mk, jitter):
 
     payload = bytes(range(1, payload_b + 1))[:payload_b] if payload_b else b'x' * 8
     rng = random.Random(2026)
+    node_geo = {n['id']: grid_geo(n['lat'], n['lon']) for n in nodes_list}
 
     def gen():
         # no offer that would fall in the last interval (measured
@@ -621,7 +622,10 @@ def load(mk, jitter):
             kn = rng.choice(nodes)
             dst = rng.choice(ids)
             if dst != kn.id:
-                kn.core.send_data(dst, bytes(payload), ack3=False)
+                # assumption (10.2): the end user supplies the correct
+                # destination geo with the message - the bridge-node
+                # rule can route even outside the own graph
+                kn.core.send_data(dst, bytes(payload), ack3=False, geo=node_geo[dst])
                 attempted[0] += 1
         radio.schedule(interval_us, gen)
     radio.schedule(interval_us, gen)

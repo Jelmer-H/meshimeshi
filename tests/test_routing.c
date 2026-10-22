@@ -202,6 +202,24 @@ static int e_deliv_count(uint16_t id) {
 }
 static int e_tx_count(int slot) { return e_tx[slot]; }
 
+/* --- test-7 radio: A - B - C with a bridge destination --------- */
+static mimeshi_node *g_nodes[3];
+static uint8_t g_last_ch;
+static void g_confirm(mimeshi_node *hs, uint16_t responder) {
+    uint8_t ha[6] = { 2, 0,0, 0,0, 0 };
+    ha[1] = (uint8_t)hs->id; ha[2] = (uint8_t)(hs->id >> 8);
+    ha[3] = (uint8_t)responder; ha[4] = (uint8_t)(responder >> 8);
+    mimeshi_rx(hs, (uint8_t)(hs->id % MC_N_CHANNELS), -55, ha, 6);
+}
+static void g_deliv_reset(void) { g_last_ch = 0xFF; }
+static void gtx(mimeshi_node *n, uint8_t ch, const uint8_t *pkt, uint16_t len, uint64_t air) {
+    (void)air; (void)len; (void)pkt;
+    int from = -1;
+    for (int i = 0; i < 3; i++) if (g_nodes[i] == n) { from = i; break; }
+    assert(from >= 0);
+    g_last_ch = ch;
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     static mimeshi_node A;
@@ -246,14 +264,14 @@ int main(void) {
      * 228, via C 20+20=40, via D 29+43=72 (D->B class 6 = 29). The
      * first transmission must go to C: channel = C's home channel. */
     data_tx = 0;
-    assert(mimeshi_send_data(&A, idB, (const uint8_t *)"route me", 8, false) == 0);
+    assert(mimeshi_send_data(&A, idB, (const uint8_t *)"route me", 8, false, 0, 0) == 0);
     pump_until(now + 50000ull);            /* switch (5 ms) + tx; far under the ack1 timeout */
     assert(data_tx == 1);
     assert((last_type & 0x0F) == PKT_DATA_VAL);
     assert(last_ch == (uint8_t)(idC % MC_N_CHANNELS));   /* first hop: C, not B */
 
     /* Test 2: unknown destination -> refuse (no flood, 10.2). */
-    assert(mimeshi_send_data(&A, 0x0BEE, (const uint8_t *)"x", 1, false) == -1);
+    assert(mimeshi_send_data(&A, 0x0BEE, (const uint8_t *)"x", 1, false, 0, 0) == -1);
 
     /* Test 4: unreachable destination - in the map (C names E with
      * id and geo), but without a single known link toward it (class 0
@@ -267,7 +285,7 @@ int main(void) {
         for (int i = 0; i < MC_MAP_NODES; i++)
             if (A.map[i].alive && A.map[i].id == 0x0C0C) inmap = 1;
         assert(inmap);                     /* E is known... */
-        assert(mimeshi_send_data(&A, 0x0C0C, (const uint8_t *)"x", 1, false) == -1);
+        assert(mimeshi_send_data(&A, 0x0C0C, (const uint8_t *)"x", 1, false, 0, 0) == -1);
     }
 
     /* Test 3: age multiplier (10.2). Let proof ticks pass so every
@@ -279,7 +297,7 @@ int main(void) {
     len = chunk_build(ck, idD, A.id, 7, 0, idB, 6, 0, 0);
     mimeshi_rx(&A, (uint8_t)(idD % MC_N_CHANNELS), -70, ck, len);   /* D fresh again */
     data_tx = 0;
-    assert(mimeshi_send_data(&A, idB, (const uint8_t *)"route me", 8, false) == 0);
+    assert(mimeshi_send_data(&A, idB, (const uint8_t *)"route me", 8, false, 0, 0) == 0);
     pump_until(now + 50000ull);
     assert(data_tx == 1);
     assert(last_ch == (uint8_t)(idD % MC_N_CHANNELS));   /* C stale: D wins */
@@ -313,7 +331,7 @@ int main(void) {
         f_deliver(ckf, lf);
         /* A -> D must be accepted (D is in A's graph) */
         f_data_tx_reset();
-        assert(mimeshi_send_data(&A, idn[3], (const uint8_t *)"hop", 3, false) == 0);
+        assert(mimeshi_send_data(&A, idn[3], (const uint8_t *)"hop", 3, false, 0, 0) == 0);
         pump_until(now + 50000000ull);      /* the whole chain: switches, hops, acks */
         /* D received the DATA (a retry of the last hop may arrive too
          * and gets its ack1 under the 7.4 retry rule - it counts as a
@@ -358,7 +376,7 @@ int main(void) {
          * attempts, 2 s + jitter apart) the exclusion must switch to
          * D and deliver. */
         e_blackout = ei[1];                    /* radio drops everything to/from C */
-        assert(mimeshi_send_data(&AA, ei[3], (const uint8_t *)"alt", 3, false) == 0);
+        assert(mimeshi_send_data(&AA, ei[3], (const uint8_t *)"alt", 3, false, 0, 0) == 0);
         pump_until(now + 30000000ull);          /* series: 2 x (350 ms + 2 s + jitter) + the D route */
         assert(e_deliv_count(ei[3]) >= 1);      /* B delivered via D */
         assert(e_tx_count(2) >= 1);              /* D forwarded at least once */
@@ -366,6 +384,53 @@ int main(void) {
         e_blackout = 0;
     }
 
-    printf("routing: OK (ETX detour, age shift, refusals, chain forward, retry series with cumulative exclusion)\n");
+    /* ------------------------------------------------------------------
+     * Test 7: the bridge-node rule (10.2). A knows B (confirmed, with
+     * geo) and B knows C (with geo) - but A does NOT know C: C lies
+     * outside A's graph. The client supplies C's geo. The bridge rule
+     * must pick the graph node closest to C's geo - B - and route the
+     * first hop toward B. B, knowing C, delivers in one more hop. */
+    {
+        static mimeshi_node A2, B2, C2;
+        mimeshi_node *G[3] = { &A2, &B2, &C2 };
+        uint16_t gi[3] = { 0x0400, 0x0401, 0x0402 };   /* homes: 0, 1, 2 */
+        qn = 0; now = 0;
+        for (int i = 0; i < 3; i++) mimeshi_init(G[i], gi[i], gtx, sched, vrsw, vrrand, vrcad, 0);
+        g_nodes[0] = &A2; g_nodes[1] = &B2; g_nodes[2] = &C2;
+        g_confirm(&A2, gi[1]); g_confirm(&B2, gi[0]);
+        g_confirm(&B2, gi[2]); g_confirm(&C2, gi[1]);
+        /* B's chunk names A and C with geos; A thereby knows B's geo
+         * and C's geo-as-entry... C appears as a map node of B - A
+         * KNOWS C indirectly. To make C genuinely unknown to A, this
+         * test injects B's chunk ONLY at A without C: a two-entry
+         * chunk without C means A knows only B. Simpler: a chunk with
+         * just A as entry, plus the mutual link nothing. A's graph:
+         * {B}. C's geo comes from the client. */
+        uint8_t ckg[64];
+        uint16_t lg = chunk_build(ckg, gi[1], gi[0], 7, 0, gi[0], 7, 0, 0);
+        /* build gives owner B with entries A and... we need A-only:
+         * hand-build a 1-entry chunk: owner B, entry A, no links */
+        ckg[0] = 4; ckg[1] = (uint8_t)gi[1]; ckg[2] = (uint8_t)(gi[1] >> 8);
+        ckg[3] = 0; ckg[4] = 1;
+        /* owner geo in the chunk header (offsets 5..8): B stands at
+         * grid (250, 250) - the bridge candidate needs a geo */
+        ckg[5] = 250; ckg[6] = 0; ckg[7] = 250; ckg[8] = 0; ckg[9] = 1;
+        ckg[10] = (uint8_t)gi[0]; ckg[11] = (uint8_t)(gi[0] >> 8);
+        ckg[12] = 0x77; ckg[13] = 0;
+        ckg[14] = 0; ckg[15] = 0; ckg[16] = 0; ckg[17] = 0; ckg[18] = 0;
+        lg = 19;
+        (void)lg;
+        mimeshi_rx(&A2, (uint8_t)(gi[1] % MC_N_CHANNELS), -60, ckg, 19);
+        /* A -> C with C's geo from the "client": bridge = B (the only,
+         * and closest, graph node); first hop must go to B */
+        uint16_t clat = 300, clon = 300;             /* C's client geo */
+        g_deliv_reset();
+        assert(mimeshi_send_data(&A2, gi[2], (const uint8_t *)"via bridge", 10, false, clat, clon) == 0);
+        pump_until(now + 50000ull);
+        /* the first transmission goes to B (B's home channel 1) */
+        assert(g_last_ch == (uint8_t)(gi[1] % MC_N_CHANNELS));
+    }
+
+    printf("routing: OK (ETX detour, age shift, refusals, chain forward, retry series, bridge-node rule)\n");
     return 0;
 }

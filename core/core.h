@@ -77,7 +77,7 @@ typedef struct {
                               the long-term lesson) */
     uint16_t msg_id, src, dst, prev_hop, next_hop;
     uint16_t excl[3];       /* the failed hops (7.4) */
-    uint8_t  pkt[12 + MC_MAX_PAYLOAD];
+    uint8_t  pkt[16 + MC_MAX_PAYLOAD];
     uint16_t pkt_len;
 } mimeshi_pending;
 
@@ -192,10 +192,16 @@ void mimeshi_init(mimeshi_node *n, uint16_t id, mimeshi_tx_fn tx, mimeshi_timer_
  * keepalive role (4.1, 4.2). */
 void mimeshi_start(mimeshi_node *n);
 
-/* Unicast to dst. 0 = accepted, -1 = dst not in the map (no flood),
- * -2 = no free pending slot, -3 = payload too large. */
+/* Unicast to dst. 0 = accepted, -1 = dst not in the map and no
+ * usable dest geo (no flood, 10.2), -2 = no free pending slot,
+ * -3 = payload too large. dest_lat/dest_lon: the destination geo in
+ * the 16-bit grid of section 5 (0,0) = unknown - the client supplies
+ * it; the source attaches it to the header when known (10.2), so
+ * every hop can apply the bridge-node rule when the destination lies
+ * outside its own graph. */
 int  mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload,
-                     uint16_t len, bool want_ack3);
+                     uint16_t len, bool want_ack3,
+                     uint16_t dest_lat, uint16_t dest_lon);
 
 /* Own geo in the 16-bit grid of section 5 (0..65535 each); (0,0) =
  * invalid/none. Travel with every table chunk header (4.3). Call

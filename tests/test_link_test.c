@@ -112,7 +112,7 @@ int main(void) {
     assert(hello_seen == 6);
 
     /* Assert 2: refuse a unicast to an unknown destination (10.2: no flooding). */
-    assert(mimeshi_send_data(&A, 0x0BEE, (const uint8_t *)"x", 1, false) == -1);
+    assert(mimeshi_send_data(&A, 0x0BEE, (const uint8_t *)"x", 1, false, 0, 0) == -1);
 
     /* Assert 3: after a received hello, B is a neighbor of A and vice
      * versa. Each hello is injected here on the home channel of the
@@ -154,7 +154,7 @@ int main(void) {
         for (int i = 0; i < MC_MAX_PENDING; i++)
             if (B.pend[i].active && (B.pend[i].pkt[0] & 0x0F) == 5) before_data_tx++;
         cad_busy_left = 2;                       /* channel twice busy, then free */
-        assert(mimeshi_send_data(&B, 0x0102, (const uint8_t *)"cad test", 8, false) == 0);
+        assert(mimeshi_send_data(&B, 0x0102, (const uint8_t *)"cad test", 8, false, 0, 0) == 0);
         pump_until(1000000);
         assert(cad_busy_cycles == 2);            /* 2x waited with backoff */
         int data_tx = 0;
@@ -180,7 +180,7 @@ int main(void) {
 
     /* hello-ack from A toward B: exchange to B's home channel (1). The
      * hello-ack is 6 B incl. the quality byte (6.2). */
-    assert(mimeshi_send_data(&B, 0x0102, (const uint8_t *)"hello mesh", 10, true) == 0);
+    assert(mimeshi_send_data(&B, 0x0102, (const uint8_t *)"hello mesh", 10, true, 0, 0) == 0);
     pump_until(now + 100000); /* switch (5 ms) + tx; not up to the ack1 timeout */
     /* B transmits data on A's home channel 0. */
     assert(last_ch == 0 && (last_type & 0x0F) == 5);

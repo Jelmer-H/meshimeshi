@@ -332,7 +332,7 @@ class CPending(ctypes.Structure):
                 ("dst", ctypes.c_uint16), ("prev_hop", ctypes.c_uint16),
                 ("next_hop", ctypes.c_uint16),
                 ("excl", ctypes.c_uint16 * 3),
-                ("pkt", ctypes.c_uint8 * (12 + MC_MAX_PAYLOAD)),
+                ("pkt", ctypes.c_uint8 * (16 + MC_MAX_PAYLOAD)),
                 ("pkt_len", ctypes.c_uint16)]
 
 class CDedup(ctypes.Structure):
@@ -422,7 +422,8 @@ def load_lib(path):
     lib.mimeshi_rx.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint8, ctypes.c_int8,
                                ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint16]
     lib.mimeshi_send_data.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint16,
-                                      ctypes.c_char_p, ctypes.c_uint16, ctypes.c_bool]
+                                      ctypes.c_char_p, ctypes.c_uint16, ctypes.c_bool,
+                                      ctypes.c_uint16, ctypes.c_uint16]
     lib.mimeshi_send_data.restype = ctypes.c_int
     lib.mimeshi_set_geo.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint16, ctypes.c_uint16]
     return lib
@@ -447,9 +448,12 @@ class CCore:
         return sum(1 for m in self.mn.map if m.alive)
     def link_count(self):
         return sum(1 for l in self.mn.lnk if l.alive)
-    def send_data(self, dst, data, ack3=True):
+    def send_data(self, dst, data, ack3=True, geo=None):
+        """geo: (lat, lon) in the 16-bit grid of section 5 - the
+        client-supplied destination geo (10.2); None = unknown."""
         payload = data.encode() if isinstance(data, str) else bytes(data)
-        rc = self.lib.mimeshi_send_data(ctypes.byref(self.mn), dst, payload, len(payload), ack3)
+        gl, go = geo if geo else (0, 0)
+        rc = self.lib.mimeshi_send_data(ctypes.byref(self.mn), dst, payload, len(payload), ack3, gl, go)
         if rc != 0:
             out(f"[sim] node {self.n.id:#06x}: transmission refused (rc={rc})")
         return rc
