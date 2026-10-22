@@ -26,7 +26,7 @@
 #define MC_TBL_WIN_US 3600000000ull   /* core.c: bundling window 1 h */
 
 /* --- mini virtual radio ---------------------------------------------- */
-#define MAXEV 256
+#define MAXEV 2048
 typedef struct { uint64_t at; mimeshi_node *n; void (*cb)(mimeshi_node *, void *); void *ud; int live; } ev;
 static ev q[MAXEV]; static int qn;
 static uint64_t now;
@@ -48,11 +48,15 @@ static void pump_until(uint64_t until) {
 /* --- record what the core does ---------------------------------------- */
 static uint8_t last_pkt[230]; static uint16_t last_len; static uint8_t last_ch;
 static uint16_t last_tx_node; static int chunk_seen;
+static uint8_t last_chunk[230]; static uint16_t last_chunk_len;
 
 static void vrtx(mimeshi_node *n, uint8_t ch, const uint8_t *pkt, uint16_t len, uint64_t air) {
     (void)air;
     memcpy(last_pkt, pkt, len); last_len = len; last_ch = ch; last_tx_node = n->id;
-    if ((pkt[0] & 0x0F) == PKT_TABLE_CHUNK_VALUE) chunk_seen++;
+    if ((pkt[0] & 0x0F) == PKT_TABLE_CHUNK_VALUE) {
+        chunk_seen++;
+        memcpy(last_chunk, pkt, len); last_chunk_len = len;
+    }
 }
 static void vrsw(mimeshi_node *n, uint8_t ch, uint64_t s, void (*done)(mimeshi_node *, void *), void *ud) {
     (void)ch; (void)s;
@@ -63,6 +67,8 @@ static bool vrcad(mimeshi_node *n, uint8_t ch) { (void)n; (void)ch; return true;
 
 #define PKT_TABLE_CHUNK_VALUE 4
 static uint16_t t_rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+/* core.c: middle of the advertised class, monotone in the class */
+static int quality_from_class_check(uint8_t cls) { return (int)((cls << 3) | 4); }
 
 /* helper: does the chunk contain an entry for `id`? */
 static int chunk_has_entry(const uint8_t *p, uint16_t len, uint16_t id) {
@@ -197,6 +203,71 @@ int main(void) {
         for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
             if (R2.nbr[i].alive && R2.nbr[i].id == 0x010B) sym = R2.nbr[i].sym;
         assert(sym == 0);                                    /* quality gate (10.1) */
+    }
+
+    /* Forwarded quality (4.3): a class-0 reception never overwrites a
+     * stored quality, and a fresher non-zero class applies. Freshness
+     * comes from the travelled age byte here (no proof ticks run in
+     * this test): the first chunk of B advertises X with class 6 and
+     * age 3, the chunk of C names X with class 0 (never reported), and
+     * a last one with class 3 and age 0 - strictly fresher. */
+    {
+        uint8_t p[64];
+        p[0] = PKT_TABLE_CHUNK_VALUE;
+        p[1] = 0x0B; p[2] = 0x01; p[3] = 0; p[4] = 1;
+        p[5] = 0; p[6] = 0; p[7] = 0; p[8] = 0; p[9] = 1;
+        p[10] = 0x01; p[11] = 0x0F; p[12] = 0x60; p[13] = 3;
+        p[14] = 0; p[15] = 0; p[16] = 0; p[17] = 0; p[18] = 0;
+        mimeshi_rx(&R, 0, -60, p, 19);
+        mimeshi_mapnode *mx = 0;
+        for (int i = 0; i < MC_MAP_NODES; i++)
+            if (R.map[i].alive && R.map[i].id == 0x0F01) mx = &R.map[i];
+        assert(mx);
+        assert(mx->quality == quality_from_class_check(6));
+        /* chunk of C (owner 0x010C) naming X with class 0: survives */
+        p[1] = 0x0C; p[2] = 0x01; p[12] = 0x00; p[13] = 0;
+        mimeshi_rx(&R, 0, -60, p, 19);
+        mx = 0;
+        for (int i = 0; i < MC_MAP_NODES; i++)
+            if (R.map[i].alive && R.map[i].id == 0x0F01) mx = &R.map[i];
+        assert(mx);
+        assert(mx->quality == quality_from_class_check(6));
+        /* fresher non-zero class (age 0 < stored 3): applies */
+        p[12] = 0x30;
+        mimeshi_rx(&R, 0, -60, p, 19);
+        mx = 0;
+        for (int i = 0; i < MC_MAP_NODES; i++)
+            if (R.map[i].alive && R.map[i].id == 0x0F01) mx = &R.map[i];
+        assert(mx);
+        assert(mx->quality == quality_from_class_check(3));
+    }
+
+    /* Tail chunks carry the forwarded class (4.3). A started node with
+     * X in its map (not a direct neighbour) re-shares the tail after
+     * the ~6 h period; the entry for X must carry class 3, not 0. */
+    {
+        static mimeshi_node T;
+        qn = 0;
+        mimeshi_init(&T, 0x0100, vrtx, sched, vrsw, vrrand, vrcad, 0);
+        uint8_t p[64];
+        p[0] = PKT_TABLE_CHUNK_VALUE;
+        p[1] = 0x0B; p[2] = 0x01; p[3] = 0; p[4] = 1;
+        p[5] = 0; p[6] = 0; p[7] = 0; p[8] = 0; p[9] = 1;
+        p[10] = 0x01; p[11] = 0x0F; p[12] = 0x30; p[13] = 0;
+        p[14] = 0; p[15] = 0; p[16] = 0; p[17] = 0; p[18] = 0;
+        mimeshi_rx(&T, 0, -60, p, 19);                   /* X: class 3, not a neighbour of T */
+        chunk_seen = 0;
+        mimeshi_start(&T);
+        pump_until(2 * 6 * 3600 * 1000000ull);           /* > one ~6 h re-share */
+        assert(chunk_seen > 0);
+        assert(chunk_has_entry(last_chunk, last_chunk_len, 0x0F01));
+        uint8_t n_ent = last_chunk[4]; uint16_t off = 10;
+        int cls = -1;
+        for (uint8_t e = 0; e < n_ent && off + 9 <= last_chunk_len; e++) {
+            if (t_rd16(last_chunk + off) == 0x0F01) { cls = last_chunk[off + 2] >> 4; break; }
+            off += 9 + 3 * last_chunk[off + 8];
+        }
+        assert(cls == 3);                                   /* forwarded class, not 0 */
     }
 
     int rmap = 0;

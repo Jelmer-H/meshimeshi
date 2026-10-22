@@ -584,7 +584,11 @@ static void tail_chunk_send(mimeshi_node *n) {
         if (!m->alive) continue;
         if (nbr_find(n, m->id)) continue;               /* direct neighbours: prefix work */
         wr16(p + len, m->id);
-        p[len + 2] = 0;                                  /* class: no direct measurement */
+        /* both directions in one byte, like the prefix (6.2, 4.3): the
+         * forwarded class in the high nibble - the class our source
+         * advertised for owner->entry; reverse nibble 0 = not reported
+         * by the entry itself. A class 0 only when never reported. */
+        p[len + 2] = (uint8_t)(adv_class_of(m->quality) << 4);
         p[len + 3] = map_age_eff(n, m);
         wr16(p + len + 4, m->geo_lat); wr16(p + len + 6, m->geo_lon);
         uint16_t lcnt_off = len + 8;
@@ -761,8 +765,12 @@ static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t 
             if (em) {
                 if (gl) { em->geo_lat = gl; em->geo_lon = go; }   /* (0,0) = none (5) */
                 uint8_t travelled = age;
-                if (!em->quality || travelled < map_age_eff(n, em)) {
-                    em->quality = quality_from_class(cls);        /* fresh beats old (4.3) */
+                if (cls && (!em->quality || travelled < map_age_eff(n, em))) {
+                    /* forwarded non-zero class beats old (4.3); a class 0
+                     * never overwrites a stored quality (the geo above
+                     * still refreshes; the age belongs to the quality
+                     * evidence): no source ever reported it */
+                    em->quality = quality_from_class(cls);
                     em->age_ticks = travelled; em->arrived_tick = n->tick;
                 }
             }
