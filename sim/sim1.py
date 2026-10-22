@@ -343,6 +343,7 @@ class CDedup(ctypes.Structure):
 class CNode(ctypes.Structure):
     pass
 
+BUSY_FN = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.POINTER(CNode), ctypes.c_uint8)
 CB = ctypes.CFUNCTYPE(None, ctypes.POINTER(CNode), ctypes.c_void_p)   # core callback (timer/switch-done)
 TX_FN = ctypes.CFUNCTYPE(None, ctypes.POINTER(CNode), ctypes.c_uint8,
                          ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint16, ctypes.c_uint64)
@@ -366,6 +367,7 @@ CNode._fields_ = [
     ("chunk_rr_ch", ctypes.c_uint8),       # channel rotation of the stable tail (4.3)
     ("proof_wait", ctypes.c_uint8 * 3),  # flush countdown per channel (4.2)
     ("tx", TX_FN), ("timer", TIMER_FN), ("switch_ch", SWITCH_FN), ("rand", RAND_FN),
+    ("busy", BUSY_FN),
     ("user", ctypes.c_void_p),
 ]
 
@@ -377,6 +379,17 @@ def _node_of(nptr):
 @TX_FN
 def _tx(nptr, ch, pkt, length, airtime):
     _node_of(nptr).tx(ch, ctypes.string_at(pkt, length), airtime)
+
+@BUSY_FN
+def _busy(nptr, ch):
+    """CAD: the channel is busy when an ongoing transmission overlaps NOW
+    (design 2). The wire model keeps the per-channel transmission list."""
+    nd = _node_of(nptr)
+    now = nd.radio.now
+    for s0, e0, t0 in nd.radio.wire.chan[ch]:
+        if s0 <= now < e0 and t0 != nd.id:
+            return True
+    return False
 
 @TIMER_FN
 def _timer(nptr, delay, cb, ud):
@@ -400,7 +413,7 @@ def _rand(nptr):
 def load_lib(path):
     lib = ctypes.CDLL(path)
     lib.mimeshi_init.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint16, TX_FN,
-                                 TIMER_FN, SWITCH_FN, RAND_FN, ctypes.c_void_p]
+                                 TIMER_FN, SWITCH_FN, RAND_FN, BUSY_FN, ctypes.c_void_p]
     lib.mimeshi_start.argtypes = [ctypes.POINTER(CNode)]
     lib.mimeshi_rx.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint8, ctypes.c_int8,
                                ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint16]
@@ -420,7 +433,7 @@ class CCore:
         self.n, self.lib = node, lib
         self.mn = CNode()
         NODES[ctypes.addressof(self.mn)] = node
-        lib.mimeshi_init(ctypes.byref(self.mn), node.id, _tx, _timer, _switch, _rand, None)
+        lib.mimeshi_init(ctypes.byref(self.mn), node.id, _tx, _timer, _switch, _rand, _busy, None)
     def start(self):
         self.lib.mimeshi_start(ctypes.byref(self.mn))
     def rx(self, arg):

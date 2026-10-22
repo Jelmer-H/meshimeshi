@@ -32,3 +32,8 @@ uint32_t host_rand(mimeshi_node *n) {
     (void)n;
     return (uint32_t)rand();
 }
+
+bool host_busy(mimeshi_node *n, uint8_t ch) {
+    (void)n; (void)ch;
+    return false;   /* stub: real CAD lives in the SX1262 driver */
+}

@@ -81,8 +81,8 @@ int main(void) {
 
     /* Home channel = id mod 3 (section 2). 0x0102 = 258 -> home 0,
      * 0x0100 = 256 -> home 1: exactly the channels this test expects. */
-    mimeshi_init(&A, 0x0102, vrtx, sched, vrswitch, vrrand, 0);
-    mimeshi_init(&B, 0x0100, vrtx, sched, vrswitch, vrrand, 0);
+    mimeshi_init(&A, 0x0102, vrtx, sched, vrswitch, vrrand, 0, 0);
+    mimeshi_init(&B, 0x0100, vrtx, sched, vrswitch, vrrand, 0, 0);
     assert(A.home_ch == 0 && B.home_ch == 1);
 
     mimeshi_start(&A);

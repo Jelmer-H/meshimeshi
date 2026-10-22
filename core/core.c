@@ -54,6 +54,9 @@
 #define MC_RETRY_TX         2              /* transmit attempts per neighbor per series (7.4) */
 #define MC_ACK1_MARGIN_US   80000ull       /* processing + margin on top of t_data + t_ack (7.3) */
 #define MC_S_SWITCH_US      5000ull        /* channel switch incl. settling (14.1) */
+#define MC_CAD_TRIES        8               /* busy-channel backoff attempts before
+                                            transmitting anyway (2) */
+#define MC_CAD_WAIT_US      20000ull        /* base backoff on a busy channel (2) */
 
 /* ---------------- airtime (SF7, 62.5 kHz, CR4/5) ----------------
  * Fixed values from the table in 14.1. The core passes the airtime to
@@ -195,14 +198,28 @@ static bool dedup_fresh(mimeshi_node *n, uint16_t msg_id, uint16_t src) {
 #ifndef MC_BOUND_POOL
 #define MC_BOUND_POOL MC_MAX_PENDING
 #endif
-typedef struct { uint8_t ch; uint16_t len; uint64_t airtime; uint8_t pkt[10 + MC_MAX_PAYLOAD]; } bound_ctx;
+typedef struct { uint8_t ch; uint16_t len; uint64_t airtime; uint8_t tries; uint8_t pkt[10 + MC_MAX_PAYLOAD]; } bound_ctx;
 static bound_ctx bctx[MC_BOUND_POOL]; /* pool per transmission; small and fixed */
 static uint32_t bctx_drops;          /* full pool = defect, never silent */
 
-static void bound_fire(mimeshi_node *n, void *ud) {
-    bound_ctx *c = (bound_ctx *)ud;
+static void bound_fire(mimeshi_node *n, void *ud);
+
+/* CAD check at the moment of transmission (2): if the channel is busy,
+ * back off with a random wait and re-check. After MC_CAD_TRIES attempts
+ * the packet goes out anyway -- best effort beats starving. Without a
+ * busy callback (NULL) the transmission is immediate. */
+static void bound_check_and_tx(mimeshi_node *n, bound_ctx *c) {
+    if (n->busy && c->tries < MC_CAD_TRIES && n->busy(n, c->ch)) {
+        c->tries++;
+        n->timer(n, (n->rand(n) % MC_CAD_WAIT_US) + MC_CAD_WAIT_US / 2, bound_fire, c);
+        return;
+    }
     n->tx(n, c->ch, c->pkt, c->len, c->airtime);
     c->len = 0; /* slot free */
+}
+
+static void bound_fire(mimeshi_node *n, void *ud) {
+    bound_check_and_tx(n, (bound_ctx *)ud);
 }
 
 /* Transmit on channel ch after a switch. Drop the transmission if the
@@ -211,7 +228,7 @@ static void bound_fire(mimeshi_node *n, void *ud) {
 static void bound_send(mimeshi_node *n, uint8_t ch, const uint8_t *pkt, uint16_t len, uint64_t airtime) {
     for (int i = 0; i < MC_BOUND_POOL; i++) {
         if (bctx[i].len == 0) {
-            bctx[i].ch = ch; bctx[i].len = len; bctx[i].airtime = airtime;
+            bctx[i].ch = ch; bctx[i].len = len; bctx[i].airtime = airtime; bctx[i].tries = 0;
             memcpy(bctx[i].pkt, pkt, len);
             n->switch_ch(n, ch, MC_S_SWITCH_US, bound_fire, &bctx[i]);
             return;
@@ -421,11 +438,8 @@ static void chunk_send(mimeshi_node *n, uint8_t ch, uint8_t with_links) {
     }
     n->chunk_rr = (uint8_t)((n->chunk_rr + cnt) % MC_MAX_KNOWN);
     p[7] = cnt;
-    if (ch == n->home_ch) {
-        n->tx(n, ch, p, off, t_data_us(off));
-    } else {
-        bound_send(n, ch, p, off, t_data_us(off));
-    }
+    bound_send(n, ch, p, off, t_data_us(off));   /* CAD applies (2): chunks are
+                                                    never direct exchange replies */
     ka_called(n, ch);                        /* own call on that channel (4.1) */
 }
 
@@ -1291,8 +1305,9 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
  * (open point 3). The node struct lives in core.h so callers can
  * reserve it statically — hence the zeroing here. */
 void mimeshi_init(mimeshi_node *n, uint16_t id, mimeshi_tx_fn tx, mimeshi_timer_fn timer,
-                mimeshi_switch_fn sw, mimeshi_rand_fn rnd, void *user) {
+                mimeshi_switch_fn sw, mimeshi_rand_fn rnd, mimeshi_busy_fn busy, void *user) {
     memset(n, 0, sizeof(*n));
+    n->busy = busy;                        /* CAD (2); NULL = no check */
     n->id = id; n->home_ch = (uint8_t)(id % MC_N_CHANNELS);
     n->local_tbl_ctr = 1; n->hello_interval_us = MC_HELLO_START_US;
     n->chunk_rr_ch = n->home_ch;               /* tail rotation starts at home */

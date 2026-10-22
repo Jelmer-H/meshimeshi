@@ -126,6 +126,14 @@ typedef void (*mimeshi_switch_fn)(mimeshi_node *n, uint8_t channel, uint64_t s_u
                                 void (*done)(mimeshi_node *, void *), void *ud);
 typedef uint32_t (*mimeshi_rand_fn)(mimeshi_node *n);
 
+/* Channel-activity check (CAD, section 2): asks the platform whether the
+ * channel is busy RIGHT NOW. The core calls this before every transmission
+ * except the direct exchange replies (ack1): those answer an exchange that
+ * is already on the channel and must go out immediately. On busy, the core
+ * backs off with a random wait and re-checks; after MC_CAD_TRIES attempts
+ * it transmits anyway (best effort beats starving). */
+typedef bool (*mimeshi_busy_fn)(mimeshi_node *n, uint8_t channel);
+
 /* ---------------- node ---------------------------------------------- */
 struct mimeshi_node {
     uint16_t id;
@@ -167,13 +175,16 @@ struct mimeshi_node {
     mimeshi_timer_fn  timer;
     mimeshi_switch_fn switch_ch;
     mimeshi_rand_fn   rand;
+    mimeshi_busy_fn   busy;                    /* CAD: channel free check (2);
+                                                   NULL = transmit without CAD */
     void *user;                       /* own data of platform/simulator */
 };
 
 /* ---------------- API ----------------------------------------------- */
-/* Initializes the node (zeroing + callbacks). The id determines the home channel. */
+/* Initializes the node (zeroing + callbacks). The id determines the home
+ * channel. busy may be NULL: then the core transmits without CAD. */
 void mimeshi_init(mimeshi_node *n, uint16_t id, mimeshi_tx_fn tx, mimeshi_timer_fn timer,
-                mimeshi_switch_fn sw, mimeshi_rand_fn rnd, void *user);
+                mimeshi_switch_fn sw, mimeshi_rand_fn rnd, mimeshi_busy_fn busy, void *user);
 
 /* First hello round immediately, then startup rounds with random phase
  * (jitter). After the startup phase the hello no longer exists:
