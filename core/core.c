@@ -433,7 +433,12 @@ static void chunk_send(mimeshi_node *n, uint8_t ch, uint8_t with_links) {
         cnt++;
         if (off > 240 - 30) break;
     }
-    /* then known-map entries round-robin (4.3), with their learned links */
+    /* then known-map entries round-robin (4.3), with their learned links.
+     * The cursor advances by the number of MAP entries actually sent
+     * (map_sent) -- the self-entry and the direct neighbours occupy fixed
+     * slots every slice, so advancing by the total count (cnt) skips most
+     * of the map (measured: 78 pushes carried only 13 of 26 map ids). */
+    uint8_t map_sent = 0;
     for (int i = 0; i < MC_MAX_KNOWN && cnt < MC_CHUNK_ENTRIES && off <= 240 - 30; i++) {
         mimeshi_2hop *h = &n->known[(n->chunk_rr + i) % MC_MAX_KNOWN];
         if (!h->alive || nbr_find(n, h->id)) continue;
@@ -442,8 +447,9 @@ static void chunk_send(mimeshi_node *n, uint8_t ch, uint8_t with_links) {
                                with_links ? h->lq : (const uint8_t *)0,
                                with_links ? h->nlinks : 0);
         cnt++;
+        map_sent++;
     }
-    n->chunk_rr = (uint8_t)((n->chunk_rr + cnt) % MC_MAX_KNOWN);
+    n->chunk_rr = (uint8_t)((n->chunk_rr + map_sent) % MC_MAX_KNOWN);
     p[7] = cnt;
     bound_send(n, ch, p, off, t_data_us(off));   /* CAD applies (2): chunks are
                                                     never direct exchange replies */
