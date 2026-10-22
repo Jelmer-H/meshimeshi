@@ -26,7 +26,10 @@
 #define MC_T_SYM_US      21600000000ull  /* 6 h: validity of confirmed symmetry (4.2) */
 #define MC_SYM_MARGIN_US  7200000000ull  /* 2 h flush margin (4.2) */
 #define MC_T_ACK2_US      7000000ull    /* ack2 wait window at the sender (7.3, proposal) */
-#define MC_MAX_ROUTE_NBR  3             /* neighbours tried per hop (7.4) */
+#define MC_MAX_ROUTE_NBR  3             /* candidates per hop: 3 x 2 = 6 attempts (7.4) */
+#define MC_RETRY_TX        2             /* transmit attempts per candidate (7.4) */
+#define MC_ACK2_CHARGE     6             /* budget cost of a failed sub-route, charged at
+                                            the node receiving the negative ack2 (7.4/9) */
 #define MC_MAX_KNOWN     256            /* known map entries (10.1) */
 #define MC_CHUNK_PERIOD_US 120000000ull /* 2 min: the chunk check tick (4.3) */
 #define MC_CHUNK_REPEAT_TICKS 10         /* slow tail repetition: slices every
@@ -37,8 +40,11 @@
                                             cannot chain pushes back-to-back */
 #define MC_CHUNK_ENTRIES 8              /* entries per chunk; with links an entry is
                                             up to 8 + 3*MC_CHUNK_LINKS B (4.3) */
-#define MC_CHUNK_LINKS    5             /* links per entry (4.3): the links of the
-                                            node follow directly after its entry */
+#define MC_CHUNK_LINKS    10            /* links per entry (4.3): the links of the
+                                            node follow directly after its entry. Must
+                                            cover the real max node degree: a cap below
+                                            it structurally limits the learned graph
+                                            (measured: 5 cut off 19 of 40 nodes) */
 #define MC_GEO_UNKNOWN   0x7fff         /* int16 sentinel: geo not known (10.2) */
 
 /* ---------------- internal types (visible for fixed allocation) ---- */

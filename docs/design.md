@@ -413,13 +413,13 @@ Example: A → B → C → D.
 
 ### 7.4 Retries
 
-- At most three neighbours per hop.
-- At most two transmission attempts per neighbour.
-- Ack1 received but no ack2: switch to the next neighbour.
-- Negative ack2: move to the next neighbour immediately, without waiting.
+- A hop tries its best next hop **twice**. If that fails, it recomputes the best next hop **without the failed hop**, and so on, up to **6 attempts per hop** (three candidates, two attempts each).
+- If the recomputed best next hop **points back toward the source**, the hop does not silently take a worse route: it sends a **negative ack2 back** and hands the message upstream.
+- On **receiving** a negative ack2, a node deducts **6 from the budget** (the failed sub-route is accounted at the upstream, because the header copy dies with the failed record) and tries its own **next best hop**. If that points back toward the source too, **the message has failed**: failed delivery report (10.5), done.
+- This bounds the backtrack: at most one extra attempt per negative ack2, never a cascade of restarting series.
 - Between attempts to the same neighbour, a random wait longer than the airtime of the next packet.
 
-**Status:** decided.
+**Status:** decided (the lump budget charge on a negative ack2 replaces per-attempt accounting of the failed sub-route).
 
 ---
 
@@ -509,6 +509,7 @@ The waiting time for senders uses the same logic as in 8.3.
 
 - One byte in the base header, starting value **32**.
 - Each forward costs 1. Each retry costs 1, deducted by the sender before retransmitting.
+- A failed sub-route costs a **lump 6** at the node that receives the negative ack2 (7.4): the downstream's spend dies with its record, so the upstream accounts for it.
 - At zero, the node stops forwarding and reports this negatively.
 - Loops are excluded, because every forward subtracts at least 1.
 - The budget is a total per message. Retries therefore do not multiply along the path.
