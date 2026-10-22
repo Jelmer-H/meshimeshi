@@ -56,6 +56,7 @@ static int cad_at_last_ack1 = -1; /* cad_calls when the last ack1 went out */
 static uint8_t last_type, last_ch;
 static uint16_t last_len;
 static int hello_cnt_A[3], hello_cnt_B[3];   /* hellos per channel per node */
+static int hack_cnt_A;                        /* hello-acks sent by A (type 2) */
 static int proof_cnt_A[3];                   /* proof lists per channel (A) */
 
 static bool vrcad(mimeshi_node *n, uint8_t ch) {
@@ -75,6 +76,7 @@ static void vrtx(mimeshi_node *n, uint8_t ch, const uint8_t *pkt, uint16_t len, 
         if (n->id == 0x0102) { hello_cnt_A[ch]++; assert(len == 3); }
         else if (n->id == 0x0100) { hello_cnt_B[ch]++; assert(len == 3); }
     }
+    if ((pkt[0] & 0x0F) == 2 && n->id == 0x0102) hack_cnt_A++;   /* hello-ack from A */
     if ((pkt[0] & 0x0F) == 3) {              /* PKT_PROOF */
         proof_seen++;
         if (n->id == 0x0102) proof_cnt_A[ch]++;
@@ -201,6 +203,57 @@ int main(void) {
         for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
             if (A.nbr[i].alive && A.nbr[i].id == 0x0107) seen = A.nbr[i].sym;
         assert(seen == 0);              /* seen, not confirmed */
+    }
+
+    /* Assert 6b: the quality gate (10.1). A confirmation (hello-ack
+     * addressed to us, proof list naming us, ack1 on our data) only
+     * makes the link symmetric when the measured quality is above the
+     * threshold; a weak link stays "seen". A weak HELLO gets no ack at
+     * all (same threshold): it can never become a routing link, so an
+     * ack on it is pure airtime. -105 dBm is below the gate
+     * (quality 11 < 14 = quality_of(-100 dBm)). */
+    {
+        pump_until(now + 4000000);                       /* let acks of earlier good hellos fire first */
+        int hack_before = hack_cnt_A;
+        uint8_t hello_weak[3] = { 1, 0x08,0x01 };        /* PKT_HELLO from 0x0108 at -105 dBm */
+        mimeshi_rx(&A, 0, -105, hello_weak, 3);
+        pump_until(now + 4000000);                       /* past the whole ack window (3 s) */
+        assert(hack_cnt_A == hack_before);               /* no hello-ack from A on a weak hello */
+        /* and the sender is in the table: liveness yes, link no */
+        int seen = -1;
+        for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
+            if (A.nbr[i].alive && A.nbr[i].id == 0x0108) seen = A.nbr[i].sym;
+        assert(seen == 0);
+    }
+    uint8_t hack_weak[5] = { 2, 0x02,0x01, 0x06,0x01 };    /* from 0x0106, addressed to A (us) */
+    mimeshi_rx(&A, 0, -105, hack_weak, 5);
+    {
+        int seen = -1;
+        for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
+            if (A.nbr[i].alive && A.nbr[i].id == 0x0106) seen = A.nbr[i].sym;
+        assert(seen == 0);              /* weak link: seen, NOT confirmed */
+    }
+    uint8_t proof_weak[5] = { 3, 0x06,0x01, 0x02,0x01 };  /* proof list from 0x0106 naming A */
+    mimeshi_rx(&A, 0, -105, proof_weak, 5);
+    {
+        int seen = -1;
+        for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
+            if (A.nbr[i].alive && A.nbr[i].id == 0x0106) seen = A.nbr[i].sym;
+        assert(seen == 0);              /* weak link: seen, NOT confirmed (liveness refreshed, still weak) */
+    }
+    /* ack1 on our data: the weak ack also fails to confirm. A has a
+     * pending toward B (msg 42, vrrand); the ack1 arrives at -105 dBm. */
+    {
+        mimeshi_neighbor *nb = 0;
+        for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
+            if (A.nbr[i].alive && A.nbr[i].id == 0x0100) nb = &A.nbr[i];
+        assert(nb);
+        int was_sym = nb->sym;
+        nb->sym = 0;                            /* internal field: start the check clean */
+        uint8_t ack1_weak[7] = { 6, 42,0, 0x00,0x01, 0x00,0x01 };  /* msg 42, source A, sender B */
+        mimeshi_rx(&A, 1, -105, ack1_weak, 7);
+        assert(nb->sym == 0);                   /* weak ack: no confirmation */
+        nb->sym = (uint8_t)was_sym;             /* restore for the assertions below */
     }
 
     /* --- keepalive via the proof list (4.1/4.2): after the startup
