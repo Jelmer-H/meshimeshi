@@ -713,16 +713,6 @@ static mimeshi_2hop *known_upsert(mimeshi_node *n, uint16_t id, uint16_t via,
  * (about -108 dBm). */
 #define MC_ROUTE_MIN_QUALITY 10
 
-/* Effective quality of a direct link (10.1: each direction proven by its
- * receiver): the minimum of both directions. quality = neighbour->us as we
- * measure; quality_back = us->neighbour as the neighbour measures (learned
- * from its self-entry, 4.3). Until quality_back is learned, our own
- * measurement is all we have -- a one-direction view. */
-static uint8_t nbr_eff_quality(mimeshi_neighbor *nb) {
-    if (nb->quality_back && nb->quality_back < nb->quality) return nb->quality_back;
-    return nb->quality;
-}
-
 /* Effective quality of a learned link (a, b): the minimum of both
  * advertised directions. Entry a's link to b carries b->a (a measured);
  * entry b's link to a carries a->b (b measured). min = the bottleneck. */
@@ -745,11 +735,21 @@ static uint8_t link_eff_quality(mimeshi_node *n, uint16_t a, uint16_t b) {
     return q;
 }
 
+/* Directional thresholds (asymmetric links, decided): the DATA travels
+ * us->neighbour and must pass MC_ROUTE_MIN_QUALITY. The ACK travels back
+ * (7 B, a fraction of the airtime) and survives a weaker link: it needs
+ * only MC_ACK_MIN_QUALITY. A link that is good toward the neighbour but
+ * weak back is therefore USABLE for data (the small ack still makes it);
+ * only both-weak links are no candidates. */
+#define MC_ACK_MIN_QUALITY 6      /* ~ -116 dBm: the ack direction floor */
 static int route_score(mimeshi_node *n, mimeshi_neighbor *nb) {
     (void)n;
     if (!nb->sym) return -1;                 /* only confirmed links (10.1) */
-    if (nbr_eff_quality(nb) < MC_ROUTE_MIN_QUALITY) return -1;   /* threshold on BOTH directions (10.1) */
-    return nbr_eff_quality(nb) - (nb->penalty << 3); /* penalty weighs heavily (10.4) */
+    uint8_t qfwd = nb->quality_back ? nb->quality_back : nb->quality;  /* us->nb (as the neighbour measures) */
+    uint8_t qback = nb->quality;              /* nb->us (as we measure) */
+    if (qfwd < MC_ROUTE_MIN_QUALITY) return -1;   /* the DATA direction must pass */
+    if (qback < MC_ACK_MIN_QUALITY) return -1;    /* the small ack still fits */
+    return ((int)qfwd + (int)qback) / 2 - (nb->penalty << 3);  /* penalty (10.4) */
 }
 
 /* Path computation on the learned link graph (10.2). The graph: our own
@@ -809,10 +809,12 @@ static mimeshi_neighbor *route_path(mimeshi_node *n, uint16_t dst, mimeshi_neigh
             for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
                 mimeshi_neighbor *nb = &n->nbr[i];
                 if (!nb->alive || !nb->sym) continue;
-                if (nbr_eff_quality(nb) < MC_ROUTE_MIN_QUALITY) continue;   /* threshold (10.1) */
+                uint8_t qfwd = nb->quality_back ? nb->quality_back : nb->quality;
+                if (qfwd < MC_ROUTE_MIN_QUALITY) continue;   /* DATA direction (10.1) */
+                if (nb->quality < MC_ACK_MIN_QUALITY) continue;  /* ack direction */
                 int v = IDX(nb->id);
                 if (v < 0) continue;
-                int32_t nd = dist[0] + dij_cost(nbr_eff_quality(nb));
+                int32_t nd = dist[0] + dij_cost((int32_t)(qfwd + nb->quality) / 2);
                 if (nd < dist[v]) {
                     dist[v] = nd;
                     first[v] = nb->id;            /* the first hop on the path to v */
@@ -843,7 +845,11 @@ static mimeshi_neighbor *route_path(mimeshi_node *n, uint16_t dst, mimeshi_neigh
     if (t < 0 || dist[t] == MC_DIJ_INF || first[t] == 0) return 0;
     mimeshi_neighbor *hop = nbr_find(n, first[t]);
     if (!hop || !hop->sym || hop == excl) return 0;
-    if (nbr_eff_quality(hop) < MC_ROUTE_MIN_QUALITY) return 0;   /* threshold (10.1) */
+    {
+        uint8_t qfwd = hop->quality_back ? hop->quality_back : hop->quality;
+        if (qfwd < MC_ROUTE_MIN_QUALITY) return 0;   /* DATA direction (10.1) */
+        if (hop->quality < MC_ACK_MIN_QUALITY) return 0;  /* ack direction */
+    }
     return hop;
     #undef IDX
 }
@@ -903,7 +909,11 @@ static mimeshi_neighbor *route_next(mimeshi_node *n, uint16_t dst,
         for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
             mimeshi_neighbor *nb = &n->nbr[i];
             if (!nb->alive || !nb->sym || nb == excl) continue;
-            if (nbr_eff_quality(nb) < MC_ROUTE_MIN_QUALITY) continue;   /* threshold (10.1) */
+            {
+                uint8_t qfwd = nb->quality_back ? nb->quality_back : nb->quality;
+                if (qfwd < MC_ROUTE_MIN_QUALITY) continue;   /* DATA direction (10.1) */
+                if (nb->quality < MC_ACK_MIN_QUALITY) continue;  /* ack direction */
+            }
             if (nb->geox == MC_GEO_UNKNOWN) continue;
             if (geo_dist2(nb->geox, nb->geoy, tgx, tgy) >= own_gw) continue;  /* no progress: void guard */
             int s = route_score(n, nb) - (geo_dist2(nb->geox, nb->geoy, tgx, tgy) >> 12);
@@ -1255,9 +1265,18 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
     case PKT_DATA: {
         uint16_t msg_id = rd16(pkt + 1), src = rd16(pkt + 3), dst = rd16(pkt + 5), prev = rd16(pkt + 7);
         uint16_t nhop = rd16(pkt + 8);
-        /* dedup before the acks: a retry of the same hop must not
-         * yield ack1/ack2/ack3 again. */
-        if (!dedup_fresh(n, msg_id, src)) return;
+        /* dedup before the handling: a retry of the same hop must not
+         * deliver or forward twice. But the ack1 is repeated: the first
+         * ack may have been lost (a 7 B ack survives a weak direction
+         * where the data did not, 7.4 -- asymmetric links are usable in
+         * the good direction), and without a re-ack the sender exhausts
+         * its attempts on a delivered message. */
+        if (!dedup_fresh(n, msg_id, src)) {
+            if (nhop == n->id) {
+                ack1_send(n, msg_id, src, ch);   /* idempotent re-ack (7.4) */
+            }
+            return;
+        }
         /* snooping (2): the sender of the data is a direct neighbour
          * candidate -- quality and liveness, never symmetry. */
         mimeshi_neighbor *snb = nbr_find(n, prev);
