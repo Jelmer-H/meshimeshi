@@ -386,9 +386,10 @@ static mimeshi_link *lnk_add(mimeshi_node *n, uint16_t a, uint16_t b) {
 
 /* Table push mutation feed (4.3): the local table counter drives the
  * push-window bundling. A mutation schedules the prefix chunks after
- * the short window; mutations inside the window bundle automatically
+ * the window (15 min + jitter: churn on a dense hub must stay inside
+ * the duty budget); mutations inside the window bundle automatically
  * because only the current state goes on air. */
-#define MC_TBL_WIN_US   30000000ull   /* bundling window: 30 s (4.3, to measure) */
+#define MC_TBL_WIN_US   900000000ull  /* bundling window: 15 min (4.3, to measure) */
 #define MC_TBL_PERIOD_TICKS 384u          /* prefix re-share: ~6 h in ~56 s ticks (4.3: every chunk at least ~1x/day) */
 
 static void tbl_push_fire(mimeshi_node *n, void *ud);
