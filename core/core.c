@@ -391,15 +391,34 @@ static mimeshi_link *lnk_add(mimeshi_node *n, uint16_t a, uint16_t b) {
  * channel; mutations inside the window bundle automatically because
  * only the current state goes on air). */
 #define MC_TBL_WIN_US   3600000000ull /* bundling window: 1 h (4.3, to measure) */
+#define MC_CHUNK_MAX_ENTRIES 8        /* entries per chunk: 8 x (9 B + links) fits 230 B */
 #define MC_TBL_PERIOD_TICKS 384u          /* prefix re-share: ~6 h in ~56 s ticks (4.3: every chunk at least ~1x/day) */
 
 static void tbl_push_fire(mimeshi_node *n, void *ud);
+
+/* Bundling window, adaptive to the table size (4.3): the airtime of a
+ * whole-prefix round grows with the number of chunks, and only large
+ * tables can approach the 1% worst-case budget. Up to
+ * MC_TBL_FAST_MAX_CHUNKS the push follows after the short window
+ * (fast convergence); above it the long window keeps sustained churn
+ * under 1% of a channel even for a fully meshed 64-hub. */
+#define MC_TBL_WIN_FAST_US  900000000ull   /* small tables: 15 min + jitter */
+#define MC_TBL_FAST_MAX_CHUNKS 8           /* <= 8 chunks: worst case 0.77% of a channel */
+
+static uint64_t tbl_win_us(mimeshi_node *n) {
+    uint16_t sym = 0;
+    for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
+        if (n->nbr[i].alive && n->nbr[i].sym) sym++;
+    return ((sym + MC_CHUNK_MAX_ENTRIES - 1) / MC_CHUNK_MAX_ENTRIES <= MC_TBL_FAST_MAX_CHUNKS)
+           ? MC_TBL_WIN_FAST_US : MC_TBL_WIN_US;
+}
 
 static void tbl_mark_dirty(mimeshi_node *n) {
     n->tbl_dirty = 1;
     if (!n->tbl_push_sched) {
         n->tbl_push_sched = 1;
-        n->timer(n, MC_TBL_WIN_US + (n->rand(n) % MC_TBL_WIN_US), tbl_push_fire, 0);
+        uint64_t w = tbl_win_us(n);
+        n->timer(n, w + (n->rand(n) % w), tbl_push_fire, 0);
     }
 }
 
@@ -418,8 +437,6 @@ static void tbl_mark_dirty(mimeshi_node *n) {
  * records under an entry carry the links between the entry-node and
  * our other confirmed neighbours, with the classes per direction as
  * they are known in the link store. */
-#define MC_CHUNK_MAX_ENTRIES 8        /* 8 entries x (9 B + links) fits 230 B */
-
 /* Direction-aware access to the link store: nibbles keyed to the
  * sorted endpoints (a < b): high nibble = a->b, low = b->a. */
 static uint8_t lnk_class(mimeshi_node *n, uint16_t from, uint16_t to) {
