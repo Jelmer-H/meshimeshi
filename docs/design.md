@@ -546,7 +546,7 @@ Threads could use a shorter limit, for example three bits. That provides some ex
 |---|---|---|
 | Destination a confirmed direct neighbour | Direct hop, best quality | Decided |
 | Destination in the known map (via entries) | Shortest path on the learned link graph (Dijkstra over quality); the first hop of that path is a confirmed direct neighbour | Decided |
-| Destination outside the map | Greedy on the destination geo from the header (6.1): the confirmed neighbour closest to the geo that is closer than we are | Decided |
+| Destination outside the map, or a concave corner | Greedy on the destination geo from the header (6.1): the confirmed neighbour closest to the geo that is closer than we are. No such step (concave corner): find the known node closest to the geo (the gateway) and plan a walkable Dijkstra path toward it through the learned graph -- the tandem continues on the map, and the message converges gateway by gateway. No perimeter mode needed while the graph is full. | Decided |
 
 The destination geo originates from the client (11) when the map does not know the destination; from then on it travels in the header. Near the destination a local node knows the target in its table and routes on the ID -- the tandem closes itself.
 | No neighbour closer (gap, "void") | Fallback: waypoint or perimeter (see 10.3) | Proposal |
