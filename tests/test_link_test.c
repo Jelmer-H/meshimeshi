@@ -155,7 +155,7 @@ int main(void) {
     }
 
     /* hello-ack from A toward B: exchange to B's home channel (1). The
-     * hello-ack is 5 B (6.2). */
+     * hello-ack is 6 B incl. the quality byte (6.2). */
     assert(mimeshi_send_data(&B, 0x0102, (const uint8_t *)"hello mesh", 10, true) == 0);
     pump_until(100000); /* switch (5 ms) + tx; not up to the ack1 timeout */
     /* B transmits data on A's home channel 0. */
@@ -175,8 +175,8 @@ int main(void) {
      * (4.2): the neighbor received our message and its ack reached us.
      * B's unicast carries msg-id 42 (vrrand yields 42); A's ack1
      * arrives. */
-    uint8_t ack1[7] = { 6, 42,0, 0x00,0x01, 0x02,0x01 };   /* ACK1: msg 42, source B, sender A */
-    mimeshi_rx(&B, 1, -70, ack1, 7);                       /* B home on channel 1 */
+    uint8_t ack1[8] = { 6, 42,0, 0x00,0x01, 0x02,0x01, 20 };  /* ACK1: msg 42, source B, sender A, quality 20 */
+    mimeshi_rx(&B, 1, -70, ack1, 8);                       /* B home on channel 1; A measured 20 on B's data */
     {
         int sym_ok = 0;
         for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
@@ -188,16 +188,17 @@ int main(void) {
      * ack addressed to US proves symmetry — the responder received our
      * hello and its ack reached us. An overheard ack (for someone else)
      * puts the sender at most on "seen" (4.2). */
-    uint8_t hack_for_a[5] = { 2, 0x02,0x01, 0x00,0x01 };  /* from B, for A */
-    mimeshi_rx(&A, 0, -70, hack_for_a, 5);
+    uint8_t hack_for_a[6] = { 2, 0x02,0x01, 0x00,0x01, 18 };  /* from B, for A; B measured 18 on A's hello */
+    mimeshi_rx(&A, 0, -70, hack_for_a, 6);
     {
-        int sym_b = 0;
+        int sym_b = 0; uint8_t rev_b = 0;
         for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
-            if (A.nbr[i].alive && A.nbr[i].id == 0x0100) sym_b = A.nbr[i].sym;
+            if (A.nbr[i].alive && A.nbr[i].id == 0x0100) { sym_b = A.nbr[i].sym; rev_b = A.nbr[i].rev_quality; }
         assert(sym_b == 1);
+        assert(rev_b == 18);              /* the hello-ack quality byte: what B measured on OUR hello (6.2) */
     }
-    uint8_t hack_for_c[5] = { 2, 0x05,0x01, 0x07,0x01 };  /* from 0x0107, for 0x0105: snooping */
-    mimeshi_rx(&A, 0, -70, hack_for_c, 5);
+    uint8_t hack_for_c[6] = { 2, 0x05,0x01, 0x07,0x01, 18 };  /* from 0x0107, for 0x0105: snooping */
+    mimeshi_rx(&A, 0, -70, hack_for_c, 6);
     {
         int seen = -1;
         for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
@@ -225,8 +226,8 @@ int main(void) {
             if (A.nbr[i].alive && A.nbr[i].id == 0x0108) seen = A.nbr[i].sym;
         assert(seen == 0);
     }
-    uint8_t hack_weak[5] = { 2, 0x02,0x01, 0x06,0x01 };    /* from 0x0106, addressed to A (us) */
-    mimeshi_rx(&A, 0, -105, hack_weak, 5);
+    uint8_t hack_weak[6] = { 2, 0x02,0x01, 0x06,0x01, 0 };    /* from 0x0106, addressed to A (us) */
+    mimeshi_rx(&A, 0, -105, hack_weak, 6);
     {
         int seen = -1;
         for (int i = 0; i < MC_MAX_NEIGHBORS; i++)

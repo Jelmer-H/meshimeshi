@@ -15,6 +15,9 @@ add_compile_options(-Wall -Wextra -Werror)
 # link the same source statically. No dynamic allocation in the core (13b).
 add_library(mimeshi_shared SHARED core/core.c core/core.h)
 set_target_properties(mimeshi_shared PROPERTIES OUTPUT_NAME mimeshi)
+# the shared .so is also loaded by the simulator (all nodes of a scenario
+# in one process): the larger bound pool, as in the README gcc line
+target_compile_definitions(mimeshi_shared PRIVATE MC_BOUND_POOL=8192)
 target_include_directories(mimeshi_shared PUBLIC ${CMAKE_SOURCE_DIR})
 
 # Static variant for firmware builds.

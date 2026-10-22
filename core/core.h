@@ -32,6 +32,9 @@
 typedef struct {
     uint16_t id;
     uint8_t  quality;      /* derived from RSSI, updated per hello/proof list */
+    uint8_t  rev_quality;  /* quality the NEIGHBOUR measured on our signal
+                              (its hello-ack/ack1 quality byte, 6.2);
+                              0 = not yet known. EWMA-smoothed. */
     uint8_t  ack_try;      /* counter per neighbor (4.1): every identifying
                               transmission of the neighbor counts; ack
                               attempts at counter values 1, 2, 4, 8, 16,

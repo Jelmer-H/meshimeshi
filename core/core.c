@@ -452,7 +452,12 @@ static void chunk_send(mimeshi_node *n) {
         mimeshi_neighbor *nb = &n->nbr[i];
         if (!nb->alive || !nb->sym) continue;      /* only confirmed symmetric (4.3) */
         wr16(p + len, nb->id);
-        p[len + 2] = adv_class_of(nb->quality);   /* measured EWMA class (3 bits) */
+        /* both directions in one byte (6.2, 4.3): our measured EWMA
+         * class, and the class the neighbour reported about us (its
+         * ack quality byte, rev_quality). 0 = the reverse direction is
+         * not yet known (the neighbour has not acked us recently). */
+        p[len + 2] = (uint8_t)((adv_class_of(nb->quality) << 4)
+                              | adv_class_of(nb->rev_quality));
         p[len + 3] = 0;                            /* direct measurement: fresh */
         mimeshi_mapnode *m = map_find(n, nb->id);
         if (m && m->geo_lat) { wr16(p + len + 4, m->geo_lat); wr16(p + len + 6, m->geo_lon); }
@@ -525,7 +530,9 @@ static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t 
     uint16_t off = 10;
     for (uint8_t e = 0; e < n_ent && off + 9 <= len; e++) {
         uint16_t eid = rd16(pkt + off);
-        uint8_t cls = pkt[off + 2] & 0x07;     /* owner->entry class (4.3) */
+        uint8_t qbyte = pkt[off + 2];
+        uint8_t cls = qbyte >> 4;              /* owner->entry class (4.3) */
+        uint8_t rcls = qbyte & 0x07;           /* entry->owner class (its reported rev quality) */
         uint8_t age = pkt[off + 3];
         uint16_t gl = rd16(pkt + off + 4), go = rd16(pkt + off + 6);
         uint8_t lcnt = pkt[off + 8];
@@ -533,6 +540,11 @@ static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t 
         if (eid == n->id) {                    /* owner names us: reverse evidence (10.1) */
             if (nb) {
                 nb->proven_age_us = 0;
+                /* the owner's entry class for us IS its measurement of
+                 * our signal: our reverse quality, refreshed with every
+                 * chunk that names us (6.2) — no extra airtime */
+                uint8_t oq = quality_from_class(cls);
+                nb->rev_quality = quality_ewma(nb->rev_quality ? nb->rev_quality : oq, oq);
                 if (quality_ok(nb->quality)) {
                     if (!nb->sym) tbl_mark_dirty(n);
                     nb->sym = 1; nb->ack_try = 0;
@@ -549,6 +561,7 @@ static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t 
                 }
             }
             lnk_set_class(n, owner, eid, cls); /* owner -> entry */
+            if (rcls) lnk_set_class(n, eid, owner, rcls);  /* entry -> owner, if reported */
         }
         for (uint8_t k = 0; k < lcnt && off + 3 <= len; k++) {
             uint16_t peer = rd16(pkt + off);
@@ -601,12 +614,29 @@ static void proof_tick(mimeshi_node *n, void *ud) {
  * available before the first unicast. Eavesdroppers process the sender
  * as a minimal hello ("seen"); the state version is dropped (4.3: no
  * pull anymore). */
+/* Pending hello-ack between wait and fire: the measured quality of the
+ * hello travels along to the fire moment (no extra airtime). */
+#define MC_MAX_PENDING_HACKS 8
+typedef struct { uint16_t to; uint8_t quality; uint8_t used; } pending_hack;
+static pending_hack phack[MC_MAX_PENDING_HACKS];
+
+static pending_hack *phack_get(uint16_t to) {
+    for (int i = 0; i < MC_MAX_PENDING_HACKS; i++)
+        if (phack[i].used && phack[i].to == to) return &phack[i];
+    for (int i = 0; i < MC_MAX_PENDING_HACKS; i++)
+        if (!phack[i].used) { phack[i].used = 1; phack[i].to = to; return &phack[i]; }
+    return 0;                                   /* full: rare, ack goes without quality */
+}
+
 static void hello_ack_fire(mimeshi_node *n, void *ud) {
     uint16_t to = (uint16_t)(uintptr_t)(size_t)ud;
-    uint8_t p[5] = { PKT_HELLO_ACK, 0,0, 0,0 };
+    uint8_t p[6] = { PKT_HELLO_ACK, 0,0, 0,0, 0 };
     wr16(p + 1, to);                       /* destination: the hello sender */
     wr16(p + 3, n->id);
-    bound_send(n, (uint8_t)(to % MC_N_CHANNELS), p, 5, t_hack_us()); /* to HOME of the sender */
+    p[5] = 0;
+    for (int i = 0; i < MC_MAX_PENDING_HACKS; i++)
+        if (phack[i].used && phack[i].to == to) { p[5] = phack[i].quality; phack[i].used = 0; break; }
+    bound_send(n, (uint8_t)(to % MC_N_CHANNELS), p, 6, t_hack_us()); /* to HOME of the sender */
     ka_called(n, (uint8_t)(to % MC_N_CHANNELS));    /* own call on that channel (4.1) */
 }
 
@@ -674,6 +704,8 @@ static void hello_ack_wait(mimeshi_node *n, uint16_t from, int8_t rssi) {
                              - t_ack_us() - MC_S_SWITCH_US);
     uint32_t slot = (uint32_t)((255 - norm) * span / 255u);
     uint32_t jitter = n->rand(n) % (MC_HELLO_ACK_JITTER_US + 1u);
+    pending_hack *ph = phack_get(from);
+    if (ph) ph->quality = quality_of(rssi);      /* what we measured on the hello */
     n->timer(n, slot + jitter, hello_ack_fire, (void *)(size_t)from);
 }
 
@@ -682,10 +714,11 @@ static void hello_ack_wait(mimeshi_node *n, uint16_t from, int8_t rssi) {
 /* Ack1: immediately, on the channel of the ongoing data exchange — the
  * sender waits there for the answer (switch rule, 2). The sender-id
  * travels along so the sender knows who has been heard. */
-static void ack1_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint8_t ch) {
-    uint8_t p[7] = { PKT_ACK1, 0,0, 0,0, 0,0 };
+static void ack1_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint8_t ch, int8_t rssi) {
+    uint8_t p[8] = { PKT_ACK1, 0,0, 0,0, 0,0, 0 };
     wr16(p + 1, msg_id); wr16(p + 3, src); wr16(p + 5, n->id);
-    n->tx(n, ch, p, 7, t_ack_us());       /* same channel as the data (switch rule) */
+    p[7] = quality_of(rssi);              /* what we measured on the data (6.2) */
+    n->tx(n, ch, p, 8, t_ack_us());       /* same channel as the data (switch rule) */
     ka_called(n, ch);                     /* own call on the data channel (4.1) */
 }
 
@@ -823,6 +856,11 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
             nb->last_seen = 0;
             nb->quality = quality_of(rssi);
             nb->proven_age_us = 0;      /* fresh reception of an identifying transmission */
+            if (dst == n->id && len >= 6) {
+                uint8_t rq = pkt[5];     /* what the responder measured on OUR signal (6.2) */
+                nb->rev_quality = rq ? quality_ewma(nb->rev_quality ? nb->rev_quality : rq, rq)
+                                     : nb->rev_quality;
+            }
             if (dst == n->id && quality_ok(nb->quality)) {
                 if (!nb->sym) tbl_mark_dirty(n);       /* new advertised neighbour (4.3) */
                 nb->sym = 1; nb->ack_try = 0;          /* confirmed symmetric (4.2, 10.1) */
@@ -879,6 +917,9 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                 if (nb) {                               /* confirmed symmetric (4.2, 10.1) */
                     nb->quality = quality_of(rssi);     /* the ack1 itself is the measurement (its direction) */
                     nb->proven_age_us = 0;
+                    if (len >= 8 && pkt[7]) {            /* what the acker measured on OUR data (6.2) */
+                        nb->rev_quality = quality_ewma(nb->rev_quality ? nb->rev_quality : pkt[7], pkt[7]);
+                    }
                     if (quality_ok(nb->quality)) {
                         if (!nb->sym) tbl_mark_dirty(n);
                         nb->sym = 1; nb->ack_try = 0;
@@ -915,7 +956,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
          * yield ack1/ack2/ack3 again. */
         if (!dedup_fresh(n, msg_id, src)) return;
         printf("[core] node %u: DATA from %u: '%.*s'\n", n->id, src, (int)(len - 10), (const char *)(pkt + 10));
-        ack1_send(n, msg_id, src, ch);             /* same channel */
+        ack1_send(n, msg_id, src, ch, rssi);       /* same channel; quality of the data travels along */
         ack2_send(n, msg_id, src, prev, false);    /* home channel previous hop */
         if (flags & F_ACK3_REQ) {
             /* ack3 as a routed message (6.2): DATA format, payload = the
