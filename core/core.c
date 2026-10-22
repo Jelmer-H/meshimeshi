@@ -393,6 +393,14 @@ static void hello_ack_fire(mimeshi_node *n, void *ud) {
  * without a third chance.
  */
 static void hello_ack_wait(mimeshi_node *n, uint16_t from, int8_t rssi) {
+    /* Quality gate (10.1), same threshold as the confirmation: a hello
+     * below it can never become a routing link (our confirmation would
+     * be blocked by the gate, the neighbour's too), so an ack on it is
+     * pure airtime -- and around boundary links it feeds the ack
+     * storm the on-demand scheme is there to prevent. The counter does
+     * not count this transmission: a weak hello is not evidence of a
+     * usable link. */
+    if (!quality_ok(quality_of(rssi))) return;
     mimeshi_neighbor *nb = nbr_find(n, from);
     int ack = 1;                                 /* unknown sender: always ack */
     if (nb) {
