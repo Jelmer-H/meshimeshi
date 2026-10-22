@@ -137,16 +137,23 @@ static uint8_t quality_of(int8_t rssi) {
     return (uint8_t)(rssi < 0 ? (rssi + 128) >> 1 : 63);
 }
 
-/* Update the quality of a neighbour. A change of at least 2 steps
- * (advertisement hysteresis, 4.3) is a table mutation: it moves the
- * local table counter, so the next chunk push carries it. */
+/* Update the quality of a neighbour per 4.3: an EWMA of the long-term
+ * average, stored = (31 x stored + new) / 32, weight 1/32; the first
+ * measurement initialises the stored value. A marginal link is thereby
+ * classified CONSISTENTLY: it stays under the routing threshold instead
+ * of slipping through on a good moment -- the decided principle: if it
+ * works it works well, and a marginal link fails clearly (the owner
+ * fixes the antenna) instead of delivering half the time.
+ * A change of at least 4 steps (advertisement hysteresis, 4.3) is a table
+ * mutation: it moves the local table counter for the next chunk push. */
 static void nbr_set_quality(mimeshi_node *n, mimeshi_neighbor *nb, int8_t rssi) {
     uint8_t q = quality_of(rssi);
-    int diff = (int)q - (int)nb->quality;
+    uint8_t before = nb->quality;
+    if (nb->quality == 0) nb->quality = q;                          /* first measurement (4.3) */
+    else nb->quality = (uint8_t)(((uint32_t)nb->quality * 31u + q) / 32u);   /* EWMA (4.3) */
+    int diff = (int)nb->quality - (int)before;
     if (diff < 0) diff = -diff;
-    nb->quality = q;
-    if (diff >= 4) n->local_tbl_ctr++;   /* 2x the advertisement hysteresis (4.3):
-                                             measurement noise is not a mutation */
+    if (diff >= 4) n->local_tbl_ctr++;
 }
 
 /* Add a neighbor (from a hello, hello-ack or proof list). Full = return 0;
@@ -532,7 +539,12 @@ static void chunk_recv(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *
              * that is the us->sender direction -> quality_back. */
             for (uint8_t j = 0; j < take; j++) {
                 if (links[j] == n->id && snb) {
-                    if (lq[j]) snb->quality_back = lq[j];
+                    if (lq[j]) {
+                        /* EWMA (4.3): their advertised measurement of our
+                         * direction is also a long-term average */
+                        if (snb->quality_back == 0) snb->quality_back = lq[j];
+                        else snb->quality_back = (uint8_t)(((uint32_t)snb->quality_back * 31u + lq[j]) / 32u);
+                    }
                 }
             }
             known_upsert(n, from, from, 63, gx, gy, links, lq, take);
