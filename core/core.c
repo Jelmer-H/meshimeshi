@@ -534,9 +534,17 @@ static void chunk_recv(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *
             lq[j] = e[8 + 3 * j + 2];
         }
         if (x == n->id && snb) {
-            /* an entry for US in the neighbour's chunk is reverse evidence
-             * (4.3): "I hear X" confirms at X both directions. */
-            snb->sym = 1; snb->ack_try = 0; snb->proven_age_us = 0;
+            /* An entry for US in a chunk is NOT confirmation on its own.
+             * Direct entries are the sender's own claims, but MAP entries
+             * are hearsay: a third node's claim propagated by the sender
+             * (the learned map diffuses, 4.3). Confirming from hearsay
+             * created false symmetric links toward nodes we cannot reach --
+             * measured: 5.7% of hop attempts went to a receiver with no
+             * working link, all 6 retries dying on the same dead hop.
+             * Reverse evidence comes exclusively from the neighbour itself
+             * (10.1): the self-entry link below (its own claim, with a
+             * measured quality), a hello ack addressed to us, an ack1 on
+             * our data, or its proof list naming us. */
         } else if (x == from) {
             /* the SENDER's own first entry: its links are the sender's
              * complete degree (4.3 node-centric), each quality being the
@@ -550,6 +558,11 @@ static void chunk_recv(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *
                          * direction is also a long-term average */
                         if (snb->quality_back == 0) snb->quality_back = lq[j];
                         else snb->quality_back = (uint8_t)(((uint32_t)snb->quality_back * 31u + lq[j]) / 32u);
+                        /* the sender's OWN link claim WITH a measured quality
+                         * is the genuine "I hear you" (4.3, 10.1): reverse
+                         * evidence. This is the only chunk path that
+                         * confirms -- its direct claim, not hearsay. */
+                        snb->sym = 1; snb->ack_try = 0; snb->proven_age_us = 0;
                     }
                 }
             }
