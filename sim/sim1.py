@@ -57,6 +57,12 @@ class Wire:
                            # default RSSI (small scenarios without a range model);
                            # False = closed world: only pairs in links exist
                            # (link budget from positions, local-net)
+    def busy(self, now, ch):
+        """Clear-to-send (design 2 / 14, open point 8): is there an
+        ongoing transmission on the channel at time now? Overlap of the
+        own transmission is impossible (the node serializes itself), so
+        this says something about the OTHERS."""
+        return any(s < now < e for s, e, _ in self.chan[ch])
     def link(self, tx_id, rx_id):
         if self.open:
             return self.links.get((tx_id, rx_id), RSSI)
@@ -329,6 +335,7 @@ class CNode(ctypes.Structure):
     pass
 
 CB = ctypes.CFUNCTYPE(None, ctypes.POINTER(CNode), ctypes.c_void_p)   # core callback (timer/switch-done)
+CTS_FN = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.POINTER(CNode), ctypes.c_uint8)
 TX_FN = ctypes.CFUNCTYPE(None, ctypes.POINTER(CNode), ctypes.c_uint8,
                          ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint16, ctypes.c_uint64)
 TIMER_FN = ctypes.CFUNCTYPE(None, ctypes.POINTER(CNode), ctypes.c_uint64,
@@ -345,7 +352,7 @@ CNode._fields_ = [
     ("ka_idle", ctypes.c_uint8 * 3),   # keepalive counters per channel (4.1)
     ("proof_wait", ctypes.c_uint8 * 3),  # flush countdown per channel (4.2)
     ("tx", TX_FN), ("timer", TIMER_FN), ("switch_ch", SWITCH_FN), ("rand", RAND_FN),
-    ("user", ctypes.c_void_p),
+    ("channel_free", CTS_FN), ("user", ctypes.c_void_p),
 ]
 
 NODES = {}   # address of mimeshi_node -> Python Node
@@ -376,10 +383,14 @@ def _switch(nptr, ch, s_us, done, ud):
 def _rand(nptr):
     return _node_of(nptr).rng.getrandbits(32)
 
+@CTS_FN
+def _channel_free(nptr, ch):
+    return not _node_of(nptr).radio.wire.busy(_node_of(nptr).radio.now, ch)
+
 def load_lib(path):
     lib = ctypes.CDLL(path)
     lib.mimeshi_init.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint16, TX_FN,
-                                 TIMER_FN, SWITCH_FN, RAND_FN, ctypes.c_void_p]
+                                 TIMER_FN, SWITCH_FN, RAND_FN, CTS_FN, ctypes.c_void_p]
     lib.mimeshi_start.argtypes = [ctypes.POINTER(CNode)]
     lib.mimeshi_rx.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint8, ctypes.c_int8,
                                ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint16]
@@ -395,7 +406,7 @@ class CCore:
         self.n, self.lib = node, lib
         self.mn = CNode()
         NODES[ctypes.addressof(self.mn)] = node
-        lib.mimeshi_init(ctypes.byref(self.mn), node.id, _tx, _timer, _switch, _rand, None)
+        lib.mimeshi_init(ctypes.byref(self.mn), node.id, _tx, _timer, _switch, _rand, _channel_free, None)
     def start(self):
         self.lib.mimeshi_start(ctypes.byref(self.mn))
     def rx(self, arg):
