@@ -57,11 +57,26 @@ typedef struct {
                                0 = only seen, one direction (4.2, 10.1) */
     uint8_t  adv_class;     /* last advertised quality class (3 bits,
                                hysteresis >= 2 steps, 4.3) */
+    uint8_t  penalty;       /* local failure counter (10.4): +1 per failed
+                              series toward this neighbour, -1 per ack1,
+                              floor 0; raises the own-edge route cost.
+                              Never transmitted. */
 } mimeshi_neighbor;
 
 typedef struct {
     uint8_t  active, tries_left, budget_left;
+    uint8_t  acked1;        /* ack1 of the own next hop is in (7.1): a
+                              forwarder now sends its ack2 and closes;
+                              the source enters the T_ack2 wait (7.3) */
+    uint8_t  alt_left;      /* remaining alternative-hop series (7.4: at
+                              most 3 neighbours per hop, so 2 after the
+                              first choice) */
+    uint8_t  excl_cnt;      /* failed next hops of THIS message (7.4:
+                              cumulative exclusion per message, no
+                              protocol field - the penalty 10.4 carries
+                              the long-term lesson) */
     uint16_t msg_id, src, dst, prev_hop, next_hop;
+    uint16_t excl[3];       /* the failed hops (7.4) */
     uint8_t  pkt[12 + MC_MAX_PAYLOAD];
     uint16_t pkt_len;
 } mimeshi_pending;

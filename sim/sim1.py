@@ -321,13 +321,17 @@ class CNeighbor(ctypes.Structure):
                 ("rev_quality", ctypes.c_uint8),
                 ("ack_try", ctypes.c_uint8), ("last_seen", ctypes.c_uint32),
                 ("proven_age_us", ctypes.c_uint64), ("alive", ctypes.c_uint8),
-                ("sym", ctypes.c_uint8)]
+                ("sym", ctypes.c_uint8), ("adv_class", ctypes.c_uint8),
+                ("penalty", ctypes.c_uint8)]
 
 class CPending(ctypes.Structure):
     _fields_ = [("active", ctypes.c_uint8), ("tries_left", ctypes.c_uint8),
-                ("budget_left", ctypes.c_uint8), ("msg_id", ctypes.c_uint16),
-                ("src", ctypes.c_uint16), ("dst", ctypes.c_uint16),
-                ("prev_hop", ctypes.c_uint16), ("next_hop", ctypes.c_uint16),
+                ("budget_left", ctypes.c_uint8), ("acked1", ctypes.c_uint8),
+                ("alt_left", ctypes.c_uint8), ("excl_cnt", ctypes.c_uint8),
+                ("msg_id", ctypes.c_uint16), ("src", ctypes.c_uint16),
+                ("dst", ctypes.c_uint16), ("prev_hop", ctypes.c_uint16),
+                ("next_hop", ctypes.c_uint16),
+                ("excl", ctypes.c_uint16 * 3),
                 ("pkt", ctypes.c_uint8 * (12 + MC_MAX_PAYLOAD)),
                 ("pkt_len", ctypes.c_uint16)]
 

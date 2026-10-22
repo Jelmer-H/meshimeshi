@@ -181,7 +181,7 @@ int main(void) {
     /* hello-ack from A toward B: exchange to B's home channel (1). The
      * hello-ack is 6 B incl. the quality byte (6.2). */
     assert(mimeshi_send_data(&B, 0x0102, (const uint8_t *)"hello mesh", 10, true) == 0);
-    pump_until(100000); /* switch (5 ms) + tx; not up to the ack1 timeout */
+    pump_until(now + 100000); /* switch (5 ms) + tx; not up to the ack1 timeout */
     /* B transmits data on A's home channel 0. */
     assert(last_ch == 0 && (last_type & 0x0F) == 5);
 
