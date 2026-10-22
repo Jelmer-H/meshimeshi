@@ -99,6 +99,7 @@ enum {
     PKT_DATA, PKT_ACK1, PKT_ACK2, PKT_ACK3, PKT_FAIL_RPT
 };
 #define F_ACK3_REQ 0x10   /* requested by the source of the message (11) */
+#define F_TAIL     0x10   /* table chunk flag: tail chunk - 2-hop entries (4.3) */
 #define F_NEG_ACK2 0x40   /* next hop could not forward (7.2) */
 
 /* little-endian reading/writing of 16-bit fields (6.1) */
@@ -442,6 +443,59 @@ static uint8_t map_age_eff(mimeshi_node *n, mimeshi_mapnode *m) {
     return (uint8_t)(a > 255 ? 255 : a);
 }
 
+
+/* Tail chunk (4.3): the 2-hop map as full entries. Same format as the
+ * prefix chunk, flagged with F_TAIL. Entries are map nodes that are NOT
+ * direct neighbours; their links come from the link store (classes per
+ * direction). The tail cycles through the periodic re-shares via
+ * tail_cursor: one tail chunk per re-share keeps the airtime bounded
+ * (4.3 rising cadence), a full tail thereby passes in a few days.
+ * Age per entry: effective age in proof ticks (4.4), capped at 255. */
+static void tail_chunk_send(mimeshi_node *n) {
+    uint8_t p[230];
+    uint16_t len = 10;
+    uint8_t cnt = 0;
+    int start = n->tail_cursor;
+    for (int k = 0; k < MC_MAP_NODES && cnt < MC_CHUNK_MAX_ENTRIES && len + 9 <= 230; k++) {
+        int i = (start + k) % MC_MAP_NODES;
+        mimeshi_mapnode *m = &n->map[i];
+        if (!m->alive) continue;
+        if (nbr_find(n, m->id)) continue;               /* direct neighbours: prefix work */
+        wr16(p + len, m->id);
+        p[len + 2] = 0;                                  /* class: no direct measurement */
+        p[len + 3] = map_age_eff(n, m);
+        wr16(p + len + 4, m->geo_lat); wr16(p + len + 6, m->geo_lon);
+        uint16_t lcnt_off = len + 8;
+        len += 9;
+        uint8_t lcnt = 0;
+        for (int j = 0; j < MC_MAP_NODES && len + 3 <= 230; j++) {
+            mimeshi_mapnode *m2 = &n->map[j];
+            if (!m2->alive || m2->id == m->id) continue;
+            uint8_t cf = lnk_class(n, m->id, m2->id);
+            if (cf == 0xFF) continue;
+            uint8_t cr = lnk_class(n, m2->id, m->id);
+            wr16(p + len, m2->id);
+            p[len + 2] = (uint8_t)((cf << 4) | (cr == 0xFF ? 0 : cr));
+            len += 3; lcnt++;
+        }
+        p[lcnt_off] = lcnt;
+        cnt++;
+        n->tail_cursor = (uint8_t)((i + 1) % MC_MAP_NODES);
+    }
+    if (cnt == 0) { n->tail_cursor = 0; return; }        /* empty tail: next time from the top */
+    p[0] = (uint8_t)(PKT_TABLE_CHUNK | F_TAIL);
+    wr16(p + 1, n->id);
+    p[3] = n->chunk_nr++;
+    p[4] = cnt;
+    wr16(p + 5, n->geo_lat); wr16(p + 7, n->geo_lon);
+    p[9] = 1;
+    for (uint8_t k = 0; k < MC_N_CHANNELS; k++) {
+        uint8_t c = (uint8_t)((n->home_ch + 1 + k) % MC_N_CHANNELS);
+        bound_send(n, c, p, len, t_data_us(len));
+        ka_called(n, c);
+    }
+}
+
 static void chunk_send(mimeshi_node *n);
 
 /* Whole prefix in one push round: mutations are urgent (4.3 cadence
@@ -606,8 +660,10 @@ static void proof_tick(mimeshi_node *n, void *ud) {
      * of the airtime of the old 10-min re-share. The per-node phase
      * offset (id mod period) spreads the moments; the random jitter
      * in the bundling window adds the fine spreading. */
-    if ((n->tick + (n->id % MC_TBL_PERIOD_TICKS)) % MC_TBL_PERIOD_TICKS == 0)
+    if ((n->tick + (n->id % MC_TBL_PERIOD_TICKS)) % MC_TBL_PERIOD_TICKS == 0) {
         tbl_mark_dirty(n);
+        tail_chunk_send(n);                    /* tail: one chunk per re-share (4.3) */
+    }
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++)          /* evidence ages per tick (4.2) */
         if (n->nbr[i].alive && n->nbr[i].proven_age_us < MC_T_SYM_US)
             n->nbr[i].proven_age_us += MC_KEEPALIVE_TICK_US;
