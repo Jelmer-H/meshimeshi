@@ -85,8 +85,9 @@ static uint64_t t_data_us(uint16_t l) { return l <= 40 ? 173000ull : l <= 150 ? 
  *   PROOF       3+2n B type, node-id(2), n x neighbour-id(2), n <= 17 (4.2).
  *                     Reactionless keepalive + symmetry flush; an empty list
  *                     is the minimal keepalive beacon (type + node-id).
- *   DATA      10+n B  type+F_ACK3_REQ, msg-id(2), source(2), destination(2),
- *                     previous-hop(2), budget(1, offset 9), payload(n)  (6.1)
+ *   DATA      12+n B  type+F_ACK3_REQ, msg-id(2), source(2), destination(2),
+ *                     previous-hop(2), budget(1, offset 9), next-hop(2,
+ *                     offset 10), payload(n)  (6.1)
  *   ACK1        7 B   type, msg-id(2), source of the message(2), sender(2) (6.2)
  *   ACK2        7 B   same as ACK1; F_NEG_ACK2 makes it negative       (6.2, 7.2)
  *   ACK3       14 B   DATA format, payload 4 B: the original msg-id (6.2, 11)
@@ -208,7 +209,7 @@ static bool dedup_fresh(mimeshi_node *n, uint16_t msg_id, uint16_t src) {
 #ifndef MC_BOUND_POOL
 #define MC_BOUND_POOL MC_MAX_PENDING
 #endif
-typedef struct { uint8_t ch; uint8_t cad_tries; uint16_t len; uint64_t airtime; uint8_t pkt[10 + MC_MAX_PAYLOAD]; } bound_ctx;
+typedef struct { uint8_t ch; uint8_t cad_tries; uint16_t len; uint64_t airtime; uint8_t pkt[12 + MC_MAX_PAYLOAD]; } bound_ctx;
 static bound_ctx bctx[MC_BOUND_POOL]; /* pool per transmission; small and fixed */
 static uint32_t bctx_drops;          /* full pool = defect, never silent */
 
@@ -1142,6 +1143,7 @@ static void ack1_timeout(mimeshi_node *n, void *ud) {
  * timeout fires too early and the attempt counts as failed. */
 static void pending_try(mimeshi_node *n, mimeshi_pending *p) {
     p->pkt[9] = p->budget_left;
+    wr16(p->pkt + 10, p->next_hop);           /* next hop in the header (6.1) */
     bound_send(n, (uint8_t)(p->next_hop % MC_N_CHANNELS), p->pkt, p->pkt_len, t_data_us(p->pkt_len));
     ka_called(n, (uint8_t)(p->next_hop % MC_N_CHANNELS));   /* data as prev_hop (4.1) */
     n->timer(n, MC_S_SWITCH_US + t_data_us(p->pkt_len) + t_ack_us() + MC_ACK1_MARGIN_US, ack1_timeout, p);
@@ -1183,8 +1185,9 @@ int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uin
     k[0] = (uint8_t)(PKT_DATA | (ack3 ? F_ACK3_REQ : 0));
     wr16(k + 1, p->msg_id); wr16(k + 3, n->id); wr16(k + 5, dst); wr16(k + 7, n->id);
     k[9] = p->budget_left;                 /* header: budget at offset 9 (section 6.1) */
-    memcpy(k + 10, payload, len);
-    p->pkt_len = (uint16_t)(10 + len);
+    wr16(k + 10, nh);                      /* next hop at offset 10 (6.1) */
+    memcpy(k + 12, payload, len);
+    p->pkt_len = (uint16_t)(12 + len);
     pending_try(n, p);
     return 0;
 }
@@ -1329,23 +1332,55 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
     }
     case PKT_DATA: {
         uint16_t msg_id = rd16(pkt + 1), src = rd16(pkt + 3), dst = rd16(pkt + 5), prev = rd16(pkt + 7);
-        if (dst != n->id) return;                  /* forwarding: next building block */
+        /* next-hop addressing (6.1): only the hop the sender chose
+         * processes the packet; other hearers on the home channel
+         * snoop (liveness, quality) - a routed unicast must not
+         * multiply. */
+        if (rd16(pkt + 10) != n->id) return;
         /* dedup before the acks: a retry of the same hop must not
-         * yield ack1/ack2/ack3 again. */
+         * yield ack1/ack2/ack3 or a new forward again. */
         if (!dedup_fresh(n, msg_id, src)) return;
-        printf("[core] node %u: DATA from %u: '%.*s'\n", n->id, src, (int)(len - 10), (const char *)(pkt + 10));
-        ack1_send(n, msg_id, src, ch, rssi);       /* same channel; quality of the data travels along */
-        ack2_send(n, msg_id, src, prev, false);    /* home channel previous hop */
-        if (flags & F_ACK3_REQ) {
-            /* ack3 as a routed message (6.2): DATA format, payload = the
-             * original msg-id (4 B incl. reservation), back toward the
-             * previous hop — until there is real routing (building
-             * block 2). */
-            uint8_t a[14] = { PKT_ACK3, 0,0, 0,0, 0,0, 0,0, 0, 0,0, 0,0 };
-            wr16(a + 1, (uint16_t)n->rand(n)); wr16(a + 3, n->id);
-            wr16(a + 5, src); wr16(a + 7, n->id); a[9] = MC_BUDGET_INIT; wr16(a + 10, msg_id);
-            bound_send(n, (uint8_t)(prev % MC_N_CHANNELS), a, 14, t_data_us(14));
-            ka_called(n, (uint8_t)(prev % MC_N_CHANNELS));   /* own call (4.1) */
+        if (dst == n->id) {
+            printf("[core] node %u: DATA from %u: '%.*s'\n", n->id, src, (int)(len - 12), (const char *)(pkt + 12));
+            ack1_send(n, msg_id, src, ch, rssi);       /* same channel; quality of the data travels along */
+            ack2_send(n, msg_id, src, prev, false);    /* home channel previous hop */
+            if (flags & F_ACK3_REQ) {
+                /* ack3 as a routed message (6.2): DATA format, payload
+                 * = the original msg-id, back toward the source - with
+                 * routing, via the first hop computation. */
+                uint16_t ah = route_next_hop(n, src);
+                if (ah) {
+                    uint8_t a[16] = { PKT_ACK3, 0,0, 0,0, 0,0, 0,0, 0, 0,0, 0,0, 0,0 };
+                    wr16(a + 1, (uint16_t)n->rand(n)); wr16(a + 3, n->id);
+                    wr16(a + 5, src); wr16(a + 7, n->id); a[9] = MC_BUDGET_INIT;
+                    wr16(a + 10, ah); wr16(a + 12, msg_id);
+                    bound_send(n, (uint8_t)(ah % MC_N_CHANNELS), a, 16, t_data_us(16));
+                    ka_called(n, (uint8_t)(ah % MC_N_CHANNELS));   /* own call (4.1) */
+                }
+            }
+            break;
+        }
+        /* forwarding (10.2, stateless per message): ack the previous
+         * hop, then recompute the own first step toward the
+         * destination. The budget bounds the chain (9); the next-hop
+         * field in the header makes the chain unambiguous (6.1). */
+        if (len < 12 || src == n->id) return;    /* malformed, or our own message echoed back */
+        uint8_t budget = pkt[9];
+        ack1_send(n, msg_id, src, ch, rssi);      /* the exchange of this hop (7.1) */
+        if (budget == 0) return;                  /* budget spent: the chain stops here */
+        uint16_t nh = route_next_hop(n, dst);
+        if (!nh) return;                          /* no routable path: the hop fails (negative ack2 / report follow in step 3) */
+        {
+            mimeshi_pending *p = 0;
+            for (int i = 0; i < MC_MAX_PENDING; i++) if (!n->pend[i].active) { p = &n->pend[i]; break; }
+            if (!p) return;                       /* no slot: cannot forward (step 3 sends the negative ack2) */
+            memset(p, 0, sizeof(*p));
+            p->active = 1; p->tries_left = MC_RETRY_TX; p->budget_left = (uint8_t)(budget - 1);
+            p->msg_id = msg_id; p->src = src; p->dst = dst; p->prev_hop = prev; p->next_hop = nh;
+            memcpy(p->pkt, pkt, len); p->pkt_len = len;
+            p->pkt[7] = (uint8_t)(n->id & 0xFF); p->pkt[8] = (uint8_t)(n->id >> 8);  /* prev hop = us */
+            printf("[core] node %u: FORWARD msg %u from %u to %u via %u\n", n->id, msg_id, src, dst, nh);
+            pending_try(n, p);
         }
         break;
     }

@@ -164,12 +164,12 @@ int main(void) {
         /* exactly one transmission of THIS data followed the "free"
          * (bound_fire transmits immediately; last_len is the data length) */
         assert(cad_tx_after_free >= 1);
-        assert(last_len == 18);                  /* 10 + 8 B payload, unswitched duplicate excluded */
+        assert(last_len == 20);                  /* 12 + 8 B payload, unswitched duplicate excluded */
         /* ack1 as a direct reply goes WITHOUT a CAD question (7.1): B
          * answers A's data on the same channel, without a switch. */
-        uint8_t dat[11] = { 5, 7,0, 0x02,0x01, 0x00,0x01, 0x00,0x01, 32, 'y' };
+        uint8_t dat[13] = { 5, 7,0, 0x02,0x01, 0x00,0x01, 0x00,0x01, 32, 0x00,0x01, 'y' };  /* next hop = B (0x0100) */
         int calls_before_ack1 = cad_calls;
-        mimeshi_rx(&B, 1, -60, dat, 11);
+        mimeshi_rx(&B, 1, -60, dat, 13);
         pump_until(now + 500000);
         assert(ack1_seen > 0 && cad_at_last_ack1 == calls_before_ack1);  /* ack1: no question */
         /* retire the test pending: no ack1 comes for it, and its retries

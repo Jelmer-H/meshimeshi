@@ -328,7 +328,7 @@ class CPending(ctypes.Structure):
                 ("budget_left", ctypes.c_uint8), ("msg_id", ctypes.c_uint16),
                 ("src", ctypes.c_uint16), ("dst", ctypes.c_uint16),
                 ("prev_hop", ctypes.c_uint16), ("next_hop", ctypes.c_uint16),
-                ("pkt", ctypes.c_uint8 * (10 + MC_MAX_PAYLOAD)),
+                ("pkt", ctypes.c_uint8 * (12 + MC_MAX_PAYLOAD)),
                 ("pkt_len", ctypes.c_uint16)]
 
 class CDedup(ctypes.Structure):

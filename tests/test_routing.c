@@ -98,6 +98,62 @@ static uint16_t chunk_build(uint8_t *ck, uint16_t owner,
     return len;
 }
 
+/* --- chain radio: four wired nodes, switch rule applied --------- */
+static uint16_t rd16p(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static mimeshi_node *f_nodes[4];
+static int f_delivered[4], f_fwd[4];
+static uint8_t f_last_ch[4];
+static void f_rx(mimeshi_node *r, uint8_t ch, const uint8_t *pkt, uint16_t len);
+static void ftx(mimeshi_node *n, uint8_t ch, const uint8_t *pkt, uint16_t len, uint64_t air) {
+    (void)air;
+    int from = -1;
+    for (int i = 0; i < 4; i++) if (f_nodes[i] == n) { from = i; break; }
+    assert(from >= 0 && len <= 230);
+    uint8_t t = pkt[0] & 0x0F;
+    f_last_ch[from] = ch;
+    if (t == PKT_DATA_VAL && len > 12 && rd16p(pkt + 5) != f_nodes[from]->id)
+        f_fwd[from]++;                        /* a DATA tx toward someone else: a forward */
+    /* the line: a packet on channel ch reaches the wired neighbours
+     * that are AT HOME there (home channel) - plus a node waiting in
+     * an exchange on that channel. */
+    static const int lk[3][2] = { {0,1}, {1,2}, {2,3} };
+    for (int k = 0; k < 3; k++) {
+        int a = lk[k][0], b = lk[k][1];
+        if (a == from && f_nodes[b]->home_ch == ch) f_rx(f_nodes[b], ch, pkt, len);
+        if (b == from && f_nodes[a]->home_ch == ch) f_rx(f_nodes[a], ch, pkt, len);
+    }
+    for (int i = 0; i < 4; i++) {
+        if (i == from || f_nodes[i]->home_ch == ch) continue;
+        for (int j = 0; j < MC_MAX_PENDING; j++)
+            if (f_nodes[i]->pend[j].active && (uint8_t)(f_nodes[i]->pend[j].next_hop % MC_N_CHANNELS) == ch) {
+                f_rx(f_nodes[i], ch, pkt, len);   /* waiting exchange partner */
+                break;
+            }
+    }
+}
+static void f_rx(mimeshi_node *r, uint8_t ch, const uint8_t *pkt, uint16_t len) {
+    if ((pkt[0] & 0x0F) == PKT_DATA_VAL && len > 12 &&
+        rd16p(pkt + 5) == r->id && rd16p(pkt + 10) == r->id) {
+        int i; for (i = 0; i < 4; i++) if (f_nodes[i] == r) break;
+        f_delivered[i]++;                      /* the destination received its DATA */
+    }
+    mimeshi_rx(r, ch, -55, pkt, len);
+}
+static void f_confirm(mimeshi_node *hs, uint16_t responder) {
+    uint8_t ha[6] = { 2, 0,0, 0,0, 0 };
+    ha[1] = (uint8_t)hs->id; ha[2] = (uint8_t)(hs->id >> 8);
+    ha[3] = (uint8_t)responder; ha[4] = (uint8_t)(responder >> 8);
+    mimeshi_rx(hs, (uint8_t)(hs->id % MC_N_CHANNELS), -55, ha, 6);
+}
+static void f_deliver(const uint8_t *pkt, uint16_t len) {
+    for (int i = 0; i < 4; i++)
+        mimeshi_rx(f_nodes[i], (uint8_t)(f_nodes[i]->id % MC_N_CHANNELS), -55, pkt, len);
+}
+static void f_data_tx_reset(void) {
+    f_delivered[0] = f_delivered[1] = f_delivered[2] = f_delivered[3] = 0;
+    f_fwd[0] = f_fwd[1] = f_fwd[2] = f_fwd[3] = 0;
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     static mimeshi_node A;
@@ -180,6 +236,47 @@ int main(void) {
     assert(data_tx == 1);
     assert(last_ch == (uint8_t)(idD % MC_N_CHANNELS));   /* C stale: D wins */
 
-    printf("routing: OK (ETX detour via C, age shift to D, refusal of the unknown and the unreachable)\n");
+    /* ------------------------------------------------------------------
+     * Test 5: forwarding over a chain (10.2 step 2). Four nodes in a
+     * line: A - B - C - D, all links confirmed symmetric and good.
+     * A sends to D; the message must run A->B->C->D, every hop with a
+     * fresh next-hop computation, and every hop acks its predecessor.
+     * The radio below wires the line and applies the switch rule. */
+    {
+        static mimeshi_node B, C, D;
+        mimeshi_node *N4[4] = { &A, &B, &C, &D };
+        uint16_t idn[4] = { 0x0200, 0x0201, 0x0202, 0x0203 };  /* homes: 2,0,1,2 */
+        extern void f_reset(void);
+        /* fresh nodes for the chain */
+        qn = 0; now = 0;
+        for (int i = 0; i < 4; i++)
+            mimeshi_init(N4[i], idn[i], ftx, sched, vrsw, vrrand, vrcad, 0);
+        f_nodes[0] = &A; f_nodes[1] = &B; f_nodes[2] = &C; f_nodes[3] = &D;
+        /* symmetric confirmations along the line: crossed hello-acks */
+        f_confirm(&A, idn[1]); f_confirm(&B, idn[0]);
+        f_confirm(&B, idn[2]); f_confirm(&C, idn[1]);
+        f_confirm(&C, idn[3]); f_confirm(&D, idn[2]);
+        /* the graph: B shares (A, C), C shares (B, D) - so A knows the
+         * path A-B-C-D, B knows B-C-D, C knows C-D */
+        uint8_t ckf[64];
+        uint16_t lf = chunk_build(ckf, idn[1], idn[0], 7, 0, idn[2], 7, 0, 0);
+        f_deliver(ckf, lf);
+        lf = chunk_build(ckf, idn[2], idn[1], 7, 0, idn[3], 7, 0, 0);
+        f_deliver(ckf, lf);
+        /* A -> D must be accepted (D is in A's graph) */
+        f_data_tx_reset();
+        assert(mimeshi_send_data(&A, idn[3], (const uint8_t *)"hop", 3, false) == 0);
+        pump_until(now + 50000000ull);      /* the whole chain: switches, hops, acks */
+        assert(f_delivered[3] == 1);        /* D delivered the DATA once */
+        assert(f_fwd[1] >= 1 && f_fwd[2] >= 1);   /* B and C each forwarded */
+        /* every pending record closed: all hops acked */
+        int act = 0;
+        for (int i = 0; i < MC_MAX_PENDING; i++) {
+            if (A.pend[i].active || B.pend[i].active || C.pend[i].active || D.pend[i].active) act++;
+        }
+        assert(act == 0);
+    }
+
+    printf("routing: OK (ETX detour via C, age shift to D, refusal of the unknown and the unreachable, chain A-B-C-D forwarded)\n");
     return 0;
 }

@@ -61,10 +61,11 @@ This document uses a number of terms that build on each other. Read this glossar
 ### Geography
 
 - **Geo:** a 4-byte position (latitude and longitude at a deliberately coarse 306 m grid). (Section 5.)
+- **Bridge node:** the graph node closest to a destination that lies outside the own graph; the intermediate target of the geo+Dijkstra rule. All nodes within 15% of its distance join as candidates. (Section 10.2.)
 - **Gabriel graph:** a way of deciding which links are needed to connect nodes around a gap, based on geometry. (Section 10.3.)
-- **Perimeter routing (GPSR):** a fallback for routing around a gap when no neighbour is closer to the destination. (Section 10.3.)
+- **Perimeter routing (GPSR):** lapsed for unicast — the bridge-node rule routes around gaps through the graph itself. (Section 10.3.)
 - **kNN radius:** the radius of a thread, set by the distance to the k-th nearest node around the starter. (Section 8.2.)
-- **Waypoint:** an intermediate geographic point that a source attaches to steer a message; it travels as an optional geo in the data header (6.1) together with the destination geo. (Section 10.2.)
+- **Waypoint:** an intermediate geographic point that a source attaches to steer a message; it travels as an optional geo in the data header (6.1) together with the destination geo, and replaces the dest geo in the bridge-node rule until a hop passes it. (Section 10.2.)
 
 ### Threads
 
@@ -254,7 +255,7 @@ The solution is the **proof list**: a small packet with the node IDs of neighbou
 - **Chunk header** (about 8 B): type, chunk number, number of nodes, and the owner geo with firmware version (4.3). The header repeats per chunk, so every chunk is self-contained. Dropped: the state version — no receiver pulls a table, and freshness travels per entry via the age encoding (4.4).
 - **Quality measurement (decided, Oct 2026): long-term average per direction.** The first measurement initialises the stored value; every subsequent reception updates it with an EWMA: `stored = (31 × stored + new value) / 32` (weight 1/32, a window of roughly half an hour of traffic). Small quality excursions are thereby damped automatically. There is no age per link: the age of a link is the age of its source, and that travels along per node entry.
 - **Reverse quality via the acks (decided, Oct 2026).** The hello ack and ack1 carry a quality byte: what the acker measured on the acked message. The sender of the original thereby learns the reverse direction of its own link immediately, without waiting for a chunk. A chunk entry also names our reverse class (its measurement of us) in its low nibble — refreshed with every chunk that names us. The chunk entry byte thereby carries both directions of the owner→neighbour link; a receiver of the chunk sees both, and the owner's own reverse knowledge comes from the acks. Measured (utrecht40, 6 h, no traffic): reverse quality known for 91% of confirmed links after 5 minutes, 100% after 6 hours; agrees with the neighbour's own measurement in 142/142 cases within one class.
-- **Quality on air (decided, Oct 2026): hybrid width per chunk.** The advertised link quality is the upper bits of the long-term average: 3 bits per direction in the prefix chunks (direct neighbours and their mutual threshold links — the links where fine-grained route choices are determined; 8 levels), 2 bits per direction in the tail chunks (tail links serve greedy direction and Gabriel witnesses, not hop selection; 4 classes per the NL calibration 14.2: bad below −2.5 dB SNR, moderate, good above +3.5 dB, excellent). The chunk header gets a flag bit for the quality width, so every chunk stays independently decodable. With 3 bits per direction (prefix) a link is 22 bits wide; with 2 bits (tail) 20 bits — both packed on a byte boundary (8 links per 22 B and 4 links per 9 B respectively). Budget: the full table thereby stays around 30 to 31 chunks, within the 32.
+- **Quality on air (decided, Oct 2026): hybrid width per chunk.** The advertised link quality is the upper bits of the long-term average: 3 bits per direction in the prefix chunks (direct neighbours and their mutual threshold links — the links where fine-grained route choices are determined; 8 levels), 2 bits per direction in the tail chunks (tail links serve bridge-node direction and Gabriel witnesses, not hop selection; 4 classes per the NL calibration 14.2: bad below −2.5 dB SNR, moderate, good above +3.5 dB, excellent). The chunk header gets a flag bit for the quality width, so every chunk stays independently decodable. With 3 bits per direction (prefix) a link is 22 bits wide; with 2 bits (tail) 20 bits — both packed on a byte boundary (8 links per 22 B and 4 links per 9 B respectively). Budget: the full table thereby stays around 30 to 31 chunks, within the 32.
 - **Tail entries carry the forwarded quality (decided, Oct 2026).** A tail entry is re-shared with the quality class its last source advertised for the link owner→entry, together with the travelled age — not with class 0. The owner of a tail entry is by definition not the measurer, but it has the measurement in its link store, and discarding it would make everything beyond the direct set unrouteable: routing (10.2) runs over the full known graph, and Dijkstra needs a cost on the far edges too. A class 0 therefore only means "no source ever reported this link". Receiver rule: a class-0 entry never overwrites a stored non-zero quality (geo and age still refresh); a non-zero class applies the existing fresh-beats-old weighing (travelled age, 4.4).
 - **Advertisement hysteresis (decided, Oct 2026): share only on difference ≥ 2.** A change in the advertised quality is only passed on when the new advertised value differs from the previous one by at least 2 steps. The average may swash over a class boundary without triggering a single packet; the advertisement hysteresis is independent of the measurement hysteresis for the neighbor table limit (10.4) — two dampers with two goals.
 - **Status flags do not travel along.** Seen/confirmed, the quality threshold and Gabriel membership are derived: the owner only sends links it has measured in both directions, and every receiver calculates threshold and Gabriel graph itself from class and geos (10.1, 10.3).
@@ -304,7 +305,7 @@ The solution is the **proof list**: a small packet with the node IDs of neighbou
 | Total size | **4 bytes** (16 + 16 bits, no flag byte) | Decided (Oct 2026) |
 | Invalid geo | Sentinel (0, 0). This decodes to (−90°, −180°), the South Pole/date-line corner, where no node ever stands. A reserved or cleared entry is therefore automatically "no geo". | Decided (Oct 2026) |
 
-**Change from the previous form (5 bytes: 18 + 18 bits + 4 flag bits).** Geo becomes 4 bytes, per neighbor table entry and in the optional source geo of every data header. The grid becomes four times coarser: 306 × 376 m in the Netherlands instead of 76 × 90 m. This is enough for all network purposes. Greedy routing (10.2), the Gabriel graph and the kNN radius work at kilometre scale, and coarser geo is better for privacy (goal 7). For display purposes, a companion keeps its precise GPS locally. The earlier goal of "about 100 m" has therefore been abandoned for the network function. The FULL root geo (6.5) already used this format.
+**Change from the previous form (5 bytes: 18 + 18 bits + 4 flag bits).** Geo becomes 4 bytes, per neighbor table entry and in the optional source geo of every data header. The grid becomes four times coarser: 306 × 376 m in the Netherlands instead of 76 × 90 m. This is enough for all network purposes. The bridge-node rule (10.2), the Gabriel graph and the kNN radius work at kilometre scale, and coarser geo is better for privacy (goal 7). For display purposes, a companion keeps its precise GPS locally. The earlier goal of "about 100 m" has therefore been abandoned for the network function. The FULL root geo (6.5) already used this format.
 
 **Precision levels are dropped as a protocol field.** There are no flag bits any more. Anyone who wants to coarsen (companions: 1 km or 10 km) sets the low bits to zero before publication. The level does not travel with the packet and cannot be inferred by receivers. This is acceptable: routing does not need it, and the display shows the published value anyway.
 
@@ -324,7 +325,10 @@ The solution is the **proof list**: a small packet with the node IDs of neighbou
 | Destination ID | 2 bytes |
 | Previous hop ID | 2 bytes |
 | Budget | 1 byte (section 9), at offset 9 of the header |
-| **Total** | **10 bytes** |
+| Next hop ID | 2 bytes, at offset 10 (decided Oct 2026, see below) |
+| **Total** | **12 bytes** |
+
+**Next hop ID (decided, Oct 2026).** A unicast travels on the home channel of the next hop, but other confirmed neighbours sit on the same home channel and hear every packet there (snooping, 4.3). Without a next-hop field a forwarder cannot tell whether a heard DATA is addressed to it: every snooping candidate would forward toward the destination, and a routed message multiplies per hop into a retransmission storm. The next hop is the one hop the sender chose (10.2); only that node processes the packet, as delivery candidate or forwarder. Other hearers treat it as snooping material (liveness, quality), exactly like table chunks. The retry and alternative-hop series (7.4) rewrite the field in place - stateless per message: each hop chooses its own next hop.
 
 Optional, present when the flag is set:
 
@@ -339,7 +343,7 @@ Optional, present when the flag is set:
 | Type | Size | Direction | Channel |
 |---|---|---|---|
 | ack1 | 8 bytes: idem + quality byte — the RSSI quality the acker measured on the data; the sender learns the reverse direction of the link in the same exchange (decided, Oct 2026) | Next hop → previous hop | Same channel as the data exchange; the sender waits there according to the switching rule |
-| ack2 | 7 bytes | Next hop → previous hop | Home channel of the previous hop |
+| ack2 | 8 bytes: idem + budget byte — the negative variant (F_NEG_ACK2) carries the **spent budget** of the message (decided, Oct 2026, 7.4): the previous hop sees how much of the 32 is left and can weigh its own alternatives against it (stop rather than try another hop against an exhausted budget). The positive variant carries the budget byte as reserved/0. | Next hop → previous hop | Home channel of the previous hop |
 | ack3 | Routed message, payload 4 bytes | Destination → source | Via routing |
 | hello ack | 6 bytes, directional: type, destination ID (the triggered sender), sender ID, quality byte — the RSSI quality the responder measured on the hello (decided, Oct 2026) | Responder → triggered sender | During a hello round: home channel of the hello sender. For a home-channel transmission of the trigger (ANN, FULL, or ack1 on its own channel): that channel itself, because the triggering sender listens there by definition. |
 | proof list | 3 + 2n bytes (n neighbour IDs, n ≤ 17): type, node ID (2), then n × 2 B | Node → all neighbours at home on that channel | Only the sub-list of neighbours at home on channel c; at most one per channel per hour (4.2). In the list = evidence refreshed, no reaction; not in the list = snooping. |
@@ -383,47 +387,49 @@ Example: A → B → C → D.
 
 1. A switches to the home channel of B, transmits, and receives ack1 there on the same channel. Then A returns to its own home channel.
 2. B tries C, at most twice. No ack1 from C: B tries D, likewise at most twice.
-3. As soon as B has received ack1 from D, it immediately sends ack2 to A, on the home channel of A.
+3. **As soon as B has received ack1 from its own next hop, it sends ack2 to A, on the home channel of A** (decided, Oct 2026, replacing the earlier "on reception" reading of 7.2). The positive ack2 therefore means: the message has come two hops — B received it AND B's own hop succeeded. B does not wait for deeper progress; C's forwarding is C's own responsibility within its retry space (7.4).
 4. A then knows the message has come two hops.
 5. D sends an ack3 to the source, if requested. That is a routed message.
 
-**Status:** decided.
+**Status:** decided (revised Oct 2026: ack2 goes out on the ack1 of the own next hop).
 
 ### 7.2 Meaning of ack2
 
-- **Positive:** the next hop has **received** the message, not necessarily forwarded it. This was a deliberate choice, so that ack2 does not have to wait for the whole chain.
-- **Negative:** the next hop could not forward the message. A can then choose a different route immediately.
+- **Positive (revised, Oct 2026):** the next hop has received the message **and its own hop has succeeded** — the ack2 goes out on the ack1 of the next hop's own next hop (7.1). Two hops of progress per ack2. Deeper progress is not covered; the hop after that carries its own responsibility within its retry space (7.4), so no ack2 has to wait for the whole chain.
+- **Negative:** the next hop could not forward the message (all series exhausted, or source-is-next-hop, 7.4). The spent budget travels along (6.2). The sender immediately recomputes and tries the next-best hop; no report about the report.
 
-**Responsibility per hop (bounded backtrack).** The node that receives the message does not store the message. It stores only a **pending record** `(message ID, previous hop, next hop, counter)` in a fixed buffer of, for example, 16–32 slots (FIFO: when full, the oldest is dropped). That record lives until `T_ack2` of its own hop expires or the retry sequence has finished. After that, only the dedup cache entry remains.
+**Responsibility per hop (bounded backtrack).** The node that receives the message does not store the message. It stores only a **pending record** `(message ID, previous hop, next hop, spent budget)` in a fixed buffer of, for example, 16–32 slots (FIFO: when full, the oldest is dropped). That record lives until its own hop is settled: positive ack2 (sent on the own next hop's ack1), negative ack2 (sent when every series failed), or the `T_ack2` timeout at the previous hop. After that, only the dedup cache entry remains.
 
 - If forwarding fails after the retries, it tries another neighbour (backtrack within the window).
 - If that also fails, or if the next hop goes down after the window, it sends a failed delivery report to the source, as a routed message. That report does not itself generate a new report.
 
 **Deliberate cost:** after a positive ack2, the source can no longer fall back to the previous hop if the failure occurs later and deeper. The only signal is then the failure report or the absence of ack3. There is therefore one return channel for late failures: the routed failure report.
 
-**Status:** decided. Late negative notifications reach the source via the routed failure report (see 10.5).
+**Status:** decided (positive meaning revised Oct 2026: two hops per ack2; negative carries the spent budget). Late negative notifications reach the source via the routed failure report (see 10.5).
 
 ### 7.3 Timeouts
 
-| Timeout | Formula | Status |
+| Timeout | Value | Status |
 |---|---|---|
 | ack1 (short) | `t_data + t_ack + processing + margin`, measured from the end of the own transmission | Decided (principle) |
-| ack2 at A | `T_ack2 = 6 × (t_data + T1) + 5 × B_max + S + t_ack + m` | Proposal |
+| ack2 (fixed) | **`T_ack2 = 15 s`** (decided, Oct 2026, replacing the old worst-case formula). After the timeout the sender treats the silence like a failed second attempt toward this neighbour: **6 units go off the budget**, and the retry structure of 7.4 takes over — next-best hop if attempts remain, otherwise the failed delivery report to the source (10.5) | Decided |
 
-- `T_ack2` does not depend on the path length, because A only looks at B. `T_ack2` is also the lifetime of the pending record at B: one timer with two functions (timeout at A, and the window for backtrack at B).
-- `S` is the channel switch from the channel of the next hop back to the home channel of A.
-- If B itself fails, no ack1 comes. A notices this at the ack1 timeout.
-- If B exhausts all six attempts, it immediately sends a negative ack2.
+- `T_ack2` does not depend on the path length, because the sender only looks at its own next hop. The fixed 15 s covers the worst case of the next hop's own series: 3 neighbours × 2 attempts with 2 s + jitter between each pair (7.4), plus the ack2 transmission itself.
+- If the next hop itself fails, no ack1 comes. The sender notices this at the ack1 timeout — that is the fast signal; `T_ack2` is only about the *slow* failure (next hop received, but its own forwarding stalls beyond every retry).
+- A negative ack2 arrives well before the timeout in every normal failure case; the timeout is the safety net, not the primary mechanism.
 
 ### 7.4 Retries
 
-- At most three neighbours per hop.
+- At most three neighbours per hop: the first next hop from the normal route computation (10.2), then at most two alternatives.
 - At most two transmission attempts per neighbour.
+- **Wait between the two attempts toward the same neighbour: 2 s + random 0..1000 ms** (decided, Oct 2026). The wait is the collision damper: a busy channel gets seconds of rest before the same hop is tried again. It applies only between the two attempts of one series; after a failed series the next neighbour follows immediately (new computation, then transmit) - no extra wait.
+- **Alternative hops: recompute with the failed links excluded.** After a failed series the route computation runs again, with all links that failed for this message excluded so far - cumulatively: at the third neighbour, the first two failed links stay excluded. Per message, so the exclusion costs no protocol field; the penalty (10.4) carries the long-term lesson into future messages.
+- **Source-is-next-hop: fail immediately.** If the recomputation says the best next hop is the previous hop (the message would travel back), the route has no forward option left. Then the node stops retrying immediately and sends a negative ack2 with the spent budget, without further attempts.
 - Ack1 received but no ack2: switch to the next neighbour.
-- Negative ack2: move to the next neighbour immediately, without waiting.
-- Between attempts to the same neighbour, a random wait longer than the airtime of the next packet.
+- Negative ack2 from the next hop: move to the next neighbour immediately, without waiting.
+- **Retry reception is acked (decided, Oct 2026):** a received transmission that is a duplicate (dedup hit) gets an ack1 anyway, on the channel it arrived on. The most likely reason for the retry is a lost ack1, not a lost data packet; silence would make the sender declare the link dead and detour - an alternative-hop series costs far more airtime than the 8 B ack1. Dedup still gates the processing: a duplicate is not delivered or forwarded again.
 
-**Status:** decided.
+**Status:** decided (series structure, wait, cumulative exclusion, source-is-next-hop, retry acking).
 
 ---
 
@@ -547,35 +553,51 @@ Routing is **stateless per message**: the path is not in the header, every hop r
 
 | Situation | Rule | Status |
 |---|---|---|
-| Destination in the known graph | Shortest route on ETX-like quality, computed on the known graph | Decided |
-| Destination outside the graph, geo known (source geo, dest geo in the header, or waypoint) | Greedy: the neighbour with the best quality that is closer to the destination | Decided |
-| No neighbour closer (gap, "void") | Fallback: waypoint or perimeter (see 10.3) | Proposal |
-| Destination unknown (ID only) | Do not flood. Wait until the graph contains the destination, or return a negative report | Decided |
+| Destination in the known graph | Shortest route on ETX-like quality, computed on the known graph (Dijkstra, below) | Decided |
+| Destination outside the graph, dest geo known | **Bridge-node rule (decided, Oct 2026):** combine geo and Dijkstra — see below | Decided |
+| Destination unknown (ID only, no dest geo) | Do not flood. Wait until the graph contains the destination, or return a negative report | Decided |
 
 **Shortest route on the known graph (worked out, Oct 2026).** The hop computation is a Dijkstra over the known graph with the own node as source and the destination as target. Edges:
 
 - The **first step must be a confirmed direct neighbour** (10.1): only edges from the own node run over the neighbor table, and only over links that are confirmed symmetric. This is the hard requirement; everything after the first hop is knowledge, not authority.
 - **Further edges run over the link store** (4.3): advertised links between map nodes, with the advertised quality class per direction. A link is only used when both directions are above the quality threshold and the effective age (4.4) of both endpoints is below expiry; expired entries are map material, not route material.
-- **Cost per edge: an ETX-like value from the quality class.** The cost table is indexed on the advertised class (prefix 3 bits, tail 2 bits); the exact values are a firmware constant and a simulation parameter. Directly measured links (own neighbor table with `quality` and `rev_quality`) are more precise than the advertised classes; the own edges therefore use the measurement, everything beyond it the class table. Proposal, Oct 2026: cost = 1/p with p derived per class, so that a link of the best class costs 1.0 and each class step roughly halves p; the tail's coarse 2-bit classes map onto the wider cost range of the prefix classes they approximate.
+- **Cost per edge: an ETX-like value from the quality class.** The cost of one link is the expected number of transmissions: cost = 1/p, with p the per-transmission success probability of the link. The route cost is the sum over the path, so Dijkstra minimises the expected total airtime of the message. The quality travels on air only as a class (prefix 3 bits = 8 classes, tail 2 bits = 4 classes), so the cost is a lookup table indexed on the class. Directly measured links (own neighbor table with `quality` and `rev_quality`) are more precise than the advertised classes; the own edges therefore use the measurement, everything beyond it the class table.
+- **Cost table (decided, provisional, Oct 2026 — to be calibrated by the load simulation).** Start values, integer scale ×16 (cost 1.0 = 16), per class step p falls by roughly ×0.66 (cost ×1.5):
+
+  | class | 7 | 6 | 5 | 4 | 3 | 2 | 1 | 0 |
+  |---|---|---|---|---|---|---|---|---|
+  | p | 0.80 | 0.55 | 0.37 | 0.25 | 0.17 | 0.11 | 0.07 | — |
+  | cost (x16) | 20 | 29 | 43 | 64 | 94 | 145 | 228 | not routable |
+
+  The tail's coarse 2-bit classes map onto the same scale at classes 2, 4, 5 and 7. Class 0 (never reported / below threshold) is not routable.
 - **Penalty (10.4) is a local addition on the own edges only:** the cost toward a penalised neighbour rises, so the route computation avoids the neighbour without a protocol field.
 
 The result of the computation is one next hop; the message carries no more than that. Hops deeper in the graph recompute with their own, fresher knowledge. A route that is locally suboptimal on paper (for example through a slightly older tail entry) is accepted: the age weighing (4.4) already discounts stale information, and the alternative — route errors and path state — costs more airtime than it saves.
 
-**Destination outside the graph, greedy with destination geo (worked out, Oct 2026).** Greedy routing needs the geo of the destination at every hop, and only the source reliably has it in its graph. The base header (6.1) therefore gets a second optional geo: **destination geo, 4 bytes, flag in the type byte**, next to the existing source geo. The source attaches the dest geo when it is known (own graph, or the client supplied it); without it, a destination outside the graph is unreachable and the message waits or gets a negative report. A forwarder keeps the dest geo standing in the header, so the greedy chain holds until the destination enters someone's graph and the shortest-route rule takes over. Nodes inside the graph are also routed greedily when their geo is fresher than the stored entry; the header geo is always the most recent measurement of the source.
+**Destination outside the graph: the bridge-node rule (decided, Oct 2026).** When the destination is not in the own known graph but its geo is known, geo and Dijkstra cooperate in two steps:
 
-**Waypoints.** The source can attach an intermediate point, for example the geo of a repeater on the Afsluitdijk. This is stateless and cheap: the waypoint replaces the destination geo for the greedy rule until a hop is closer to the waypoint than the margin, after which the real dest geo (which must then also be in the header) takes over. A waypoint therefore always costs 8 bytes: 4 for the waypoint plus 4 for the dest geo.
+1. **Bridge node:** find the graph node closest to the destination geo (distance in the 16-bit grid of section 5). All nodes within **15% of that minimum distance** join the candidate set (decided: the margin grows with the absolute distance, so far from the destination there is more freedom to pick a better path; at 30 km that is 4.5 km of play along the ideal line).
+2. **Dijkstra decides:** among the candidate set, the next hop follows from the shortest-route computation above — the candidate with the best route cost wins. The next hop itself does **not** have to lie closer to the destination: it lies on the shortest path *toward the bridge node*, and that path may start sideways or even backwards (around a lake, along a dam). Every void-perimeter problem of pure greedy routing disappears here, as long as there is any path material toward the bridge node in the graph.
 
-**Status:** shortest route and greedy decided; cost table, penalty parameters and waypoint margin are simulation parameters (open).
+Every hop recomputes: as soon as the destination (or a node that knows it) enters someone's graph, the shortest-route rule takes over — the bridge node is per-hop and local, so no header field and no state. This replaces the earlier pure-greedy rule and its waypoint/perimeter fallback for the routed case; perimeter routing (10.3) lapses for unicast and remains only as a possible later tool.
 
-### 10.3 Perimeter routing (later)
+**Destination geo in the header (decided).** The bridge-node rule needs the dest geo at every hop, and only the source reliably has it. The base header (6.1) therefore gets a second optional geo: **destination geo, 4 bytes, flag**, next to the existing source geo. **The source attaches the dest geo whenever it is known** — not only when the destination lies outside its own graph: the source cannot know what the hops further on still have in their graphs. A forwarder keeps the dest geo standing in the header. Without a dest geo, a destination outside the graph is unreachable: wait or negative report.
+
+**Waypoints** remain possible (proposal): a waypoint replaces the dest geo in the bridge-node rule until a hop passes it; 8 bytes total (waypoint + dest geo together).
+
+**Age in the route cost (decided, Oct 2026).** Stale knowledge must lose against fresh knowledge inside the computation, not only by the receiver-side weighing of 4.4. Edges therefore get an age multiplier on the effective age (4.4) of their endpoints: under half of `T_active` (~6 h) the plain class cost, above that ×1.5, and above `T_active` itself (12–24 h, map material only) ×3 — as a last resort, only when nothing fresher exists. The first-step symmetry requirement (10.1) applies unchanged. The multiplier boundaries follow `T_active` (12 h), not `T_expire` (4 h, neighbor-table only). Parameters to be measured in simulation.
+
+**Computation budget (decided, Oct 2026).** The route computation runs **per message**, not per tick with a cache: 256 map nodes and ~1.5 k links are small enough for an MCU, and per-message computation reacts to table mutations immediately. The bridge-node search is a linear scan over the map (256 distance computations), not a second Dijkstra. A route cache over all destinations remains a quiet-period option (open point 15) if simulation shows CPU problems — not before.
+
+**Status:** bridge-node rule, 15% margin, dest-geo-in-header, age multiplier, per-message computation and the provisional cost table decided (Oct 2026). Cost table values, age multiplier boundaries and the waypoint margin are to be calibrated by the load simulation. Perimeter routing (10.3) lapses for unicast.
+
+### 10.3 Perimeter routing (lapsed for unicast)
 
 - Basis: GPSR-like perimeter mode.
-- The Gabriel graph is calculated on the known links. A link between u and v remains if there is no witness w within the circle with diameter uv.
-- Witnesses almost always lie within the known graph, because the circle falls within radio range.
-- A packet in perimeter mode carries ten extra bytes: the geo of the perimeter's starting point and the last face change.
-- Limitation: the graph is bounded (256 nodes) and the tail is less fresh than the prefix (4.3). The perimeter around a gap can therefore be incomplete. This must be tested in simulation, for example around the IJsselmeer.
+- **Lapsed for unicast (decided, Oct 2026):** the bridge-node rule (10.2) routes around gaps through the graph itself — Dijkstra finds the path toward the bridge node even when it starts sideways or backwards, so the void problem that perimeter was meant to solve no longer exists for routed unicast. Perimeter mode is retained only as a possible later tool for other purposes (for example broadcast spreading), not for the unicast path.
+- The Gabriel graph remains useful as a local computation on the known links (a link between u and v remains if no witness w lies within the circle with diameter uv).
 
-**Status:** later. First waypoints and failed delivery reports. Perimeter only if the simulation requires it.
+**Status:** lapsed for unicast. Revisit only if simulation shows a gap the bridge-node rule cannot route around (no path material at all toward the bridge node).
 
 ### 10.4 Penalty and recovery
 
@@ -687,7 +709,7 @@ The result of the computation is one next hop; the message carries no more than 
 1. Radio and channel: airtime, path loss, capture effect, duty cycle.
 2. Hello and neighbor table.
 3. Data, ack1, ack2, retries and budget.
-4. Routing: map, greedy, failed reports.
+4. Routing: map, bridge-node rule (geo+Dijkstra), failed reports.
 5. Gaps and perimeter (IJsselmeer).
 6. Threads: radius, pruning, ANN/FULL, recovery.
 7. Churn: outages and returns.

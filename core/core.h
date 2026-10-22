@@ -62,7 +62,7 @@ typedef struct {
 typedef struct {
     uint8_t  active, tries_left, budget_left;
     uint16_t msg_id, src, dst, prev_hop, next_hop;
-    uint8_t  pkt[10 + MC_MAX_PAYLOAD];
+    uint8_t  pkt[12 + MC_MAX_PAYLOAD];
     uint16_t pkt_len;
 } mimeshi_pending;
 
