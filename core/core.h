@@ -26,6 +26,10 @@
 #define MC_MAP_NODES    256             /* bounded 2-hop map (13.2, 13.3) */
 #define MC_MAX_LINKS   1536            /* link store: links between map nodes (13.2) */
 #define MC_T_SYM_US      21600000000ull  /* 6 h: validity of confirmed symmetry (4.2) */
+#define MC_T_EXPIRE_TICKS 257u           /* ~4 h in proof ticks: neighbour-table expiry (4.4) */
+#define MC_T_ACTIVE_TICKS 771u           /* ~12 h: map entry stays fully usable (4.4); ~2
+                                            re-shares, so a live node with at least one
+                                            neighbour never falls below this */
 #define MC_SYM_MARGIN_US  7200000000ull  /* 2 h flush margin (4.2) */
 
 /* ---------------- internal types (visible for fixed allocation) ---- */

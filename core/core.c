@@ -101,6 +101,7 @@ enum {
 #define F_ACK3_REQ 0x10   /* requested by the source of the message (11) */
 #define F_TAIL     0x10   /* table chunk flag: tail chunk - 2-hop entries (4.3) */
 #define F_DELTA    0x20   /* table chunk flag: delta - one changed entry (4.3) */
+#define F_NEG      0x40   /* table chunk flag: negative delta - one entry gone (4.4) */
 #define F_NEG_ACK2 0x40   /* next hop could not forward (7.2) */
 
 /* little-endian reading/writing of 16-bit fields (6.1) */
@@ -343,6 +344,29 @@ static void proof_fire(mimeshi_node *n, void *ud) {
  * class). Both are bounded (13.2): full = the entry is dropped with a
  * message, never silently. */
 
+/* Effective age of a map entry in full proof ticks (~56 s each),
+ * uncapped for internal comparisons (4.4); on air the age byte caps at
+ * 255 (~4 h) - anything older advertises simply as expired. */
+static uint32_t map_age_ticks(mimeshi_node *n, mimeshi_mapnode *m) {
+    return (uint32_t)m->age_ticks + (n->tick - m->arrived_tick);
+}
+
+/* Age byte for the air: capped at 255 (~4 h = expired, 4.4). */
+static uint8_t map_age_eff(mimeshi_node *n, mimeshi_mapnode *m) {
+    uint32_t a = map_age_ticks(n, m);
+    return (uint8_t)(a > 255 ? 255 : a);
+}
+
+/* Eviction of a map entry (4.4): the entry goes, and with it every
+ * stored link that touches it - the link store stays consistent with
+ * the map, and a link is only usable while both endpoints stand. */
+static void map_evict(mimeshi_node *n, mimeshi_mapnode *m) {
+    for (int i = 0; i < MC_MAX_LINKS; i++)
+        if (n->lnk[i].alive && (n->lnk[i].a == m->id || n->lnk[i].b == m->id))
+            n->lnk[i].alive = 0;
+    m->alive = 0;
+}
+
 static mimeshi_mapnode *map_find(mimeshi_node *n, uint16_t id) {
     for (int i = 0; i < MC_MAP_NODES; i++)
         if (n->map[i].alive && n->map[i].id == id) return &n->map[i];
@@ -360,8 +384,26 @@ static mimeshi_mapnode *map_add(mimeshi_node *n, uint16_t id) {
             n->map[i].arrived_tick = n->tick;
             return &n->map[i];
         }
-    printf("[core] node %u: map full, entry %u dropped\n", n->id, id);
-    return 0;
+    /* pool full (4.4): recycle the LEAST FRESH entry - never the
+     * newest; the freshest knowledge is the routing capital. */
+    int victim = -1; uint32_t worst = 0;
+    for (int i = 0; i < MC_MAP_NODES; i++) {
+        if (!n->map[i].alive) continue;
+        /* direct neighbours never: they live in the prefix */
+        if (nbr_find(n, n->map[i].id)) continue;
+        uint32_t a = map_age_ticks(n, &n->map[i]);
+        if (a > worst) { worst = a; victim = i; }
+    }
+    if (victim < 0) {                            /* only direct neighbours in the map */
+        printf("[core] node %u: map full, entry %u dropped\n", n->id, id);
+        return 0;
+    }
+    map_evict(n, &n->map[victim]);
+    n->map[victim].alive = 1; n->map[victim].id = id;
+    n->map[victim].geo_lat = 0; n->map[victim].geo_lon = 0;
+    n->map[victim].quality = 0; n->map[victim].age_ticks = 255;
+    n->map[victim].arrived_tick = n->tick;
+    return &n->map[victim];
 }
 
 /* Link between two map nodes, endpoints normalized a < b. */
@@ -466,12 +508,6 @@ static void lnk_set_class(mimeshi_node *n, uint16_t from, uint16_t to, uint8_t c
     else           l->q = (uint8_t)((l->q & 0xF0) | cls);
 }
 
-/* Effective age of a map entry in proof ticks (~56 s), capped at 255
- * (= ~4 h, expired, 4.4). */
-static uint8_t map_age_eff(mimeshi_node *n, mimeshi_mapnode *m) {
-    uint32_t a = (uint32_t)m->age_ticks + (n->tick - m->arrived_tick);
-    return (uint8_t)(a > 255 ? 255 : a);
-}
 
 
 /* Delta chunk (4.3): a single changed entry, for neighbour
@@ -501,6 +537,31 @@ static void delta_send(mimeshi_node *n, uint16_t id) {
     for (uint8_t k = 0; k < MC_N_CHANNELS; k++) {
         uint8_t c = (uint8_t)((n->home_ch + 1 + k) % MC_N_CHANNELS);
         bound_send(n, c, p, 20, t_data_us(20));
+        ka_called(n, c);
+    }
+}
+
+/* Negative delta (4.4): one entry gone. Same shape as the delta, but
+ * the entry id names the dead neighbour; a receiver deletes the
+ * link-owner -> dead node from its store (links between others stay:
+ * a different source may still carry them). Expire-then-silence is the
+ * normal removal (4.4: no tombstone); the negative delta only makes
+ * the routing core adapt within minutes. */
+static void delta_neg_send(mimeshi_node *n, uint16_t id) {
+    uint8_t p[20];
+    p[0] = (uint8_t)(PKT_TABLE_CHUNK | F_DELTA | F_NEG);
+    wr16(p + 1, n->id);
+    p[3] = n->chunk_nr++;
+    p[4] = 1;
+    wr16(p + 5, n->geo_lat); wr16(p + 7, n->geo_lon);
+    p[9] = 1;
+    wr16(p + 10, id);
+    p[12] = 0; p[13] = 255;                        /* no classes; age 255 = expired */
+    wr16(p + 14, 0); wr16(p + 16, 0);              /* no geo */
+    p[18] = 0;                                     /* no links */
+    for (uint8_t k = 0; k < MC_N_CHANNELS; k++) {
+        uint8_t c = (uint8_t)((n->home_ch + 1 + k) % MC_N_CHANNELS);
+        bound_send(n, c, p, 19, t_data_us(19));
         ka_called(n, c);
     }
 }
@@ -652,6 +713,16 @@ static void tbl_push_fire(mimeshi_node *n, void *ud) {
 static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t len) {
     if (len < 10) return;
     uint16_t owner = rd16(pkt + 1);
+    if (pkt[0] & F_NEG) {                     /* negative delta (4.4): one entry gone */
+        if (len >= 19) {
+            uint16_t dead = rd16(pkt + 10);
+            mimeshi_link *l = lnk_find(n, owner, dead);
+            if (l) l->alive = 0;              /* the owner->dead link disappears here */
+            /* the map entry itself stays: a different source may still
+             * carry the node; its own age decides whether it expires */
+        }
+        return;
+    }
     uint8_t n_ent = pkt[4];
     mimeshi_mapnode *om = map_add(n, owner);
     if (om) {
@@ -710,9 +781,44 @@ static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t 
     }
 }
 
+static void nbr_expire(mimeshi_node *n);
+
+/* Death detection (4.4): every identifying reception refreshes
+ * last_seen; per proof tick it ages. At T_expire (~4 h) the neighbour
+ * is dead: the entry disappears from our table (no tombstone, 4.4),
+ * which means it also disappears from every chunk and proof list we
+ * send - silence propagates the removal. A negative delta (F_NEG)
+ * announces the removal to the neighbours immediately: the routing
+ * core adapts within minutes instead of waiting for the rounds. */
+static void nbr_expire(mimeshi_node *n) {
+    for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
+        mimeshi_neighbor *nb = &n->nbr[i];
+        if (!nb->alive) continue;
+        if (nb->last_seen < 0xFFFF) nb->last_seen++;
+        if (nb->last_seen >= MC_T_EXPIRE_TICKS) {
+            uint16_t dead_id = nb->id;
+            nb->alive = 0; nb->sym = 0; nb->ack_try = 0;
+            nb->quality = 0; nb->rev_quality = 0; nb->proven_age_us = 0;
+            tbl_mark_dirty(n);              /* the prefix loses the entry (4.3) */
+            delta_neg_send(n, dead_id);     /* negative delta: link gone (4.4) */
+            printf("[core] node %u: neighbour %u expired after ~4 h of silence\n", n->id, dead_id);
+        }
+    }
+}
+
 static void proof_tick(mimeshi_node *n, void *ud) {
     (void)ud;
     n->tick++;                                 /* local time base, ~56 s per tick (4.4) */
+    nbr_expire(n);                             /* death detection (4.4) */
+    /* map aging (4.4): an entry nobody has refreshed anymore dies at
+     * 2 x T_active (~24 h) - after that it is stale beyond every
+     * cadence and only takes pool space from fresher knowledge. */
+    for (int i = 0; i < MC_MAP_NODES; i++) {
+        if (!n->map[i].alive) continue;
+        if (nbr_find(n, n->map[i].id)) continue;           /* prefix work */
+        if (map_age_ticks(n, &n->map[i]) >= 2 * MC_T_ACTIVE_TICKS)
+            map_evict(n, &n->map[i]);
+    }
     /* Periodic prefix re-share (4.3): without traffic there are no
      * mutations, and a chunk missed by a neighbour (collision, away
      * from home) would then never return. Every MC_TBL_PERIOD_TICKS

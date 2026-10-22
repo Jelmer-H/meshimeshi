@@ -289,7 +289,7 @@ The solution is the **proof list**: a small packet with the node IDs of neighbou
 - Removal through silence does **not** use a tombstone.
 - The number of tombstones is limited by the memory budget.
 
-**Status:** proposal for `T_expire` and the age encoding (to be tested in scenario 5). Tombstone duration decided.
+**Status:** implemented (Oct 2026): `T_expire` ~4 h via last_seen aging per proof tick; death removes the neighbour entry without a tombstone and fires a negative delta chunk (F_NEG, 19 B) so the routing core adapts within minutes. Age travels per node entry (links inherit, no per-link age on air); effective age = advertised age + local ticks, capped at 255 (~4 h) on air. Map entries age out at 2 x T_active (~24 h) and the pool recycles least-fresh-first; links die with their endpoints. Death measured (utrecht40, node silenced after 24 h): sym gone network-wide within ~4-6 h, map empty within ~24-30 h.
 
 ---
 
