@@ -93,6 +93,7 @@ static uint32_t vrrand(mimeshi_node *n) { (void)n; return 42u; }
 
 
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
     static mimeshi_node A, B;
     qn = 0; now = 0;
 
@@ -121,6 +122,29 @@ int main(void) {
     uint8_t helloA[3] = { 1, 0x02, 0x01 };       /* PKT_HELLO from 0x0102 */
     mimeshi_rx(&B, 1, -60, helloA, 3);
     pump_until(1000000);
+
+    /* Assert 4: a neighbor learned via hello stands at "seen": one
+     * direction, symmetry not yet proven (4.2). B knew A from the
+     * injected hello. */
+    {
+        int seen = 0;
+        for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
+            if (B.nbr[i].alive && B.nbr[i].id == 0x0102) seen = B.nbr[i].sym;
+        assert(seen == 0);
+    }
+
+    /* Routing (10.1/10.2): a unicast goes only over confirmed
+     * symmetric links. A hello proves one direction; the hello-ack
+     * addressed to us proves the other (4.2). Give B that proof
+     * before the unicast tests. */
+    uint8_t hackA[6] = { 2, 0x00,0x01, 0x02,0x01, 0 };  /* hello-ack from A (0x0102) to B (0x0100) */
+    mimeshi_rx(&B, 1, -60, hackA, 6);
+    {
+        int sym = 0;
+        for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
+            if (B.nbr[i].alive && B.nbr[i].id == 0x0102) sym = B.nbr[i].sym;
+        assert(sym == 1);                     /* confirmed via the hello-ack */
+    }
 
     /* Assert 2b: CAD (2). A bound transmission asks
      * about the channel after the switch and waits with backoff on
@@ -160,16 +184,6 @@ int main(void) {
     pump_until(100000); /* switch (5 ms) + tx; not up to the ack1 timeout */
     /* B transmits data on A's home channel 0. */
     assert(last_ch == 0 && (last_type & 0x0F) == 5);
-
-    /* Assert 4: a neighbor learned via hello stands at "seen": one
-     * direction, symmetry not yet proven (4.2). B knew A from the
-     * injected hello. */
-    {
-        int seen = 0;
-        for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
-            if (B.nbr[i].alive && B.nbr[i].id == 0x0102) seen = B.nbr[i].sym;
-        assert(seen == 0);
-    }
 
     /* Assert 5: a received ack1 confirms the symmetry of the sender
      * (4.2): the neighbor received our message and its ack reached us.

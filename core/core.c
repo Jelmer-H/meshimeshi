@@ -508,6 +508,126 @@ static void lnk_set_class(mimeshi_node *n, uint16_t from, uint16_t to, uint8_t c
     else           l->q = (uint8_t)((l->q & 0xF0) | cls);
 }
 
+/* ---------------- route computation (10.2, building block 2) ------
+ * Stateless per message: no path in the header, every hop computes its
+ * own first step on the own known graph. Cost model (decided, Oct
+ * 2026): ETX per link = 1/p on the integer scale x16, one lookup table
+ * indexed on the advertised quality class; the route cost is the sum
+ * over the path, so the computation minimises the expected number of
+ * transmissions. Age multiplier (10.2): an endpoint above half of
+ * T_active makes the edge 1.5x as expensive, above T_active itself
+ * 3x - stale knowledge loses against fresh. First step (hard
+ * requirement, 10.1): only confirmed symmetric neighbours above the
+ * quality threshold. */
+#define MC_ROUTE_SCALE 16u                /* cost 1.0 (10.2) */
+static const uint16_t mc_etx_class[8] = {
+    0,                                /* class 0: not routable (10.2) */
+    228, 145, 94, 64, 43, 29, 20      /* classes 1..7: cost x16 (10.2 table) */
+};
+
+/* Age multiplier on an edge endpoint: follows the effective age of the
+ * map entry (4.4), in proof ticks (~56 s). Returns 2 = 1.5x, 3 = 3x. */
+static uint16_t route_age_mult(uint32_t age) {
+    if (age >= MC_T_ACTIVE_TICKS) return 3;
+    if (age >= MC_T_ACTIVE_TICKS / 2) return 2;
+    return 0;
+}
+
+static uint32_t mult_apply(uint32_t c, uint16_t m) {
+    if (m == 3) return c * 3;
+    if (m == 2) return c * 3 / 2;
+    return c;
+}
+
+/* Cost of the own edge toward a confirmed neighbour: the measured
+ * quality class (finer than the advertised classes), with the age
+ * addition of the map entry when we have one. Penalty (10.4) follows
+ * in a later building step. */
+static uint32_t route_edge_own(mimeshi_node *n, mimeshi_neighbor *nb) {
+    uint8_t cls = adv_class_of(nb->quality);
+    uint32_t c = (cls < 8 && mc_etx_class[cls]) ? mc_etx_class[cls] : MC_ROUTE_SCALE;
+    mimeshi_mapnode *m = map_find(n, nb->id);
+    if (m) c = mult_apply(c, route_age_mult(map_age_ticks(n, m)));
+    return c;
+}
+
+/* Dijkstra scratch: bounded like the map (13.2); static because the
+ * core has no heap and is single-threaded per node (13b). */
+#define MC_DIST_INF 0x7FFFFFFFu
+static uint32_t r_dist[MC_MAP_NODES];
+static uint16_t r_prev[MC_MAP_NODES];   /* predecessor map slot; 0xFFFE = own edge */
+static uint8_t  r_done[MC_MAP_NODES];
+
+static int r_idx(mimeshi_node *n, uint16_t id) {
+    for (int i = 0; i < MC_MAP_NODES; i++)
+        if (n->map[i].alive && n->map[i].id == id) return i;
+    return -1;
+}
+
+/* The first hop toward dst on the own known graph, or 0 when dst is
+ * unreachable. The first step runs only over confirmed symmetric
+ * neighbours above the quality threshold (10.1); further edges run
+ * over the link store, direction of travel known, endpoints not
+ * expired (4.4). A confirmed direct neighbour is its own first hop
+ * even without a map slot: it is the destination itself. */
+static uint16_t route_next_hop(mimeshi_node *n, uint16_t dst) {
+    if (dst == n->id) return n->id;
+    int di = r_idx(n, dst);
+    /* A direct neighbour is NOT its own first hop by definition: its
+     * own edge competes in the computation like every other edge, and
+     * two good hops beat one bad hop (10.2, ETX). But a confirmed
+     * neighbour without a map slot must still be able to WIN that
+     * competition when it is the destination itself - otherwise a
+     * fresh symmetric neighbour is unreachable until its chunk
+     * arrives (measured: 'no candidate hop' losses under load). */
+    mimeshi_neighbor *dnb = nbr_find(n, dst);
+    int direct_ok = (dnb && dnb->sym && quality_ok(dnb->quality));
+    if (di < 0) {
+        if (direct_ok) return dst;              /* the only edge toward it is the own one */
+        return 0;                                /* not in the graph: no flood (10.2) */
+    }
+    for (int i = 0; i < MC_MAP_NODES; i++) { r_dist[i] = MC_DIST_INF; r_prev[i] = 0xFFFF; r_done[i] = 0; }
+    for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {           /* own edges (virtual start) */
+        mimeshi_neighbor *nb = &n->nbr[i];
+        if (!nb->alive || !nb->sym || !quality_ok(nb->quality)) continue;
+        int bi = r_idx(n, nb->id);
+        if (bi < 0) continue;                     /* no map slot: no further edges */
+        uint32_t c = route_edge_own(n, nb);
+        if (c < r_dist[bi]) { r_dist[bi] = c; r_prev[bi] = 0xFFFE; }
+    }
+    for (;;) {
+        int u = -1;
+        for (int i = 0; i < MC_MAP_NODES; i++)
+            if (!r_done[i] && r_dist[i] < MC_DIST_INF && (u < 0 || r_dist[i] < r_dist[u])) u = i;
+        if (u < 0 || u == di) break;              /* nothing left, or target settled */
+        r_done[u] = 1;
+        uint16_t mult_u = route_age_mult(map_age_ticks(n, &n->map[u]));
+        for (int j = 0; j < MC_MAX_LINKS; j++) {           /* relax the edges of map[u] */
+            mimeshi_link *l = &n->lnk[j];
+            if (!l->alive) continue;
+            uint16_t from = n->map[u].id;
+            if (l->a != from && l->b != from) continue;
+            uint8_t cf = (l->a == from) ? (uint8_t)((l->q >> 4) & 0x0F) : (uint8_t)(l->q & 0x0F);
+            if (cf == 0) continue;                          /* direction of travel unknown */
+            uint32_t c = mc_etx_class[cf & 7];
+            if (!c) continue;
+            c = mult_apply(c, mult_u);                     /* stale endpoint u */
+            uint16_t o = (l->a == from) ? l->b : l->a;
+            int oi = r_idx(n, o);
+            if (oi < 0 || r_done[oi]) continue;
+            c = mult_apply(c, route_age_mult(map_age_ticks(n, &n->map[oi])));
+            if (r_dist[u] + c < r_dist[oi]) { r_dist[oi] = r_dist[u] + c; r_prev[oi] = (uint16_t)u; }
+        }
+    }
+    if (r_dist[di] >= MC_DIST_INF) return 0;     /* unreachable in the graph */
+    int cur = di;                                 /* walk back to the own edge */
+    while (r_prev[cur] != 0xFFFE) {
+        cur = r_prev[cur];
+        if (cur == 0xFFFF) return 0;
+    }
+    return n->map[cur].id;
+}
+
 
 
 /* Delta chunk (4.3): a single changed entry, for neighbour
@@ -1043,7 +1163,14 @@ static void pending_try(mimeshi_node *n, mimeshi_pending *p) {
  * sending is bounded by retries+budget and fails visibly on the ack1
  * timeout. */
 int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uint16_t len, bool ack3) {
-    if (!nbr_find(n, dst)) return -1;          /* not in the map: do not flood (10.2) */
+    /* routing (10.2): the first hop follows from the own known graph -
+     * a direct neighbour only when its link is confirmed symmetric
+     * (10.1), otherwise the computation decides. Not in the graph:
+     * refuse, no flood. Forwarding (the next building step) is not yet
+     * part of this, so for now the computation only serves 1-hop
+     * choices and the refusal of unknown destinations. */
+    uint16_t nh = route_next_hop(n, dst);
+    if (!nh) return -1;                        /* not in the graph / unreachable: no flood (10.2) */
     if (len > MC_MAX_PAYLOAD) return -3;
     mimeshi_pending *p = 0;
     for (int i = 0; i < MC_MAX_PENDING; i++) if (!n->pend[i].active) { p = &n->pend[i]; break; }
@@ -1051,7 +1178,7 @@ int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uin
     memset(p, 0, sizeof(*p));
     p->active = 1; p->tries_left = MC_RETRY_TX; p->budget_left = MC_BUDGET_INIT;
     p->msg_id = (uint16_t)n->rand(n);
-    p->src = n->id; p->dst = dst; p->prev_hop = n->id; p->next_hop = dst;
+    p->src = n->id; p->dst = dst; p->prev_hop = n->id; p->next_hop = nh;
     uint8_t *k = p->pkt;
     k[0] = (uint8_t)(PKT_DATA | (ack3 ? F_ACK3_REQ : 0));
     wr16(k + 1, p->msg_id); wr16(k + 3, n->id); wr16(k + 5, dst); wr16(k + 7, n->id);

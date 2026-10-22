@@ -40,5 +40,11 @@ target_compile_options(test_table_chunk PRIVATE -UNDEBUG)
 target_link_libraries(test_table_chunk mimeshi_static)
 add_test(NAME table_chunk COMMAND test_table_chunk)
 
+# Route computation (10.2): ETX diamond, age multiplier, refusal rules.
+add_executable(test_routing tests/test_routing.c)
+target_compile_options(test_routing PRIVATE -UNDEBUG)
+target_link_libraries(test_routing mimeshi_static)
+add_test(NAME routing COMMAND test_routing)
+
 # ---- platform layers (stubs; per platform only the hardware interface) ----
 add_subdirectory(platform/host)
