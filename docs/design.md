@@ -1,8 +1,8 @@
 # Meshimeshi: Design Document (revised)
 
-**Status:** working document, not yet simulated
+**Status:** working document, simulated (building blocks 1 and 2 on utrecht40)
 **Language:** English
-**Last updated:** 15 October 2026 (routing, section 10, worked out over the known graph; 2-hop terminology retired)
+**Last updated:** 22 October 2026 (building block 2 implemented and measured: route computation, forwarding with next-hop addressing, retry series 7.4, revised ack2 7.1–7.3, destination geo + bridge-node rule 10.2; cost table provisional, calibration open)
 
 This document records the design decisions discussed so far. Each item carries a status:
 
