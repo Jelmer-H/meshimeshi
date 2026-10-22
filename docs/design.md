@@ -536,7 +536,7 @@ Threads could use a shorter limit, for example three bits. That provides some ex
 - Each direction must be proven by the receiver of that direction:
   - A hello or an overheard hello ack proves only sender→receiver ("seen").
   - The reverse direction comes exclusively from the neighbour itself: via a hello ack addressed to us, via its table chunks (4.3), or via a successful unicast with ack1 ("confirmed").
-- Routing chooses the next hop only via confirmed direct links. Entries beyond the direct neighbours serve greedy direction and route insight, not hop selection: the hop itself always runs over a confirmed direct neighbour. Direct replies in exchanges are exempt from this requirement (4.3).
+- Routing chooses the next hop only via confirmed direct links, and only when BOTH directions are measured: the DATA direction (us->neighbour) counts as the neighbour measures it (its chunk self-entry, 4.3), not as we infer from our own reception. Without the neighbour's advertised measurement the link is not yet a route candidate: a one-direction view is not enough to route a 173-459 ms packet over a link (measured: the fallback let -110 dBm boundary links through on the evidence of their good return direction -- delivery 69.7% -> 76.9% after the strict rule). Entries beyond the direct neighbours serve greedy direction and route insight, not hop selection: the hop itself always runs over a confirmed direct neighbour. Direct replies in exchanges are exempt from this requirement (4.3).
 
 **Status:** decided (cap and eviction replace the former "2-hop map" concept; the map is no longer bounded by two hops but by the node limit of 256).
 

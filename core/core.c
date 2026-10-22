@@ -763,7 +763,11 @@ static uint8_t link_eff_quality(mimeshi_node *n, uint16_t a, uint16_t b) {
 static int route_score(mimeshi_node *n, mimeshi_neighbor *nb) {
     (void)n;
     if (!nb->sym) return -1;                 /* only confirmed links (10.1) */
-    uint8_t qfwd = nb->quality_back ? nb->quality_back : nb->quality;  /* us->nb (as the neighbour measures) */
+    if (!nb->quality_back) return -1;        /* the DATA direction must be MEASURED by
+                                                the neighbour (its chunk self-entry): a
+                                                one-direction view is not enough to
+                                                route a 173-459 ms packet over this link */
+    uint8_t qfwd = nb->quality_back;         /* us->nb (as the neighbour measures) */
     uint8_t qback = nb->quality;              /* nb->us (as we measure) */
     if (qfwd < MC_ROUTE_MIN_QUALITY) return -1;   /* the DATA direction must pass */
     if (qback < MC_ACK_MIN_QUALITY) return -1;    /* the small ack still fits */
@@ -827,12 +831,12 @@ static mimeshi_neighbor *route_path(mimeshi_node *n, uint16_t dst, mimeshi_neigh
             for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
                 mimeshi_neighbor *nb = &n->nbr[i];
                 if (!nb->alive || !nb->sym) continue;
-                uint8_t qfwd = nb->quality_back ? nb->quality_back : nb->quality;
-                if (qfwd < MC_ROUTE_MIN_QUALITY) continue;   /* DATA direction (10.1) */
+                if (!nb->quality_back) continue;               /* DATA direction must be measured (10.1) */
+                if (nb->quality_back < MC_ROUTE_MIN_QUALITY) continue;   /* DATA direction (10.1) */
                 if (nb->quality < MC_ACK_MIN_QUALITY) continue;  /* ack direction */
                 int v = IDX(nb->id);
                 if (v < 0) continue;
-                int32_t nd = dist[0] + dij_cost((int32_t)(qfwd + nb->quality) / 2);
+                int32_t nd = dist[0] + dij_cost((int32_t)(nb->quality_back + nb->quality) / 2);
                 if (nd < dist[v]) {
                     dist[v] = nd;
                     first[v] = nb->id;            /* the first hop on the path to v */
@@ -863,11 +867,9 @@ static mimeshi_neighbor *route_path(mimeshi_node *n, uint16_t dst, mimeshi_neigh
     if (t < 0 || dist[t] == MC_DIJ_INF || first[t] == 0) return 0;
     mimeshi_neighbor *hop = nbr_find(n, first[t]);
     if (!hop || !hop->sym || hop == excl) return 0;
-    {
-        uint8_t qfwd = hop->quality_back ? hop->quality_back : hop->quality;
-        if (qfwd < MC_ROUTE_MIN_QUALITY) return 0;   /* DATA direction (10.1) */
-        if (hop->quality < MC_ACK_MIN_QUALITY) return 0;  /* ack direction */
-    }
+    if (!hop->quality_back) return 0;               /* DATA direction must be measured (10.1) */
+    if (hop->quality_back < MC_ROUTE_MIN_QUALITY) return 0;   /* DATA direction (10.1) */
+    if (hop->quality < MC_ACK_MIN_QUALITY) return 0;  /* ack direction */
     return hop;
     #undef IDX
 }
@@ -927,11 +929,9 @@ static mimeshi_neighbor *route_next(mimeshi_node *n, uint16_t dst,
         for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
             mimeshi_neighbor *nb = &n->nbr[i];
             if (!nb->alive || !nb->sym || nb == excl) continue;
-            {
-                uint8_t qfwd = nb->quality_back ? nb->quality_back : nb->quality;
-                if (qfwd < MC_ROUTE_MIN_QUALITY) continue;   /* DATA direction (10.1) */
-                if (nb->quality < MC_ACK_MIN_QUALITY) continue;  /* ack direction */
-            }
+            if (!nb->quality_back) continue;   /* DATA direction must be measured (10.1) */
+            if (nb->quality_back < MC_ROUTE_MIN_QUALITY) continue;   /* DATA direction (10.1) */
+            if (nb->quality < MC_ACK_MIN_QUALITY) continue;  /* ack direction */
             if (nb->geox == MC_GEO_UNKNOWN) continue;
             if (geo_dist2(nb->geox, nb->geoy, tgx, tgy) >= own_gw) continue;  /* no progress: void guard */
             int s = route_score(n, nb) - (geo_dist2(nb->geox, nb->geoy, tgx, tgy) >> 12);
