@@ -42,7 +42,7 @@ cmake --build build
 ctest --test-dir build            # link test on the C core
 
 # or without cmake:
-gcc -O2 -fPIC -shared -DMC_BOUND_POOL=2048 core/core.c -o build/libmimeshi.so -I.
+gcc -O2 -fPIC -shared -DMC_BOUND_POOL=8192 core/core.c -o build/libmimeshi.so -I.
 gcc -O2 -Wall -Wextra -Werror -I. tests/test_link_test.c core/core.c -o build/test_link_test
 # (the pool flag: the simulator shares the C core between all nodes of the
 #  scenario; firmware builds without it and gets the compact pool)
