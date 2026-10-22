@@ -906,26 +906,16 @@ static mimeshi_neighbor *route_next(mimeshi_node *n, uint16_t dst,
             best = via; best_score = route_score(n, via) + 64;
         }
     }
-    /* 3. smart greedy on geo (10.2): not the neighbour closest to the
-     * destination, but: first find the point on the whole known map
-     * closest to the destination geo (the best "gateway" toward it --
-     * may be far away), then route to the hop that can get closest to
-     * THAT point. A neighbour that is not closer to the destination can
-     * still be the best way toward the gateway around a concave shore
-     * (void guard: we must make progress toward the gateway). */
+    /* 3. geo-greedy via the tandem (10.2, decided): every hop only needs
+     * to make progress TOWARD THE DESTINATION GEO -- not to reach it. The
+     * next hop looks at its own map and continues; the message converges
+     * hop by hop. The rule: the best routable neighbour that is closer to
+     * the destination geo than we are (measured at the DIRECT hop: a small
+     * step forward is enough -- the rest is the next hop's problem). This
+     * is the original tandem: the source does not need to see the whole
+     * route, only a step in the right direction. */
     if (dgx != MC_GEO_UNKNOWN && n->geox != MC_GEO_UNKNOWN) {
-        int16_t tgx = dgx, tgy = dgy;      /* the gateway point: default the destination itself */
         int32_t own_dst = geo_dist2(n->geox, n->geoy, dgx, dgy);
-        int32_t best_gw = own_dst;          /* the gateway must beat our own position */
-        for (int i = 0; i < MC_MAX_KNOWN; i++) {
-            mimeshi_2hop *e = &n->known[i];
-            if (!e->alive || e->geox == MC_GEO_UNKNOWN) continue;
-            int32_t d = geo_dist2(e->geox, e->geoy, dgx, dgy);
-            if (d < best_gw) { best_gw = d; tgx = e->geox; tgy = e->geoy; }
-        }
-        /* hop toward the gateway: the confirmed neighbour closest to the
-         * gateway point that is closer to it than we are */
-        int32_t own_gw = geo_dist2(n->geox, n->geoy, tgx, tgy);
         for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
             mimeshi_neighbor *nb = &n->nbr[i];
             if (!nb->alive || !nb->sym || nb == excl) continue;
@@ -933,8 +923,9 @@ static mimeshi_neighbor *route_next(mimeshi_node *n, uint16_t dst,
             if (nb->quality_back < MC_ROUTE_MIN_QUALITY) continue;   /* DATA direction (10.1) */
             if (nb->quality < MC_ACK_MIN_QUALITY) continue;  /* ack direction */
             if (nb->geox == MC_GEO_UNKNOWN) continue;
-            if (geo_dist2(nb->geox, nb->geoy, tgx, tgy) >= own_gw) continue;  /* no progress: void guard */
-            int s = route_score(n, nb) - (geo_dist2(nb->geox, nb->geoy, tgx, tgy) >> 12);
+            int32_t d = geo_dist2(nb->geox, nb->geoy, dgx, dgy);
+            if (d >= own_dst) continue;          /* must make progress toward the geo */
+            int s = route_score(n, nb) - (int)(d >> 14);   /* prefer the closest hop, quality first */
             if (s > best_score) { best_score = s; best = nb; }
         }
     }
