@@ -365,15 +365,26 @@ static void chunk_send(mimeshi_node *n, uint8_t ch, uint8_t with_links) {
     for (int i = 0; i < MC_MAX_NEIGHBORS && cnt < MC_CHUNK_ENTRIES; i++) {
         mimeshi_neighbor *nb = &n->nbr[i];
         if (!nb->alive || !nb->sym) continue;
+        /* the links OF this neighbour, as we know them (4.3: node-centric):
+         * first our own link to it (the edge nb--us), then the links we
+         * learned for nb from other chunks. Without the learned links the
+         * graph never fills: nobody could ever forward a third node's links. */
         uint8_t nl = 0;
-        for (int j = 0; j < MC_MAX_NEIGHBORS && nl < MC_CHUNK_LINKS; j++) {
-            mimeshi_neighbor *l = &n->nbr[j];
-            if (!l->alive || !l->sym || l == nb) continue;
-            /* only links between our own confirmed entries (4.3: the mutual
-             * links of the neighbours) */
-            lbuf[nl] = l->id;
-            qbuf[nl] = (uint8_t)((l->quality + nb->quality) / 2);
+        if (nb->sym && nl < MC_CHUNK_LINKS) {
+            lbuf[nl] = n->id;                       /* our own edge to nb */
+            qbuf[nl] = nb->quality;
             nl++;
+        }
+        mimeshi_2hop *leh = known_find(n, nb->id);
+        if (leh) {
+            for (uint8_t l = 0; l < leh->nlinks && nl < MC_CHUNK_LINKS; l++) {
+                uint8_t dup = 0;
+                for (uint8_t d = 0; d < nl; d++) if (lbuf[d] == leh->link[l]) { dup = 1; break; }
+                if (dup) continue;
+                lbuf[nl] = leh->link[l];
+                qbuf[nl] = leh->lq[l] ? leh->lq[l] : leh->quality;
+                nl++;
+            }
         }
         off += chunk_entry_put(n, p + off, nb->id, nb->quality, nb->geox, nb->geoy,
                                with_links ? lbuf : (const uint16_t *)0,
@@ -434,10 +445,9 @@ static void chunk_tick(mimeshi_node *n, void *ud) {
              * graph, 4.3); the periodic tail repeats geo+quality only --
              * the link graph fills via the mutation pushes, the tail
              * keeps the map fresh at 8 B per entry */
-            chunk_send(n, n->home_ch, mutated ? 1 : 0);
-            /* one slice per repetition: the round-robin carries the whole
-             * map over successive repetitions (4.3), and the channel
-             * share stays modest */
+            chunk_send(n, n->home_ch, 1);   /* always with links (4.3): the tail
+                                               * keeps BOTH the map and the graph fresh;
+                                               * an empty graph is worth nothing */
         }
     }
     n->timer(n, MC_CHUNK_PERIOD_US + (n->rand(n) % 1000000ull), chunk_tick, 0);
