@@ -367,7 +367,7 @@ CNode._fields_ = [
     ("proof_wait", ctypes.c_uint8 * 3),  # flush countdown per channel (4.2)
     ("geo_lat", ctypes.c_uint16), ("geo_lon", ctypes.c_uint16),  # own geo grid (5)
     ("tick", ctypes.c_uint32),          # local time base in proof ticks (4.4)
-    ("chunk_nr", ctypes.c_uint8), ("tbl_dirty", ctypes.c_uint8),
+    ("chunk_nr", ctypes.c_uint8), ("chunk_cursor", ctypes.c_uint8), ("tbl_dirty", ctypes.c_uint8),
     ("tbl_push_sched", ctypes.c_uint8),
     ("map", CMapNode * MC_MAP_NODES),   # 2-hop map (10.1)
     ("lnk", CLink * MC_MAX_LINKS),      # link store (4.3)

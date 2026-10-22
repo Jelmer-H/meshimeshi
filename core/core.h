@@ -139,6 +139,9 @@ struct mimeshi_node {
     uint32_t tick;                    /* local time base: proof ticks (~56 s)
                                          since start (4.4); starts at 1 */
     uint8_t  chunk_nr;                /* next table chunk number (4.3) */
+    uint8_t  chunk_cursor;             /* table position where the next chunk
+                                          continues: tables larger than one
+                                          chunk cycle through the pushes (4.3) */
     uint8_t  tbl_dirty;               /* prefix mutation pending (4.3) */
     uint8_t  tbl_push_sched;          /* push window/period timer running */
     mimeshi_mapnode map[MC_MAP_NODES];  /* 2-hop map (10.1) */

@@ -388,6 +388,7 @@ static mimeshi_link *lnk_add(mimeshi_node *n, uint16_t a, uint16_t b) {
  * the short window; mutations inside the window bundle automatically
  * because only the current state goes on air. */
 #define MC_TBL_WIN_US   30000000ull   /* bundling window: 30 s (4.3, to measure) */
+#define MC_TBL_PERIOD_TICKS 10u           /* prefix re-share: ~10 min (4.3 cadence, to measure) */
 
 static void tbl_push_fire(mimeshi_node *n, void *ud);
 
@@ -445,7 +446,9 @@ static void chunk_send(mimeshi_node *n) {
     uint8_t p[230];
     uint16_t len = 10;
     uint8_t cnt = 0;
-    for (int i = 0; i < MC_MAX_NEIGHBORS && cnt < MC_CHUNK_MAX_ENTRIES && len + 9 <= 230; i++) {
+    int start = n->chunk_cursor;                  /* continuation: the table cycles (4.3) */
+    for (int k = 0; k < MC_MAX_NEIGHBORS && cnt < MC_CHUNK_MAX_ENTRIES && len + 9 <= 230; k++) {
+        int i = (start + k) % MC_MAX_NEIGHBORS;
         mimeshi_neighbor *nb = &n->nbr[i];
         if (!nb->alive || !nb->sym) continue;      /* only confirmed symmetric (4.3) */
         wr16(p + len, nb->id);
@@ -470,8 +473,9 @@ static void chunk_send(mimeshi_node *n) {
         }
         p[lcnt_off] = lcnt;
         cnt++;
+        n->chunk_cursor = (uint8_t)((i + 1) % MC_MAX_NEIGHBORS);   /* continue here next push */
     }
-    if (cnt == 0) return;                          /* nothing to share yet */
+    if (cnt == 0) { n->chunk_cursor = 0; return; } /* nothing to share yet */
     p[0] = PKT_TABLE_CHUNK;
     wr16(p + 1, n->id);
     p[3] = n->chunk_nr++;
@@ -561,6 +565,16 @@ static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t 
 static void proof_tick(mimeshi_node *n, void *ud) {
     (void)ud;
     n->tick++;                                 /* local time base, ~56 s per tick (4.4) */
+    /* Periodic prefix re-share (4.3): without traffic there are no
+     * mutations, and a chunk missed by a neighbour (collision, away
+     * from home) would then never return. Every MC_TBL_PERIOD_TICKS
+     * (~10 min) the prefix goes out again. The per-node phase offset
+     * (id mod period) spreads the re-share moments over the whole
+     * period: 40 nodes at the same tick would put 40 x 869 ms on each
+     * channel inside one bundling window - guaranteed collisions. The
+     * random jitter in the bundling window adds the fine spreading. */
+    if ((n->tick + (n->id % MC_TBL_PERIOD_TICKS)) % MC_TBL_PERIOD_TICKS == 0)
+        tbl_mark_dirty(n);
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++)          /* evidence ages per tick (4.2) */
         if (n->nbr[i].alive && n->nbr[i].proven_age_us < MC_T_SYM_US)
             n->nbr[i].proven_age_us += MC_KEEPALIVE_TICK_US;
