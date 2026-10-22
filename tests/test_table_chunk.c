@@ -23,7 +23,7 @@
 
 #define PKT_TABLE_CHUNK_VALUE 4   /* PKT_TABLE_CHUNK, core.c */
 #define MC_SYM_QUALITY_MIN 14u      /* core.c: quality_of(-100 dBm) */
-#define MC_TBL_WIN_US 900000000ull    /* core.c: bundling window 15 min */
+#define MC_TBL_WIN_US 3600000000ull   /* core.c: bundling window 1 h */
 
 /* --- mini virtual radio ---------------------------------------------- */
 #define MAXEV 256
@@ -112,7 +112,7 @@ int main(void) {
     /* the confirmation marked S's table dirty: after the bundling
      * window a chunk follows on S's home channel. */
     int before = chunk_seen;
-    pump_until(2 * MC_TBL_WIN_US);                          /* > the 15 min window + jitter */
+    pump_until(2 * MC_TBL_WIN_US);                          /* > the 1 h window + jitter */
     assert(chunk_seen == before + MC_N_CHANNELS);           /* one push: a chunk per channel */
     assert(last_tx_node == 0x0102);
     /* round starts at (home+1)%3 and ends on the OWN home channel (2):
