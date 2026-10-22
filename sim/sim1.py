@@ -161,6 +161,7 @@ class Radio:  # virtual radio + clock
         self.hello_air = [0]*N_CH   # airtime of hellos (type 1) per channel
         self.ack_air = [0]*N_CH     # airtime of hello-acks (type 2) per channel
         self.proof_air = [0]*N_CH   # airtime of proof lists (type 3) per channel
+        self.chunk_air = [0]*N_CH   # airtime of table chunks (type 4) per channel
         self.duty = DutyLedger()
         self.wire = Wire()
         self.seq = 0
@@ -184,6 +185,7 @@ class Radio:  # virtual radio + clock
         if ptype == 1: self.hello_air[ch] += airtime
         elif ptype == 2: self.ack_air[ch] += airtime
         elif ptype == 3: self.proof_air[ch] += airtime
+        elif ptype == 4: self.chunk_air[ch] += airtime
         self.duty.add(node.id, ch, self.now, airtime)
         self.wire.begin(self.now, ch, node.id, airtime)
         for r in self.nodes.values():
@@ -310,12 +312,13 @@ class Node:
 # ---------------------------------------------------------------------------
 # C core via ctypes — the only protocol implementation (design 13b).
 # Struct layout verified against sizeof/offsetof of core.h
-# (neighbor 12, pending 256, node 5448 B).
+# (neighbor 24, pending 256, mapnode 12, link 6, node 18528 B).
 # ---------------------------------------------------------------------------
 MC_MAX_NEIGHBORS, MC_MAX_PENDING, MC_MAX_DEDUP, MC_MAX_PAYLOAD = 64, 16, 128, 230
 
 class CNeighbor(ctypes.Structure):
     _fields_ = [("id", ctypes.c_uint16), ("quality", ctypes.c_uint8),
+                ("rev_quality", ctypes.c_uint8),
                 ("ack_try", ctypes.c_uint8), ("last_seen", ctypes.c_uint32),
                 ("proven_age_us", ctypes.c_uint64), ("alive", ctypes.c_uint8),
                 ("sym", ctypes.c_uint8)]
@@ -330,6 +333,20 @@ class CPending(ctypes.Structure):
 
 class CDedup(ctypes.Structure):
     _fields_ = [("msg_id", ctypes.c_uint16), ("src", ctypes.c_uint16)]
+
+MC_MAP_NODES, MC_MAX_LINKS = 256, 1536
+
+class CMapNode(ctypes.Structure):
+    _fields_ = [("id", ctypes.c_uint16),
+                ("geo_lat", ctypes.c_uint16), ("geo_lon", ctypes.c_uint16),
+                ("quality", ctypes.c_uint8),
+                ("arrived_tick", ctypes.c_uint16),
+                ("age_ticks", ctypes.c_uint8),
+                ("alive", ctypes.c_uint8)]
+
+class CLink(ctypes.Structure):
+    _fields_ = [("a", ctypes.c_uint16), ("b", ctypes.c_uint16),
+                ("q", ctypes.c_uint8), ("alive", ctypes.c_uint8)]
 
 class CNode(ctypes.Structure):
     pass
@@ -351,6 +368,12 @@ CNode._fields_ = [
     ("hello_jitter_us", ctypes.c_uint64),
     ("ka_idle", ctypes.c_uint8 * 3),   # keepalive counters per channel (4.1)
     ("proof_wait", ctypes.c_uint8 * 3),  # flush countdown per channel (4.2)
+    ("geo_lat", ctypes.c_uint16), ("geo_lon", ctypes.c_uint16),  # own geo grid (5)
+    ("tick", ctypes.c_uint32),          # local time base in proof ticks (4.4)
+    ("chunk_nr", ctypes.c_uint8), ("chunk_cursor", ctypes.c_uint8), ("tail_cursor", ctypes.c_uint8), ("tbl_dirty", ctypes.c_uint8),
+    ("tbl_push_sched", ctypes.c_uint8),
+    ("map", CMapNode * MC_MAP_NODES),   # 2-hop map (10.1)
+    ("lnk", CLink * MC_MAX_LINKS),      # link store (4.3)
     ("tx", TX_FN), ("timer", TIMER_FN), ("switch_ch", SWITCH_FN), ("rand", RAND_FN),
     ("channel_free", CAD_FN), ("user", ctypes.c_void_p),
 ]
@@ -397,6 +420,7 @@ def load_lib(path):
     lib.mimeshi_send_data.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint16,
                                       ctypes.c_char_p, ctypes.c_uint16, ctypes.c_bool]
     lib.mimeshi_send_data.restype = ctypes.c_int
+    lib.mimeshi_set_geo.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint16, ctypes.c_uint16]
     return lib
 
 class CCore:
@@ -413,6 +437,12 @@ class CCore:
         ch, rssi, pkt = arg
         buf = (ctypes.c_uint8 * len(pkt)).from_buffer_copy(pkt) if pkt else (ctypes.c_uint8 * 1)()
         self.lib.mimeshi_rx(ctypes.byref(self.mn), ch, rssi, buf, len(pkt))
+    def set_geo(self, lat, lon):
+        self.lib.mimeshi_set_geo(ctypes.byref(self.mn), lat, lon)
+    def map_size(self):
+        return sum(1 for m in self.mn.map if m.alive)
+    def link_count(self):
+        return sum(1 for l in self.mn.lnk if l.alive)
     def send_data(self, dst, data, ack3=True):
         payload = data.encode() if isinstance(data, str) else bytes(data)
         rc = self.lib.mimeshi_send_data(ctypes.byref(self.mn), dst, payload, len(payload), ack3)
