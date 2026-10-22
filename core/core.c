@@ -142,6 +142,20 @@ static uint8_t quality_of(int8_t rssi) {
  * directions are above the threshold. */
 static bool quality_ok(uint8_t q) { return q >= MC_SYM_QUALITY_MIN; }
 
+/* Advertised quality class (4.3): the upper bits of the long-term
+ * average, 3 bits (8 levels) in the prefix chunks. */
+static uint8_t adv_class_of(uint8_t q) { return (uint8_t)(q >> 3); }   /* 0..7 */
+
+/* Quality byte back from an advertised class (receiver side): the
+ * middle of the class, so route comparisons stay monotone. */
+static uint8_t quality_from_class(uint8_t cls) { return (uint8_t)((cls << 3) | 4); }
+
+/* EWMA on the long-term average (4.3): weight 1/32. */
+static uint8_t quality_ewma(uint8_t stored, uint8_t fresh) {
+    return (uint8_t)(((uint16_t)stored * 31u + fresh) / 32u);
+}
+
+
 /* Add a neighbor (from a hello, hello-ack or proof list). Full = return 0;
  * the caller continues without the neighbor. A new entry starts as "seen":
  * one direction, sym = 0 (4.2). The local table counter feeds push-window
@@ -319,8 +333,234 @@ static void proof_fire(mimeshi_node *n, void *ud) {
  * one proof list per channel per hour maximum.
  */
 #define MC_PROOF_ROT_TICKS (MC_KEEPALIVE_TICKS / MC_N_CHANNELS)  /* 20 min in ticks (4.2) */
+
+/* ---------------- 2-hop map and link store (4.3, 10.1) --------
+ * The map holds every node we know: direct neighbours (alive in the
+ * neighbor table) and 2-hop nodes from table chunks. The link store
+ * holds the advertised links between map nodes (per direction a 3-bit
+ * class). Both are bounded (13.2): full = the entry is dropped with a
+ * message, never silently. */
+
+static mimeshi_mapnode *map_find(mimeshi_node *n, uint16_t id) {
+    for (int i = 0; i < MC_MAP_NODES; i++)
+        if (n->map[i].alive && n->map[i].id == id) return &n->map[i];
+    return 0;
+}
+
+static mimeshi_mapnode *map_add(mimeshi_node *n, uint16_t id) {
+    mimeshi_mapnode *m = map_find(n, id);
+    if (m) return m;
+    for (int i = 0; i < MC_MAP_NODES; i++)
+        if (!n->map[i].alive) {
+            n->map[i].alive = 1; n->map[i].id = id;
+            n->map[i].geo_lat = 0; n->map[i].geo_lon = 0;
+            n->map[i].quality = 0; n->map[i].age_ticks = 255;
+            n->map[i].arrived_tick = n->tick;
+            return &n->map[i];
+        }
+    printf("[core] node %u: map full, entry %u dropped\n", n->id, id);
+    return 0;
+}
+
+/* Link between two map nodes, endpoints normalized a < b. */
+static mimeshi_link *lnk_find(mimeshi_node *n, uint16_t a, uint16_t b) {
+    if (a > b) { uint16_t t = a; a = b; b = t; }
+    for (int i = 0; i < MC_MAX_LINKS; i++)
+        if (n->lnk[i].alive && n->lnk[i].a == a && n->lnk[i].b == b) return &n->lnk[i];
+    return 0;
+}
+
+static mimeshi_link *lnk_add(mimeshi_node *n, uint16_t a, uint16_t b) {
+    mimeshi_link *l = lnk_find(n, a, b);
+    if (l) return l;
+    if (a > b) { uint16_t t = a; a = b; b = t; }
+    for (int i = 0; i < MC_MAX_LINKS; i++)
+        if (!n->lnk[i].alive) {
+            n->lnk[i].alive = 1; n->lnk[i].a = a; n->lnk[i].b = b;
+            return &n->lnk[i];
+        }
+    printf("[core] node %u: link store full, link %u-%u dropped\n", n->id, a, b);
+    return 0;
+}
+
+/* Table push mutation feed (4.3): the local table counter drives the
+ * push-window bundling. A mutation schedules the prefix chunks after
+ * the short window; mutations inside the window bundle automatically
+ * because only the current state goes on air. */
+#define MC_TBL_WIN_US   30000000ull   /* bundling window: 30 s (4.3, to measure) */
+
+static void tbl_push_fire(mimeshi_node *n, void *ud);
+
+static void tbl_mark_dirty(mimeshi_node *n) {
+    n->tbl_dirty = 1;
+    if (!n->tbl_push_sched) {
+        n->tbl_push_sched = 1;
+        n->timer(n, MC_TBL_WIN_US + (n->rand(n) % MC_TBL_WIN_US), tbl_push_fire, 0);
+    }
+}
+
+/* ---------------- table chunks (4.3) ----------------
+ * Prefix chunk, node-centric and self-contained (4.3):
+ *   header: type(1) owner-id(2) chunk-nr(1) n-entries(1)
+ *           owner-geo(4) fw-version(1)                      = 10 B
+ *   entry:  node-id(2) class(1) age(1) geo(4) link-count(1) = 9 B
+ *   link:   endpoint-id(2) class-entry->endpoint(4 bits)
+ *           class-endpoint->entry(4 bits)                   = 3 B
+ * Only confirmed symmetric neighbours are advertised (decided:
+ * no "heard only" in the chunks). The entry class is the owner's
+ * measured quality of the link (EWMA average, 3 bits); the fading
+ * asymmetry per direction (+-5 dB) is below the class width, so one
+ * class stands for both directions of a direct link. The link
+ * records under an entry carry the links between the entry-node and
+ * our other confirmed neighbours, with the classes per direction as
+ * they are known in the link store. */
+#define MC_CHUNK_MAX_ENTRIES 8        /* 8 entries x (9 B + links) fits 230 B */
+
+/* Direction-aware access to the link store: nibbles keyed to the
+ * sorted endpoints (a < b): high nibble = a->b, low = b->a. */
+static uint8_t lnk_class(mimeshi_node *n, uint16_t from, uint16_t to) {
+    mimeshi_link *l = lnk_find(n, from, to);
+    if (!l) return 0xFF;                        /* unknown */
+    uint16_t a = from < to ? from : to;
+    return (from == a) ? (uint8_t)((l->q >> 4) & 0x0F) : (uint8_t)(l->q & 0x0F);
+}
+
+static void lnk_set_class(mimeshi_node *n, uint16_t from, uint16_t to, uint8_t cls) {
+    if (cls > 7) return;                        /* unknown stays unknown */
+    mimeshi_link *l = lnk_add(n, from, to);
+    if (!l) return;
+    uint16_t a = from < to ? from : to;
+    if (from == a) l->q = (uint8_t)((l->q & 0x0F) | (cls << 4));
+    else           l->q = (uint8_t)((l->q & 0xF0) | cls);
+}
+
+/* Effective age of a map entry in proof ticks (~56 s), capped at 255
+ * (= ~4 h, expired, 4.4). */
+static uint8_t map_age_eff(mimeshi_node *n, mimeshi_mapnode *m) {
+    uint32_t a = (uint32_t)m->age_ticks + (n->tick - m->arrived_tick);
+    return (uint8_t)(a > 255 ? 255 : a);
+}
+
+static void chunk_send(mimeshi_node *n) {
+    uint8_t p[230];
+    uint16_t len = 10;
+    uint8_t cnt = 0;
+    for (int i = 0; i < MC_MAX_NEIGHBORS && cnt < MC_CHUNK_MAX_ENTRIES && len + 9 <= 230; i++) {
+        mimeshi_neighbor *nb = &n->nbr[i];
+        if (!nb->alive || !nb->sym) continue;      /* only confirmed symmetric (4.3) */
+        wr16(p + len, nb->id);
+        p[len + 2] = adv_class_of(nb->quality);   /* measured EWMA class (3 bits) */
+        p[len + 3] = 0;                            /* direct measurement: fresh */
+        mimeshi_mapnode *m = map_find(n, nb->id);
+        if (m && m->geo_lat) { wr16(p + len + 4, m->geo_lat); wr16(p + len + 6, m->geo_lon); }
+        else { wr16(p + len + 4, 0); wr16(p + len + 6, 0); }
+        uint16_t lcnt_off = len + 8;
+        len += 9;
+        uint8_t lcnt = 0;
+        for (int j = 0; j < MC_MAX_NEIGHBORS && len + 3 <= 230; j++) {
+            if (j == i) continue;
+            mimeshi_neighbor *nb2 = &n->nbr[j];
+            if (!nb2->alive || !nb2->sym) continue;
+            uint8_t cf = lnk_class(n, nb->id, nb2->id);
+            if (cf == 0xFF) continue;              /* never heard about this pair */
+            uint8_t cr = lnk_class(n, nb2->id, nb->id);
+            wr16(p + len, nb2->id);
+            p[len + 2] = (uint8_t)((cf << 4) | (cr == 0xFF ? 0 : cr));
+            len += 3; lcnt++;
+        }
+        p[lcnt_off] = lcnt;
+        cnt++;
+    }
+    if (cnt == 0) return;                          /* nothing to share yet */
+    p[0] = PKT_TABLE_CHUNK;
+    wr16(p + 1, n->id);
+    p[3] = n->chunk_nr++;
+    p[4] = cnt;
+    wr16(p + 5, n->geo_lat); wr16(p + 7, n->geo_lon);
+    p[9] = 1;                                     /* firmware version */
+    /* All three channels, in fixed order — the same reason as the hello
+     * round (2): confirmed neighbours sit on all home channels. A chunk
+     * on the own home channel alone would reach only the same-channel
+     * third; the links between cross-channel neighbours would then never
+     * propagate and the 2-hop map would stay blind for exactly the
+     * links that Gabriel and route choice need. Cost per chunk: 3 x
+     * 869 ms air per push round; a full tower table stays far under the
+     * duty limit. The push bundling (one chunk per window) caps the
+     * rate; the pool has a slot per transmission like the hello round. */
+    for (uint8_t c = 0; c < MC_N_CHANNELS; c++) {
+        bound_send(n, c, p, len, t_data_us(len));
+        ka_called(n, c);                          /* own call on c (4.1) */
+    }
+}
+
+static void tbl_push_fire(mimeshi_node *n, void *ud) {
+    (void)ud;
+    n->tbl_push_sched = 0;
+    if (!n->tbl_dirty) return;
+    n->tbl_dirty = 0;
+    chunk_send(n);
+}
+
+/* Reception of a table chunk (4.3). Self-contained: every entry is
+ * processed on its own against the own map and link store. The owner
+ * naming US in an entry is reverse-direction evidence for the link
+ * owner->us (10.1) — gated on quality like every confirmation. */
+static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t len) {
+    if (len < 10) return;
+    uint16_t owner = rd16(pkt + 1);
+    uint8_t n_ent = pkt[4];
+    mimeshi_mapnode *om = map_add(n, owner);
+    if (om) {
+        om->geo_lat = rd16(pkt + 5); om->geo_lon = rd16(pkt + 7);
+        om->quality = quality_of(rssi);       /* our measurement of owner->us */
+        om->age_ticks = 0; om->arrived_tick = n->tick;
+    }
+    mimeshi_neighbor *nb = nbr_find(n, owner);
+    if (!nb) nb = nbr_add(n, owner);
+    if (nb) nb->quality = quality_ewma(nb->quality ? nb->quality : quality_of(rssi), quality_of(rssi));
+    uint16_t off = 10;
+    for (uint8_t e = 0; e < n_ent && off + 9 <= len; e++) {
+        uint16_t eid = rd16(pkt + off);
+        uint8_t cls = pkt[off + 2] & 0x07;     /* owner->entry class (4.3) */
+        uint8_t age = pkt[off + 3];
+        uint16_t gl = rd16(pkt + off + 4), go = rd16(pkt + off + 6);
+        uint8_t lcnt = pkt[off + 8];
+        off += 9;
+        if (eid == n->id) {                    /* owner names us: reverse evidence (10.1) */
+            if (nb) {
+                nb->proven_age_us = 0;
+                if (quality_ok(nb->quality)) {
+                    if (!nb->sym) tbl_mark_dirty(n);
+                    nb->sym = 1; nb->ack_try = 0;
+                }
+            }
+        } else {
+            mimeshi_mapnode *em = map_add(n, eid);
+            if (em) {
+                if (gl) { em->geo_lat = gl; em->geo_lon = go; }   /* (0,0) = none (5) */
+                uint8_t travelled = age;
+                if (!em->quality || travelled < map_age_eff(n, em)) {
+                    em->quality = quality_from_class(cls);        /* fresh beats old (4.3) */
+                    em->age_ticks = travelled; em->arrived_tick = n->tick;
+                }
+            }
+            lnk_set_class(n, owner, eid, cls); /* owner -> entry */
+        }
+        for (uint8_t k = 0; k < lcnt && off + 3 <= len; k++) {
+            uint16_t peer = rd16(pkt + off);
+            uint8_t lb = pkt[off + 2];
+            off += 3;
+            if (peer == n->id) continue;       /* link to us: covered by our own entry */
+            map_add(n, peer);                 /* presence in the 2-hop set (10.1) */
+            lnk_set_class(n, eid, peer, (uint8_t)(lb >> 4));
+            lnk_set_class(n, peer, eid, (uint8_t)(lb & 0x0F));
+        }
+    }
+}
+
 static void proof_tick(mimeshi_node *n, void *ud) {
     (void)ud;
+    n->tick++;                                 /* local time base, ~56 s per tick (4.4) */
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++)          /* evidence ages per tick (4.2) */
         if (n->nbr[i].alive && n->nbr[i].proven_age_us < MC_T_SYM_US)
             n->nbr[i].proven_age_us += MC_KEEPALIVE_TICK_US;
@@ -569,8 +809,10 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
             nb->last_seen = 0;
             nb->quality = quality_of(rssi);
             nb->proven_age_us = 0;      /* fresh reception of an identifying transmission */
-            if (dst == n->id && quality_ok(nb->quality))
-                { nb->sym = 1; nb->ack_try = 0; }   /* confirmed symmetric (4.2, 10.1: quality gate) */
+            if (dst == n->id && quality_ok(nb->quality)) {
+                if (!nb->sym) tbl_mark_dirty(n);       /* new advertised neighbour (4.3) */
+                nb->sym = 1; nb->ack_try = 0;          /* confirmed symmetric (4.2, 10.1) */
+            }
         }
         break;
     }
@@ -596,7 +838,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         for (uint16_t i = 0; i < ids; i++) {
             if (rd16(pkt + 3 + 2 * i) == n->id && nb) {
                 nb->proven_age_us = 0;
-                if (quality_ok(nb->quality)) { nb->sym = 1; nb->ack_try = 0; }
+                if (quality_ok(nb->quality) && !nb->sym) { nb->sym = 1; nb->ack_try = 0; tbl_mark_dirty(n); }
             }
         }
         break;
@@ -623,7 +865,10 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                 if (nb) {                               /* confirmed symmetric (4.2, 10.1) */
                     nb->quality = quality_of(rssi);     /* the ack1 itself is the measurement (its direction) */
                     nb->proven_age_us = 0;
-                    if (quality_ok(nb->quality)) { nb->sym = 1; nb->ack_try = 0; }
+                    if (quality_ok(nb->quality)) {
+                        if (!nb->sym) tbl_mark_dirty(n);
+                        nb->sym = 1; nb->ack_try = 0;
+                    }
                 }
                 printf("[core] node %u: ACK1 for msg %u\n", n->id, msg_id);
                 return;
@@ -643,6 +888,10 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         /* final destination has had the message delivered (11): routed
          * back to the source, here still without routing logic. */
         printf("[core] node %u: ACK3 — delivered at destination\n", n->id);
+        break;
+    }
+    case PKT_TABLE_CHUNK: {
+        chunk_rx(n, rssi, pkt, len);
         break;
     }
     case PKT_DATA: {
@@ -699,6 +948,14 @@ void mimeshi_init(mimeshi_node *n, uint16_t id, mimeshi_tx_fn tx, mimeshi_timer_
 static void proof_stagger(mimeshi_node *n) {
     for (uint8_t c = 0; c < MC_N_CHANNELS; c++)
         n->proof_wait[c] = (uint8_t)(c * MC_PROOF_ROT_TICKS);
+}
+
+/* Own geo in the 16-bit grid (5): (0,0) = none. A later call with a
+ * different value is a mutation and feeds the table push (4.3). */
+void mimeshi_set_geo(mimeshi_node *n, uint16_t lat, uint16_t lon) {
+    if (lat == n->geo_lat && lon == n->geo_lon) return;
+    n->geo_lat = lat; n->geo_lon = lon;
+    tbl_mark_dirty(n);
 }
 
 void mimeshi_start(mimeshi_node *n) {

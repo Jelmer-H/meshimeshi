@@ -23,6 +23,8 @@
 #define MC_MAX_PENDING   16
 #define MC_MAX_DEDUP    128
 #define MC_MAX_PAYLOAD  230
+#define MC_MAP_NODES    256             /* bounded 2-hop map (13.2, 13.3) */
+#define MC_MAX_LINKS   1536            /* link store: links between map nodes (13.2) */
 #define MC_T_SYM_US      21600000000ull  /* 6 h: validity of confirmed symmetry (4.2) */
 #define MC_SYM_MARGIN_US  7200000000ull  /* 2 h flush margin (4.2) */
 
@@ -46,6 +48,8 @@ typedef struct {
                                to us, proof list in which we appear, ack1
                                on our data, or table chunk naming us);
                                0 = only seen, one direction (4.2, 10.1) */
+    uint8_t  adv_class;     /* last advertised quality class (3 bits,
+                               hysteresis >= 2 steps, 4.3) */
 } mimeshi_neighbor;
 
 typedef struct {
@@ -56,6 +60,31 @@ typedef struct {
 } mimeshi_pending;
 
 typedef struct { uint16_t msg_id, src; } mimeshi_dedup;
+
+/* 2-hop map entry (4.3, 10.1): a node we know about indirectly (from
+ * table chunks) or directly. Geo in the 16-bit grid of section 5;
+ * (0,0) = invalid. Age bookkeeping without a clock: arrived_tick is
+ * the local tick counter of the last refresh; age_ticks is the on-air
+ * age (in proof ticks, ~56 s) at that moment. Effective age =
+ * (tick - arrived_tick) + age_ticks, in proof ticks; 255 (~4 h) =
+ * expired (4.4). */
+typedef struct {
+    uint16_t id;
+    uint16_t geo_lat, geo_lon;
+    uint8_t  quality;        /* advertised quality of the link to its owner (4.3) */
+    uint16_t arrived_tick;
+    uint8_t  age_ticks;
+    uint8_t  alive;
+} mimeshi_mapnode;
+
+/* A link between two map nodes with the advertised quality class (3
+ * bits) per direction (4.3). Endpoints normalized a < b; alive = 0
+ * marks a free slot. */
+typedef struct {
+    uint16_t a, b;
+    uint8_t  q;             /* (class a->b) << 4 | class b->a */
+    uint8_t  alive;
+} mimeshi_link;
 
 struct mimeshi_node;
 typedef struct mimeshi_node mimeshi_node;
@@ -105,6 +134,15 @@ struct mimeshi_node {
                                          per channel (4.2), staggered 20
                                          min apart; restarts at 1 h on
                                          every fire: the hourly cap */
+    uint16_t geo_lat, geo_lon;        /* own geo in the 16-bit grid (5);
+                                         (0,0) = none (yet) */
+    uint32_t tick;                    /* local time base: proof ticks (~56 s)
+                                         since start (4.4); starts at 1 */
+    uint8_t  chunk_nr;                /* next table chunk number (4.3) */
+    uint8_t  tbl_dirty;               /* prefix mutation pending (4.3) */
+    uint8_t  tbl_push_sched;          /* push window/period timer running */
+    mimeshi_mapnode map[MC_MAP_NODES];  /* 2-hop map (10.1) */
+    mimeshi_link   lnk[MC_MAX_LINKS];  /* links between map nodes (4.3) */
     mimeshi_tx_fn     tx;
     mimeshi_timer_fn  timer;
     mimeshi_switch_fn switch_ch;
@@ -129,6 +167,12 @@ void mimeshi_start(mimeshi_node *n);
  * -2 = no free pending slot, -3 = payload too large. */
 int  mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload,
                      uint16_t len, bool want_ack3);
+
+/* Own geo in the 16-bit grid of section 5 (0..65535 each); (0,0) =
+ * invalid/none. Travel with every table chunk header (4.3). Call
+ * before mimeshi_start(); a later call is a mutation (geo change)
+ * and feeds the table push. */
+void mimeshi_set_geo(mimeshi_node *n, uint16_t lat, uint16_t lon);
 
 /* Packet received (from radio or simulator). ch = channel of reception. */
 void mimeshi_rx(mimeshi_node *n, uint8_t channel, int8_t rssi_db,

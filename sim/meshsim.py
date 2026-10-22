@@ -309,6 +309,13 @@ def newcomer_traffic(mk, jitter):
         f"top 5 {[f'{u/1e6:.1f}' for u in top]} s, "
         f"above limit: {sum(1 for u in usage.values() if u > 360_000_000)}")
 
+def grid_geo(lat, lon):
+    """16-bit grid encoding of section 5: 180 degrees over 65536 steps
+    for latitude, 360 for longitude (offset +32768)."""
+    la = int((lat + 90.0) / 180.0 * 65536)
+    lo = int((lon + 180.0) / 360.0 * 65536) + 32768
+    return max(1, min(65535, la)), max(1, min(65535, lo))
+
 _ARGS = None   # CLI context for scenarios (local-net reads --nodes/--duration)
 
 @scenario("local-net", "GPS node list (position+height) -> link budget; hello/ack measurement")
@@ -327,6 +334,7 @@ def local_net(mk, jitter):
     for i, nd in enumerate(nodes_list):
         kn = Node(radio, nd['id'])
         kn.core = set_jitter(mk(kn), jitter)
+        kn.core.set_geo(*grid_geo(nd['lat'], nd['lon']))   # published geo (5, 4.3)
         nodes.append(kn)
         radio.schedule(i * 250_000, kn.core.start)   # never start synchronously
     ids = [n['id'] for n in nodes_list]
@@ -373,6 +381,12 @@ def local_net(mk, jitter):
     out(f"neighbors per node: seen avg {sum(seen)/len(seen):.1f} (min {min(seen)}, max {max(seen)}), "
         f"confirmed symmetric avg {sum(conf)/len(conf):.1f}")
     out(f"nodes without confirmed neighbor: {sum(1 for b in conf if b == 0)} of {len(conf)}")
+    maps = [kn.core.map_size() for kn in nodes]
+    links = [kn.core.link_count() for kn in nodes]
+    geos = [sum(1 for m in kn.core.mn.map if m.alive and m.geo_lat) for kn in nodes]
+    out(f"2-hop map: avg {sum(maps)/len(maps):.1f} nodes (min {min(maps)}, max {max(maps)}), "
+        f"links avg {sum(links)/len(links):.1f}, "
+        f"entries with geo avg {sum(geos)/len(geos):.1f}")
     out(f"collisions: {sum(radio.wire.collided)} lost receptions, "
         f"{sum(kn.hello_missed for kn in nodes)} missed hellos")
     usage = {(n, c): radio.duty.usage(n, c, radio.now) for n in ids for c in range(N_CH)}
