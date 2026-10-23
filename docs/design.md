@@ -2,7 +2,7 @@
 
 **Status:** working document, simulated (building blocks 1 and 2 on utrecht40)
 **Language:** English
-**Last updated:** 23 October 2026 (measured under load, two fixes: one-hop closing piece in 7.1 — an ack1 from the destination closes the pending record; dedup cache as FIFO with eviction of the oldest entry, 8.3/10.2 — kills the routing ping-pong)
+**Last updated:** 23 October 2026 (measured under load, two fixes: one-hop closing piece in 7.1 — an ack1 from the destination closes the pending record; dedup cache as FIFO with eviction of the oldest entry, 8.3/10.2, and prev-hop exclusion at the first forward choice, 10.2 — the routing ping-pong cannot start)
 
 This document records the design decisions discussed so far. Each item carries a status:
 
@@ -554,6 +554,8 @@ Threads could use a shorter limit, for example three bits. That provides some ex
 Routing is **stateless per message**: the path is not in the header, every hop recomputes its own first step on its own known graph (10.1). A route therefore repairs itself at every hop when a table mutation arrives; there is no route invalidation, no route error propagation, and no stale path in flight. Loop-freedom does not come from the route computation but from the two existing mechanisms: the budget (9) bounds the total number of forwards and retries per message, and the dedup cache (8.3) discards repeats.
 
 **Dedup cache replacement (decided, Oct 2026, measured under load).** The dedup cache is a fixed-size FIFO of the most recent (msg-id, source) pairs; when full, the oldest entry is evicted. The earlier "full cache = receive anyway" pass-through turned dedup off completely after 128 messages, and a two-hop routing ping-pong could then forward one message more than 160 times (each forward is a fresh pending, and the retry-ack1 rule of 7.4 keeps the loop fed). FIFO replacement bounds the duplicate work structurally, without aging bookkeeping on the entries.
+
+**Prev-hop exclusion at the first forward choice (decided, Oct 2026, measured under load).** At the first route computation for a forwarded message, the hop the message came from is not a candidate for the next one. The known graph is local and incomplete, so two nodes can be each other's best first hop toward the destination (measured: 279<->285 bounced one message 166 times before a 15 s `T_ack2` broke the loop). The exclusion does not travel in the header - the previous hop is already in the packet (offset 7) - and costs nothing extra. The retry machinery of 7.4 applies it from its second series onward; here it prevents the two-hop loop from starting at all. When the exclusion leaves no candidate, the hop does not forward and the failure becomes visible through the negative ack2 / the failure report (10.5).
 
 | Situation | Rule | Status |
 |---|---|---|

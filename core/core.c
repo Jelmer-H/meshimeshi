@@ -1604,7 +1604,21 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         if (budget == 0) return;                  /* budget spent: the chain stops here */
         uint16_t gl = 0, go = 0;
         if (flags & F_DEST_GEO) { gl = rd16(pkt + 12); go = rd16(pkt + 14); }   /* geo stays in the header (10.2) */
-        uint16_t nh = route_next_hop_geo(n, dst, gl, go, 0, 0);
+        /* prev-hop exclusion at the FIRST forward choice (decided Oct
+         * 2026, measured under load): the hop the message came from
+         * is not a candidate for the next one. The known graph is
+         * local and incomplete, so two nodes can each other's best
+         * first hop toward the destination (measured: 279<->285
+         * bounced one message 166 times, kept alive by the dedup
+         * pass-through, only broken by a 15 s T_ack2). The retry
+         * machinery of 7.4 applies this exclusion from its second
+         * series onward; here it prevents the two-hop loop from ever
+         * starting. The source itself stays reachable as a fallback:
+         * when the exclusion leaves no candidate, the hop simply does
+         * not forward (the negative ack2 / failure report of 10.5
+         * follows later). */
+        uint16_t excl1 = prev;
+        uint16_t nh = route_next_hop_geo(n, dst, gl, go, &excl1, 1);
         if (!nh) return;                          /* no routable path: the hop fails (negative ack2 / report follow in step 3) */
         {
             mimeshi_pending *p = 0;
