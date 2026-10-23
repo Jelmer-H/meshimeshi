@@ -81,7 +81,12 @@ typedef struct {
     uint16_t pkt_len;
 } mimeshi_pending;
 
-typedef struct { uint16_t msg_id, src; } mimeshi_dedup;
+/* Dedup entry with insertion order (14, layer 3): the insertion
+ * counter makes the fixed-size cache a FIFO - the oldest entry is the
+ * replacement victim when the cache is full. Measured under load: a
+ * permanent "full = receive anyway" turned dedup off after 128
+ * messages, and a routing ping-pong forwarded one message 166 times. */
+typedef struct { uint16_t msg_id, src; uint16_t seq; } mimeshi_dedup;
 
 /* 2-hop map entry (4.3, 10.1): a node we know about indirectly (from
  * table chunks) or directly. Geo in the 16-bit grid of section 5;
@@ -161,6 +166,7 @@ struct mimeshi_node {
     uint32_t tick;                    /* local time base: proof ticks (~56 s)
                                          since start (4.4); starts at 1 */
     uint8_t  chunk_nr;                /* next table chunk number (4.3) */
+    uint16_t dedup_seq;               /* FIFO insertion counter of the dedup cache (14) */
     uint8_t  chunk_cursor;             /* table position where the next chunk
                                           continues: tables larger than one
                                           chunk cycle through the pushes (4.3) */

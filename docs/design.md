@@ -2,7 +2,7 @@
 
 **Status:** working document, simulated (building blocks 1 and 2 on utrecht40)
 **Language:** English
-**Last updated:** 22 October 2026 (building block 2 implemented and measured: route computation, forwarding with next-hop addressing, retry series 7.4, revised ack2 7.1–7.3, destination geo + bridge-node rule 10.2; cost table provisional, calibration open)
+**Last updated:** 23 October 2026 (measured under load, two fixes: one-hop closing piece in 7.1 — an ack1 from the destination closes the pending record; dedup cache as FIFO with eviction of the oldest entry, 8.3/10.2 — kills the routing ping-pong)
 
 This document records the design decisions discussed so far. Each item carries a status:
 
@@ -393,6 +393,8 @@ Example: A → B → C → D.
 
 **Status:** decided (revised Oct 2026: ack2 goes out on the ack1 of the own next hop).
 
+**One-hop closing piece (decided, Oct 2026, measured under load).** When the own next hop IS the final destination, the source closes its pending record on the ack1 of the destination: there is no second hop whose ack2 the source would wait for. Waiting for `T_ack2` anyway burned 6 budget units per delivered one-hop unicast and drove retry series through unrelated neighbours (measured: hundreds of `T_ack2` timeouts on messages that had already been delivered). The destination therefore needs no ack2 of its own; its ack1 is the end confirmation.
+
 ### 7.2 Meaning of ack2
 
 - **Positive (revised, Oct 2026):** the next hop has received the message **and its own hop has succeeded** — the ack2 goes out on the ack1 of the next hop's own next hop (7.1). Two hops of progress per ack2. Deeper progress is not covered; the hop after that carries its own responsibility within its retry space (7.4), so no ack2 has to wait for the whole chain.
@@ -550,6 +552,8 @@ Threads could use a shorter limit, for example three bits. That provides some ex
 ### 10.2 Choosing the next hop
 
 Routing is **stateless per message**: the path is not in the header, every hop recomputes its own first step on its own known graph (10.1). A route therefore repairs itself at every hop when a table mutation arrives; there is no route invalidation, no route error propagation, and no stale path in flight. Loop-freedom does not come from the route computation but from the two existing mechanisms: the budget (9) bounds the total number of forwards and retries per message, and the dedup cache (8.3) discards repeats.
+
+**Dedup cache replacement (decided, Oct 2026, measured under load).** The dedup cache is a fixed-size FIFO of the most recent (msg-id, source) pairs; when full, the oldest entry is evicted. The earlier "full cache = receive anyway" pass-through turned dedup off completely after 128 messages, and a two-hop routing ping-pong could then forward one message more than 160 times (each forward is a fresh pending, and the retry-ack1 rule of 7.4 keeps the loop fed). FIFO replacement bounds the duplicate work structurally, without aging bookkeeping on the entries.
 
 | Situation | Rule | Status |
 |---|---|---|

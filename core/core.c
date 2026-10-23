@@ -188,15 +188,25 @@ static mimeshi_neighbor *nbr_add(mimeshi_node *n, uint16_t id) {
  * msg-id 0 counts as an empty slot: every message with id 0 is therefore
  * passed through; msg-ids come from the RNG (16 bit) and may be 0 —
  * known and acceptable for building block 1, included in the dedup
- * hardening. Full cache = receive anyway; LRU replacement comes later
- * (14, layer 3). */
+ * hardening. Full cache = FIFO replacement (decided Oct 2026, measured
+ * under load): the oldest entry is evicted and the fresh one takes its
+ * place. "Receive anyway" after 128 messages turned dedup off
+ * completely, and a routing ping-pong forwarded one message 166 times
+ * (each FORWARD is a fresh pending, and the ack1 rule of 7.4 kept the
+ * loop fed). The recent 128 (msg-id, source) pairs always block. */
 static bool dedup_fresh(mimeshi_node *n, uint16_t msg_id, uint16_t src) {
     for (int i = 0; i < MC_MAX_DEDUP; i++)
         if (n->dedup[i].msg_id == msg_id && n->dedup[i].src == src) return false;
-    for (int i = 0; i < MC_MAX_DEDUP; i++) if (n->dedup[i].msg_id == 0) {
-        n->dedup[i].msg_id = msg_id; n->dedup[i].src = src; return true;
+    int victim = 0;
+    for (int i = 0; i < MC_MAX_DEDUP; i++) {
+        if (n->dedup[i].msg_id == 0) { victim = i; goto insert; }
+        if (n->dedup[i].seq < n->dedup[victim].seq) victim = i;
     }
-    return true; /* full cache: receive anyway (LRU comes later) */
+insert:
+    n->dedup[victim].msg_id = msg_id; n->dedup[victim].src = src;
+    n->dedup_seq = (uint16_t)(n->dedup_seq + 1);
+    n->dedup[victim].seq = n->dedup_seq;
+    return true;
 }
 
 /* ---------------- exchange (switch rule, section 2) ---------
@@ -1489,7 +1499,21 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                 } else {
                     /* source: the hop is done; ack2 comes back on the
                      * own home channel. T_ack2 (15 s) is the safety
-                     * net (7.3). */
+                     * net (7.3). Exception (decided Oct 2026, the
+                     * one-hop closing piece): when the own next hop
+                     * IS the final destination, its ack1 is the end
+                     * confirmation - there is no second hop whose
+                     * ack2 the source would wait for. The record
+                     * closes here; waiting would burn budget and
+                     * drive retries through unrelated neighbours
+                     * (measured: T_ack2 timeouts on delivered
+                     * one-hop unicasts under load). */
+                    if (p->next_hop == p->dst) {
+                        printf("[core] node %u: ACK1 from destination for msg %u - done\n",
+                               n->id, msg_id);
+                        p->active = 0;
+                        return;
+                    }
                     n->timer(n, MC_T_ACK2_US, ack2_timeout, p);
                 }
                 return;
