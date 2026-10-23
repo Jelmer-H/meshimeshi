@@ -857,16 +857,31 @@ static void chunk_send(mimeshi_node *n);
 
 /* Whole prefix in one push round: mutations are urgent (4.3 cadence
  * speed 1), so every chunk follows back to back. A round starts at
- * table position 0 and takes ceil(sym/8) chunks -- the full table,
- * deterministically, in one go. */
+ * table position 0 and ends when the cursor has come fully around:
+ * the number of chunks follows from what actually fits per chunk
+ * (230 B packet, 9 B per entry + 3 B per inter-neighbour link), not
+ * from the table size alone. A fixed ceil(sym/8) rounds off the
+ * count while entries get thicker as the link store fills - every
+ * round then shared the same first ~21 of 26 neighbours and never
+ * the tail (measured under load: the leaf neighbours of a hub
+ * vanished from its prefix forever, and the network 'forgot' them
+ * at the 24 h map eviction). The guard bounds the loop; a chunk
+ * with cnt 0 resets the cursor to 0, and no cursor progress also
+ * ends the round. */
 static void chunk_send_all(mimeshi_node *n) {
     uint16_t sym = 0;
+    int last = -1;
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
-        if (n->nbr[i].alive && n->nbr[i].sym) sym++;
+        if (n->nbr[i].alive && n->nbr[i].sym) { sym++; last = i; }
     if (sym == 0) return;
+    uint8_t end = (uint8_t)((last + 1) % MC_MAX_NEIGHBORS);   /* one past the last entry */
     n->chunk_cursor = 0;
-    for (uint16_t c = 0; c < (sym + MC_CHUNK_MAX_ENTRIES - 1) / MC_CHUNK_MAX_ENTRIES; c++)
+    for (uint16_t guard = 0; guard <= MC_MAX_NEIGHBORS; guard++) {
+        uint8_t before = n->chunk_cursor;
         chunk_send(n);
+        if (n->chunk_cursor == 0 || n->chunk_cursor == before
+            || n->chunk_cursor == end) break;   /* round complete: cursor passed the last entry */
+    }
 }
 
 static void chunk_send(mimeshi_node *n) {

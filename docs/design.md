@@ -2,7 +2,7 @@
 
 **Status:** working document, simulated (building blocks 1 and 2 on utrecht40)
 **Language:** English
-**Last updated:** 23 October 2026 (measured under load, two fixes: one-hop closing piece in 7.1 — an ack1 from the destination closes the pending record; dedup cache as FIFO with eviction of the oldest entry, 8.3/10.2, and prev-hop exclusion at the first forward choice, 10.2 — the routing ping-pong cannot start)
+**Last updated:** 23 October 2026 (measured under load, two fixes: one-hop closing piece in 7.1 — an ack1 from the destination closes the pending record; dedup cache as FIFO with eviction of the oldest entry, 8.3/10.2, and prev-hop exclusion at the first forward choice, 10.2 — the routing ping-pong cannot start; prefix round completes fully however thick the entries, 4.3 — the network no longer forgets leaf neighbours)
 
 This document records the design decisions discussed so far. Each item carries a status:
 
@@ -246,6 +246,7 @@ The solution is the **proof list**: a small packet with the node IDs of neighbou
 - The table also contains the links between the owner's neighbours. The owner already knows these from its neighbours' tables, so no extra pull is needed. Per link, the node IDs of both endpoints travel along (absolute IDs, no indices; see the chunk format below), with the quality in both directions. This way a node knows all links within its covered set, and the Gabriel graph around a gap becomes complete. Nodes beyond the covered set are unknown by default. They only come in through maintenance during quiet periods (section 12, point 15).
 - Sharing tables from second-hop nodes does **not** happen (that information already travels along via the tables of direct neighbours). Strategically expanding the routing table during quiet periods can be considered later.
 - At startup, the first table chunks are scheduled with a random delay, so that they do not collide with the hello round and other newcomers.
+- **Round size from content, not from the table (decided, Oct 2026, measured under load).** A full-prefix round runs until the cursor has passed the last confirmed entry - the number of chunks follows from what actually fits per packet (230 B: 9 B per entry plus 3 B per advertised link). A fixed `ceil(sym/8)` count silently truncated every round once the link store filled and entries grew thicker: a 26-neighbour hub then shared the same first ~21 entries forever and never the tail - its leaf neighbours disappeared from every prefix after a few hours, the network 'forgot' them at the 24 h map eviction, and their delivery fell to zero (measured: 'dst not in graph' refusals with ordinary sources and destinations). Entries per chunk thereby shrink as the store fills; the round sends more, smaller chunks instead of dropping content.
 - Tables larger than one packet go in chunks of about 200 bytes, with sequence numbers.
 
 **Chunk format (Oct 2026: self-contained, node-centric chunks).** Every chunk is processable in its entirety without information from other chunks; the order does not matter and the receiver does not need to know whether and when the rest comes.
