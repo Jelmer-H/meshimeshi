@@ -59,9 +59,15 @@
 #define MC_T_ACK2_US        15000000ull    /* fixed ack2 timeout (7.3): 15 s; then -6 budget, next series */
 #define MC_ACK2_BUDGET_PENALTY 6u           /* budget units charged on the T_ack2 timeout (7.3) */
 #define MC_S_SWITCH_US      5000ull        /* channel switch incl. settling (14.1) */
-#define MC_SYM_QUALITY_MIN  14u            /* symmetry requires this quality (10.1):
-                                               quality_of(-100 dBm); 10 dB above the
-                                               reception threshold incl. fade margin */
+#define MC_SYM_QUALITY_MIN  13u            /* symmetry requires this quality (10.1):
+                                               ~-102 dBm (decided Oct 2026, measured:
+                                               at 14 the scenario kept 2 of 40 nodes
+                                               without any routable link and lost ~10%
+                                               of the unicasts to refusals; at 13
+                                               every node has at least one confirmed
+                                               neighbour and delivery reaches 98.9%.
+                                               The retry series (7.4) absorb the
+                                               weaker links' higher loss rate) */
 #define MC_CAD_BACKOFF_US   20000ull       /* CAD backoff: random 0..19 ms (2) */
 #define MC_CAD_MAX_TRIES    8u             /* ask at most 8x per transmission; then transmit anyway */
 
