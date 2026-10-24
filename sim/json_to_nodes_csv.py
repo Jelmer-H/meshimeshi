@@ -34,7 +34,7 @@ def convert(in_path, out_path):
             loc.get("latitude", ""),
             loc.get("longitude", ""),
             "",  # hoogte_m: not available in the JSON export
-            node.get("name", ""),
+            "NODE#%04d" % (len(rows) + 1),
             node.get("node_weight", ""),
         ])
 
