@@ -6,8 +6,9 @@ Input: JSON list of node entries, e.g.
       "location":{"latitude":52.32576,"longitude":6.95849},
       "last_seen":"2026-10-23T08:52:33.109Z","node_weight":250.474,"sf":7}]
 
-Entries with sf != 7 are dropped. The hoogte_m column is left empty and the
-node_weight value is written as an extra column.
+Entries with sf != 7 are dropped. The height (hoogte_m) is estimated from
+node_weight as h = 2 + 2.54*w^0.56 metres (median weight -> 20 m, heaviest
+node -> 300 m); node_weight is also written as an extra column.
 
 Fields are written in the lowercase hexadecimal notation also used for MAC
 addresses and IPv6 (0-9, a-f):
@@ -21,8 +22,21 @@ Output format: id,lat,lon,hoogte_m,naam,node_weight
 import argparse
 import csv
 import json
+import math
 import sys
 from binascii import crc_hqx
+
+
+def weight_to_height_m(weight):
+    """Estimate an antenna height from the node weight.
+
+    The weight distribution is strongly right-skewed (handhelds near 0, a
+    few heavy installations in the thousands). A power law keeps the
+    median at a realistic ~20 m roof mount while stretching the heavy tail
+    to real mast heights: calibrated so the median weight maps to 20 m
+    and the heaviest node in the dataset maps to 300 m.
+    """
+    return round(2.0 + 2.54 * weight ** 0.56, 1)
 
 
 def geo16(value, low, span):
@@ -55,7 +69,7 @@ def convert(in_path, out_path):
             nid,
             geo16(float(loc["latitude"]), -90.0, 180.0),
             geo16(float(loc["longitude"]), -180.0, 360.0),
-            "",  # hoogte_m: not available in the JSON export
+            weight_to_height_m(float(node["node_weight"])),
             "NODE#%04d" % (len(rows) + 1),
             node.get("node_weight", ""),
         ])
