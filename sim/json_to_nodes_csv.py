@@ -16,6 +16,7 @@ import argparse
 import csv
 import json
 import sys
+from binascii import crc_hqx
 
 
 def convert(in_path, out_path):
@@ -24,14 +25,23 @@ def convert(in_path, out_path):
 
     rows = []
     skipped = 0
+    seen_ids = {}
     for node in nodes:
         if node.get("sf") != 7:
             skipped += 1
             continue
         loc = node.get("location") or {}
         pubkey = node.get("public_key", "")
+        # Deterministic 16-bit node id from the full public key (design.md:
+        # node ID is 2 bytes). Collisions are reported as a warning.
+        nid = "0x%04X" % (crc_hqx(pubkey.encode("utf-8"), 0xFFFF) & 0xFFFF)
+        if nid in seen_ids:
+            print("WARNING: id collision: %s for %s and %s" %
+                  (nid, seen_ids[nid], node.get("name", "?")), file=sys.stderr)
+        else:
+            seen_ids[nid] = node.get("name", "?")
         rows.append([
-            pubkey[:8],  # first 4 bytes of the public key
+            nid,
             loc.get("latitude", ""),
             loc.get("longitude", ""),
             "",  # hoogte_m: not available in the JSON export
