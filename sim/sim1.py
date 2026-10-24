@@ -115,9 +115,22 @@ TX_DBM = 27.0          # ERP in the 869.4-869.65 MHz sub-band (500 mW)
 RX_MIN_DBM = -110.0    # reception threshold incl. fade margin
 FSPL_1KM_DB = 91.2    # free-space loss at 869 MHz over 1 km
 
+def _node_field(raw, base=0):
+    """Parse a node CSV field: degrees (float) or hex (mac/ipv6 style,
+    e.g. '9a3c'); empty -> None."""
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return int(raw, base)
+
 def load_nodes_csv(path):
     """Node list with GPS position and height. Format per line:
-    id,lat,lon,height_m,name — '#' is a comment."""
+    id,lat,lon,height_m,name[,...] — '#' is a comment.
+    id is 16-bit (hex or 0x-prefixed); lat/lon are degrees, or the on-air
+    16-bit geo grid as hex (design.md section 5); height may be empty."""
     nodes = []
     with open(path) as f:
         for line in f:
@@ -125,8 +138,18 @@ def load_nodes_csv(path):
             if not line or line.startswith('#'):
                 continue
             d = [v.strip() for v in line.split(',')]
-            nodes.append({'id': int(d[0], 0), 'lat': float(d[1]),
-                          'lon': float(d[2]), 'h': float(d[3]),
+            if d[0] == 'id':  # header row
+                continue
+            nid = _node_field(d[0], 16)
+            lat = _node_field(d[1], 16)
+            if isinstance(lat, int):
+                lat = -90.0 + lat / 65535.0 * 180.0
+            lon = _node_field(d[2], 16)
+            if isinstance(lon, int):
+                lon = -180.0 + lon / 65535.0 * 360.0
+            h = _node_field(d[3]) or 0.0
+            nodes.append({'id': nid, 'lat': lat,
+                          'lon': lon, 'h': h,
                           'name': d[4] if len(d) > 4 else ''})
     return nodes
 

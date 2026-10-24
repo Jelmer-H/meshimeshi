@@ -9,6 +9,12 @@ Input: JSON list of node entries, e.g.
 Entries with sf != 7 are dropped. The hoogte_m column is left empty and the
 node_weight value is written as an extra column.
 
+Fields are written in the lowercase hexadecimal notation also used for MAC
+addresses and IPv6 (0-9, a-f):
+  - id: CRC-16 over the full public key, 4 hex digits (2 bytes, design.md)
+  - lat/lon: the on-air geo encoding (design.md section 5), each 4 hex
+    digits: lat = round((lat + 90) / 180 * 65535), lon likewise over 360.
+
 Output format: id,lat,lon,hoogte_m,naam,node_weight
 """
 
@@ -17,6 +23,11 @@ import csv
 import json
 import sys
 from binascii import crc_hqx
+
+
+def geo16(value, low, span):
+    """Quantise a degree value onto the on-air 16-bit grid, hex notation."""
+    return "%04x" % round((value - low) / span * 65535)
 
 
 def convert(in_path, out_path):
@@ -34,7 +45,7 @@ def convert(in_path, out_path):
         pubkey = node.get("public_key", "")
         # Deterministic 16-bit node id from the full public key (design.md:
         # node ID is 2 bytes). Collisions are reported as a warning.
-        nid = "0x%04X" % (crc_hqx(pubkey.encode("utf-8"), 0xFFFF) & 0xFFFF)
+        nid = "%04x" % (crc_hqx(pubkey.encode("utf-8"), 0xFFFF) & 0xFFFF)
         if nid in seen_ids:
             print("WARNING: id collision: %s for %s and %s" %
                   (nid, seen_ids[nid], node.get("name", "?")), file=sys.stderr)
@@ -42,8 +53,8 @@ def convert(in_path, out_path):
             seen_ids[nid] = node.get("name", "?")
         rows.append([
             nid,
-            loc.get("latitude", ""),
-            loc.get("longitude", ""),
+            geo16(float(loc["latitude"]), -90.0, 180.0),
+            geo16(float(loc["longitude"]), -180.0, 360.0),
             "",  # hoogte_m: not available in the JSON export
             "NODE#%04d" % (len(rows) + 1),
             node.get("node_weight", ""),
