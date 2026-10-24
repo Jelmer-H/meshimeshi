@@ -68,14 +68,17 @@ typedef struct {
     uint8_t  acked1;        /* ack1 of the own next hop is in (7.1): a
                               forwarder now sends its ack2 and closes;
                               the source enters the T_ack2 wait (7.3) */
-    uint8_t  alt_left;      /* remaining alternative-hop series (7.4: at
-                              most 3 neighbours per hop, so 2 after the
-                              first choice) */
+    uint8_t  cand_cnt;      /* candidates of the attempt plan (7.4): 1..3
+                              next hops, each the best hop of a full
+                              Dijkstra run without the earlier ones */
+    uint8_t  try_idx;       /* attempt counter over the plan; cand[try_idx
+                              % cand_cnt] is the next hop of the attempt */
     uint8_t  excl_cnt;      /* failed next hops of THIS message (7.4:
                               cumulative exclusion per message, no
                               protocol field - the penalty 10.4 carries
                               the long-term lesson) */
     uint16_t msg_id, src, dst, prev_hop, next_hop;
+    uint16_t cand[3];      /* the attempt plan, best first (7.4) */
     uint16_t excl[3];       /* the failed hops (7.4) */
     uint8_t  pkt[16 + MC_MAX_PAYLOAD];
     uint16_t pkt_len;

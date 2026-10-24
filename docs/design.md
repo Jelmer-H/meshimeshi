@@ -2,7 +2,7 @@
 
 **Status:** working document, simulated (building blocks 1 and 2 on utrecht40)
 **Language:** English
-**Last updated:** 23 October 2026 (measured under load, two fixes: one-hop closing piece in 7.1 — an ack1 from the destination closes the pending record; dedup cache as FIFO with eviction of the oldest entry, 8.3/10.2, and prev-hop exclusion at the first forward choice, 10.2 — the routing ping-pong cannot start; prefix round completes fully however thick the entries, 4.3 — the network no longer forgets leaf neighbours; symmetry gate at 13 (~-102 dBm), 10.1 — every node routable, delivery 98.9%)
+**Last updated:** 23 October 2026 (measured under load, two fixes: one-hop closing piece in 7.1 — an ack1 from the destination closes the pending record; dedup cache as FIFO with eviction of the oldest entry, 8.3/10.2, and prev-hop exclusion at the first forward choice, 10.2 — the routing ping-pong cannot start; prefix round completes fully however thick the entries, 4.3 — the network no longer forgets leaf neighbours; symmetry gate at 13 (~-102 dBm), 10.1; attempt schedule for retries, 7.3/7.4 — T_ack2 8 s, latency max 28 -> 9 s, delivery 99.1%)
 
 This document records the design decisions discussed so far. Each item carries a status:
 
@@ -415,24 +415,24 @@ Example: A → B → C → D.
 | Timeout | Value | Status |
 |---|---|---|
 | ack1 (short) | `t_data + t_ack + processing + margin`, measured from the end of the own transmission | Decided (principle) |
-| ack2 (fixed) | **`T_ack2 = 15 s`** (decided, Oct 2026, replacing the old worst-case formula). After the timeout the sender treats the silence like a failed second attempt toward this neighbour: **6 units go off the budget**, and the retry structure of 7.4 takes over — next-best hop if attempts remain, otherwise the failed delivery report to the source (10.5) | Decided |
+| ack2 (fixed) | **`T_ack2 = 8 s`** (revised Oct 2026 with the attempt schedule of 7.4: the schedule completes in ~6 s worst case, so silence beyond 8 s means the next hop's forwarding truly stalled). After the timeout the sender treats the silence like a failed attempt toward this neighbour: budget units go off (7.4), and the message fails for this hop with a negative ack2 upstream | Decided |
 
-- `T_ack2` does not depend on the path length, because the sender only looks at its own next hop. The fixed 15 s covers the worst case of the next hop's own series: 3 neighbours × 2 attempts with 2 s + jitter between each pair (7.4), plus the ack2 transmission itself.
+- `T_ack2` does not depend on the path length, because the sender only looks at its own next hop. The fixed 8 s covers the worst case of the next hop's own attempt schedule: up to 6 attempts with escalating waits inside ~6 s (7.4), plus the ack2 transmission itself.
 - If the next hop itself fails, no ack1 comes. The sender notices this at the ack1 timeout — that is the fast signal; `T_ack2` is only about the *slow* failure (next hop received, but its own forwarding stalls beyond every retry).
 - A negative ack2 arrives well before the timeout in every normal failure case; the timeout is the safety net, not the primary mechanism.
 
 ### 7.4 Retries
 
-- At most three neighbours per hop: the first next hop from the normal route computation (10.2), then at most two alternatives.
-- At most two transmission attempts per neighbour.
-- **Wait between the two attempts toward the same neighbour: 2 s + random 0..1000 ms** (decided, Oct 2026). The wait is the collision damper: a busy channel gets seconds of rest before the same hop is tried again. It applies only between the two attempts of one series; after a failed series the next neighbour follows immediately (new computation, then transmit) - no extra wait.
-- **Alternative hops: recompute with the failed links excluded.** After a failed series the route computation runs again, with all links that failed for this message excluded so far - cumulatively: at the third neighbour, the first two failed links stay excluded. Per message, so the exclusion costs no protocol field; the penalty (10.4) carries the long-term lesson into future messages.
-- **Source-is-next-hop: fail immediately.** If the recomputation says the best next hop is the previous hop (the message would travel back), the route has no forward option left. Then the node stops retrying immediately and sends a negative ack2 with the spent budget, without further attempts.
-- Ack1 received but no ack2: switch to the next neighbour.
-- Negative ack2 from the next hop: move to the next neighbour immediately, without waiting.
-- **Retry reception is acked (decided, Oct 2026):** a received transmission that is a duplicate (dedup hit) gets an ack1 anyway, on the channel it arrived on. The most likely reason for the retry is a lost ack1, not a lost data packet; silence would make the sender declare the link dead and detour - an alternative-hop series costs far more airtime than the 8 B ack1. Dedup still gates the processing: a duplicate is not delivered or forwarded again.
+**Attempt schedule (revised Oct 2026, measured under load).** One hop gets ONE schedule of at most 6 transmission attempts, built once at submission/forwarding - no rebuild afterward. The schedule is table-driven and thereby fully readable in the code (candidate table, wait table, one round-robin function).
 
-**Status:** decided (series structure, wait, cumulative exclusion, source-is-next-hop, retry acking).
+- **Candidates: up to 3, each from a full Dijkstra run.** Candidate 1 is the computed route (10.2); candidate 2 is the best route that does not start with candidate 1; candidate 3 likewise without the first two. Every candidate is thereby a real, computed alternative over the whole known graph, and the best candidate always leads. The previous hop is part of the Dijkstra exclusion itself from the first round - a post-filter on the result would discard the whole plan when the best route leads back, while the second-best non-prev route exists but was never computed (measured: silent hop drops, five times the T_ack2 firings at the sender).
+- **Attempts round-robin over the candidates: 1 candidate = 4 attempts (A,A,A,A); 2 = 6 (A,B,A,B,A,B); 3 = 6 (A,B,C,A,B,C).** At most 4 toward the same node, at most 6 total - both limits hold structurally, without separate counters.
+- **Waits: small fixed gap inside a pass, escalating gap at each pass boundary.** The next attempt within a pass goes to a DIFFERENT node, so no damper needed: a fixed 400 ms (+-25% jitter). At a pass boundary the same node comes back - there the damper belongs: 800, 1200, 1800 ms (+-25% jitter), strictly escalating. With 1 candidate every attempt is a boundary; the pass table then runs 0.8, 1.2, 1.8 s. The jitter keeps two nodes that collided once from retrying in lock-step.
+- **Everything inside ~6 s worst case, 10 s including maximal CAD backoffs.** Measured on the load run: last-hop latency max 9.1 s (was 28.0 s with the old series), p95 1.2 s.
+- **Schedule exhausted: definitive fail for this hop.** All candidates go into the cumulative exclusion together (per message, no protocol field; the penalty 10.4 carries the long-term lesson), and a negative ack2 goes to the previous hop with the spent budget - the previous hop decides with its own schedule and budget whether another route remains. No rebuild: the 6 attempts ARE the retry space of the hop.
+- **Retry reception is acked (decided, Oct 2026):** a received transmission that is a duplicate (dedup hit) gets an ack1 anyway, on the channel it arrived on. The most likely reason for the retry is a lost ack1, not a lost data packet; silence would make the sender declare the link dead and detour. Dedup still gates the processing: a duplicate is not delivered or forwarded again.
+
+**Status:** decided (attempt schedule: Dijkstra candidates, round-robin attempts, pass-boundary waits, definitive fail; retry acking).
 
 ---
 
