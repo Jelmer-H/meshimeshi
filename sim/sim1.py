@@ -327,16 +327,18 @@ class CNeighbor(ctypes.Structure):
 class CPending(ctypes.Structure):
     _fields_ = [("active", ctypes.c_uint8), ("tries_left", ctypes.c_uint8),
                 ("budget_left", ctypes.c_uint8), ("acked1", ctypes.c_uint8),
-                ("alt_left", ctypes.c_uint8), ("excl_cnt", ctypes.c_uint8),
+                ("cand_cnt", ctypes.c_uint8), ("try_idx", ctypes.c_uint8),
+                ("excl_cnt", ctypes.c_uint8),
                 ("msg_id", ctypes.c_uint16), ("src", ctypes.c_uint16),
                 ("dst", ctypes.c_uint16), ("prev_hop", ctypes.c_uint16),
                 ("next_hop", ctypes.c_uint16),
+                ("cand", ctypes.c_uint16 * 3),
                 ("excl", ctypes.c_uint16 * 3),
                 ("pkt", ctypes.c_uint8 * (16 + MC_MAX_PAYLOAD)),
                 ("pkt_len", ctypes.c_uint16)]
 
 class CDedup(ctypes.Structure):
-    _fields_ = [("msg_id", ctypes.c_uint16), ("src", ctypes.c_uint16)]
+    _fields_ = [("msg_id", ctypes.c_uint16), ("src", ctypes.c_uint16), ("seq", ctypes.c_uint16)]
 
 MC_MAP_NODES, MC_MAX_LINKS = 256, 1536
 
@@ -374,7 +376,8 @@ CNode._fields_ = [
     ("proof_wait", ctypes.c_uint8 * 3),  # flush countdown per channel (4.2)
     ("geo_lat", ctypes.c_uint16), ("geo_lon", ctypes.c_uint16),  # own geo grid (5)
     ("tick", ctypes.c_uint32),          # local time base in proof ticks (4.4)
-    ("chunk_nr", ctypes.c_uint8), ("chunk_cursor", ctypes.c_uint8), ("tail_cursor", ctypes.c_uint8), ("tbl_dirty", ctypes.c_uint8),
+    ("chunk_nr", ctypes.c_uint8), ("dedup_seq", ctypes.c_uint16),
+    ("chunk_cursor", ctypes.c_uint8), ("tail_cursor", ctypes.c_uint8), ("tbl_dirty", ctypes.c_uint8),
     ("tbl_push_sched", ctypes.c_uint8),
     ("map", CMapNode * MC_MAP_NODES),   # 2-hop map (10.1)
     ("lnk", CLink * MC_MAX_LINKS),      # link store (4.3)

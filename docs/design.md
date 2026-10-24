@@ -2,7 +2,7 @@
 
 **Status:** working document, simulated (building blocks 1 and 2 on utrecht40)
 **Language:** English
-**Last updated:** 22 October 2026 (building block 2 implemented and measured: route computation, forwarding with next-hop addressing, retry series 7.4, revised ack2 7.1–7.3, destination geo + bridge-node rule 10.2; cost table provisional, calibration open)
+**Last updated:** 23 October 2026 (measured under load, two fixes: one-hop closing piece in 7.1 — an ack1 from the destination closes the pending record; dedup cache as FIFO with eviction of the oldest entry, 8.3/10.2, and prev-hop exclusion at the first forward choice, 10.2 — the routing ping-pong cannot start; prefix round completes fully however thick the entries, 4.3 — the network no longer forgets leaf neighbours; symmetry gate at 13 (~-102 dBm), 10.1; attempt schedule for retries, 7.3/7.4 — T_ack2 8 s, latency max 28 -> 9 s, delivery 99.1%)
 
 This document records the design decisions discussed so far. Each item carries a status:
 
@@ -246,6 +246,7 @@ The solution is the **proof list**: a small packet with the node IDs of neighbou
 - The table also contains the links between the owner's neighbours. The owner already knows these from its neighbours' tables, so no extra pull is needed. Per link, the node IDs of both endpoints travel along (absolute IDs, no indices; see the chunk format below), with the quality in both directions. This way a node knows all links within its covered set, and the Gabriel graph around a gap becomes complete. Nodes beyond the covered set are unknown by default. They only come in through maintenance during quiet periods (section 12, point 15).
 - Sharing tables from second-hop nodes does **not** happen (that information already travels along via the tables of direct neighbours). Strategically expanding the routing table during quiet periods can be considered later.
 - At startup, the first table chunks are scheduled with a random delay, so that they do not collide with the hello round and other newcomers.
+- **Round size from content, not from the table (decided, Oct 2026, measured under load).** A full-prefix round runs until the cursor has passed the last confirmed entry - the number of chunks follows from what actually fits per packet (230 B: 9 B per entry plus 3 B per advertised link). A fixed `ceil(sym/8)` count silently truncated every round once the link store filled and entries grew thicker: a 26-neighbour hub then shared the same first ~21 entries forever and never the tail - its leaf neighbours disappeared from every prefix after a few hours, the network 'forgot' them at the 24 h map eviction, and their delivery fell to zero (measured: 'dst not in graph' refusals with ordinary sources and destinations). Entries per chunk thereby shrink as the store fills; the round sends more, smaller chunks instead of dropping content.
 - Tables larger than one packet go in chunks of about 200 bytes, with sequence numbers.
 
 **Chunk format (Oct 2026: self-contained, node-centric chunks).** Every chunk is processable in its entirety without information from other chunks; the order does not matter and the receiver does not need to know whether and when the rest comes.
@@ -393,6 +394,8 @@ Example: A → B → C → D.
 
 **Status:** decided (revised Oct 2026: ack2 goes out on the ack1 of the own next hop).
 
+**One-hop closing piece (decided, Oct 2026, measured under load).** When the own next hop IS the final destination, the source closes its pending record on the ack1 of the destination: there is no second hop whose ack2 the source would wait for. Waiting for `T_ack2` anyway burned 6 budget units per delivered one-hop unicast and drove retry series through unrelated neighbours (measured: hundreds of `T_ack2` timeouts on messages that had already been delivered). The destination therefore needs no ack2 of its own; its ack1 is the end confirmation.
+
 ### 7.2 Meaning of ack2
 
 - **Positive (revised, Oct 2026):** the next hop has received the message **and its own hop has succeeded** — the ack2 goes out on the ack1 of the next hop's own next hop (7.1). Two hops of progress per ack2. Deeper progress is not covered; the hop after that carries its own responsibility within its retry space (7.4), so no ack2 has to wait for the whole chain.
@@ -412,24 +415,24 @@ Example: A → B → C → D.
 | Timeout | Value | Status |
 |---|---|---|
 | ack1 (short) | `t_data + t_ack + processing + margin`, measured from the end of the own transmission | Decided (principle) |
-| ack2 (fixed) | **`T_ack2 = 15 s`** (decided, Oct 2026, replacing the old worst-case formula). After the timeout the sender treats the silence like a failed second attempt toward this neighbour: **6 units go off the budget**, and the retry structure of 7.4 takes over — next-best hop if attempts remain, otherwise the failed delivery report to the source (10.5) | Decided |
+| ack2 (fixed) | **`T_ack2 = 8 s`** (revised Oct 2026 with the attempt schedule of 7.4: the schedule completes in ~6 s worst case, so silence beyond 8 s means the next hop's forwarding truly stalled). After the timeout the sender treats the silence like a failed attempt toward this neighbour: budget units go off (7.4), and the message fails for this hop with a negative ack2 upstream | Decided |
 
-- `T_ack2` does not depend on the path length, because the sender only looks at its own next hop. The fixed 15 s covers the worst case of the next hop's own series: 3 neighbours × 2 attempts with 2 s + jitter between each pair (7.4), plus the ack2 transmission itself.
+- `T_ack2` does not depend on the path length, because the sender only looks at its own next hop. The fixed 8 s covers the worst case of the next hop's own attempt schedule: up to 6 attempts with escalating waits inside ~6 s (7.4), plus the ack2 transmission itself.
 - If the next hop itself fails, no ack1 comes. The sender notices this at the ack1 timeout — that is the fast signal; `T_ack2` is only about the *slow* failure (next hop received, but its own forwarding stalls beyond every retry).
 - A negative ack2 arrives well before the timeout in every normal failure case; the timeout is the safety net, not the primary mechanism.
 
 ### 7.4 Retries
 
-- At most three neighbours per hop: the first next hop from the normal route computation (10.2), then at most two alternatives.
-- At most two transmission attempts per neighbour.
-- **Wait between the two attempts toward the same neighbour: 2 s + random 0..1000 ms** (decided, Oct 2026). The wait is the collision damper: a busy channel gets seconds of rest before the same hop is tried again. It applies only between the two attempts of one series; after a failed series the next neighbour follows immediately (new computation, then transmit) - no extra wait.
-- **Alternative hops: recompute with the failed links excluded.** After a failed series the route computation runs again, with all links that failed for this message excluded so far - cumulatively: at the third neighbour, the first two failed links stay excluded. Per message, so the exclusion costs no protocol field; the penalty (10.4) carries the long-term lesson into future messages.
-- **Source-is-next-hop: fail immediately.** If the recomputation says the best next hop is the previous hop (the message would travel back), the route has no forward option left. Then the node stops retrying immediately and sends a negative ack2 with the spent budget, without further attempts.
-- Ack1 received but no ack2: switch to the next neighbour.
-- Negative ack2 from the next hop: move to the next neighbour immediately, without waiting.
-- **Retry reception is acked (decided, Oct 2026):** a received transmission that is a duplicate (dedup hit) gets an ack1 anyway, on the channel it arrived on. The most likely reason for the retry is a lost ack1, not a lost data packet; silence would make the sender declare the link dead and detour - an alternative-hop series costs far more airtime than the 8 B ack1. Dedup still gates the processing: a duplicate is not delivered or forwarded again.
+**Attempt schedule (revised Oct 2026, measured under load).** One hop gets ONE schedule of at most 6 transmission attempts, built once at submission/forwarding - no rebuild afterward. The schedule is table-driven and thereby fully readable in the code (candidate table, wait table, one round-robin function).
 
-**Status:** decided (series structure, wait, cumulative exclusion, source-is-next-hop, retry acking).
+- **Candidates: up to 3, each from a full Dijkstra run.** Candidate 1 is the computed route (10.2); candidate 2 is the best route that does not start with candidate 1; candidate 3 likewise without the first two. Every candidate is thereby a real, computed alternative over the whole known graph, and the best candidate always leads. The previous hop is part of the Dijkstra exclusion itself from the first round - a post-filter on the result would discard the whole plan when the best route leads back, while the second-best non-prev route exists but was never computed (measured: silent hop drops, five times the T_ack2 firings at the sender).
+- **Attempts round-robin over the candidates: 1 candidate = 4 attempts (A,A,A,A); 2 = 6 (A,B,A,B,A,B); 3 = 6 (A,B,C,A,B,C).** At most 4 toward the same node, at most 6 total - both limits hold structurally, without separate counters.
+- **Waits: small fixed gap inside a pass, escalating gap at each pass boundary.** The next attempt within a pass goes to a DIFFERENT node, so no damper needed: a fixed 400 ms (+-25% jitter). At a pass boundary the same node comes back - there the damper belongs: 800, 1200, 1800 ms (+-25% jitter), strictly escalating. With 1 candidate every attempt is a boundary; the pass table then runs 0.8, 1.2, 1.8 s. The jitter keeps two nodes that collided once from retrying in lock-step.
+- **Everything inside ~6 s worst case, 10 s including maximal CAD backoffs.** Measured on the load run: last-hop latency max 3.9 s (was 28.0 s with the old series), p95 1.1 s.
+- **Schedule exhausted: definitive fail for this hop.** All candidates go into the cumulative exclusion together (per message, no protocol field; the penalty 10.4 carries the long-term lesson), and a negative ack2 goes to the previous hop with the spent budget - the previous hop decides with its own schedule and budget whether another route remains. No rebuild: the 6 attempts ARE the retry space of the hop.
+- **Retry reception is acked (decided, Oct 2026):** a received transmission that is a duplicate (dedup hit) gets an ack1 anyway, on the channel it arrived on. The most likely reason for the retry is a lost ack1, not a lost data packet; silence would make the sender declare the link dead and detour. Dedup still gates the processing: a duplicate is not delivered or forwarded again.
+
+**Status:** decided (attempt schedule: Dijkstra candidates, round-robin attempts, pass-boundary waits, definitive fail; retry acking).
 
 ---
 
@@ -539,7 +542,8 @@ Threads could use a shorter limit, for example three bits. That provides some ex
 
 - Per node: the known graph built from the own direct neighbours plus everything that arrives via the table chunks (4.3): nodes as ID, geo, age and quality, and the links between them with the advertised quality class per direction. Bounded at 256 map nodes and a fixed link store (13.2, 13.3). There is no hop horizon anymore: an entry counts, wherever its source lies. Beyond the graph, a node knows nothing.
 - Links are used only if they are above a quality threshold and work in both directions.
-- **Quality gate on confirmation (decided, Oct 2026):** a confirmation (hello ack addressed to us, proof list naming us, ack1 on our data) makes a link symmetric only when the measured quality of that reception is above the threshold. Each node can only measure the direction toward itself; the neighbour applies the same gate to its own direction. The combined effect: a link is confirmed symmetric only when BOTH directions are above the threshold — the core value is `MC_SYM_QUALITY_MIN`, quality_of(−100 dBm), 10 dB above the reception threshold including fade margin. A weak link stays "seen": liveness and quality remain stored, the proof refreshes the reverse evidence, but routing never selects it. The proof list only sends confirmed links (4.2), so weak links are also never advertised to third parties as working.
+- **Quality gate on confirmation (decided, Oct 2026):** a confirmation (hello ack addressed to us, proof list naming us, ack1 on our data) makes a link symmetric only when the measured quality of that reception is above the threshold. Each node can only measure the direction toward itself; the neighbour applies the same gate to its own direction. The combined effect: a link is confirmed symmetric only when BOTH directions are above the threshold — the core value is `MC_SYM_QUALITY_MIN`. A weak link stays "seen": liveness and quality remain stored, the proof refreshes the reverse evidence, but routing never selects it. The proof list only sends confirmed links (4.2), so weak links are also never advertised to third parties as working.
+- **Gate value (revised Oct 2026, measured under load):** `MC_SYM_QUALITY_MIN` = 13 (~−102 dBm). At 14 (~−100 dBm) the utrecht40 scenario kept 2 of 40 nodes without a single routable link and ~10% of the unicasts were refused as 'dst not in graph'; at 13 every node has at least one confirmed neighbour, the average rises from 3.5 to 4.8 confirmed links, and delivery reaches 98.9% (load run, 24 h warmup + 6 h). The retry series (7.4) absorb the higher loss rate of the weaker links: T_ack2 timeouts and FAILs stayed at the same level, duty stayed far under the limit. Below 13 there is no further structural gain in the scenario (only thicker retry traffic over bad links).
 - Each direction must be proven by the receiver of that direction:
   - A hello or an overheard hello ack proves only sender→receiver ("seen").
   - The reverse direction comes exclusively from the neighbour itself: via a hello ack addressed to us, via its table chunks (4.3), or via a successful unicast with ack1 ("confirmed").
@@ -550,6 +554,10 @@ Threads could use a shorter limit, for example three bits. That provides some ex
 ### 10.2 Choosing the next hop
 
 Routing is **stateless per message**: the path is not in the header, every hop recomputes its own first step on its own known graph (10.1). A route therefore repairs itself at every hop when a table mutation arrives; there is no route invalidation, no route error propagation, and no stale path in flight. Loop-freedom does not come from the route computation but from the two existing mechanisms: the budget (9) bounds the total number of forwards and retries per message, and the dedup cache (8.3) discards repeats.
+
+**Dedup cache replacement (decided, Oct 2026, measured under load).** The dedup cache is a fixed-size FIFO of the most recent (msg-id, source) pairs; when full, the oldest entry is evicted. The earlier "full cache = receive anyway" pass-through turned dedup off completely after 128 messages, and a two-hop routing ping-pong could then forward one message more than 160 times (each forward is a fresh pending, and the retry-ack1 rule of 7.4 keeps the loop fed). FIFO replacement bounds the duplicate work structurally, without aging bookkeeping on the entries.
+
+**Prev-hop exclusion at the first forward choice (decided, Oct 2026, measured under load).** At the first route computation for a forwarded message, the hop the message came from is not a candidate for the next one. The known graph is local and incomplete, so two nodes can be each other's best first hop toward the destination (measured: 279<->285 bounced one message 166 times before a 15 s `T_ack2` broke the loop). The exclusion does not travel in the header - the previous hop is already in the packet (offset 7) - and costs nothing extra. The retry machinery of 7.4 applies it from its second series onward; here it prevents the two-hop loop from starting at all. When the exclusion leaves no candidate, the hop does not forward and the failure becomes visible through the negative ack2 / the failure report (10.5).
 
 | Situation | Rule | Status |
 |---|---|---|

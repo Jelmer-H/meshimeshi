@@ -585,6 +585,8 @@ def load(mk, jitter):
                 mid = pkt[1] | (pkt[2] << 8)
                 key = (mid, src)
                 if not hasattr(rx, '_seen'): rx._seen = set()
+                if not hasattr(rx, '_times'): rx._times = {}
+                rx._times[key] = rx._times.get(key, 0) + 1
                 if key not in rx._seen:
                     rx._seen.add(key)
                     delivered[0] += 1
@@ -605,7 +607,11 @@ def load(mk, jitter):
                 if p.active and p.dst == dst:
                     sent_at[(p.msg_id, p.src)] = radio.now
                     break
-        elif rc == -1: refused_graph[0] += 1
+        elif rc == -1:
+            refused_graph[0] += 1
+            if not hasattr(send_probe, '_ref'): send_probe._ref = {}
+            key = (self.n.id, dst)
+            send_probe._ref[key] = send_probe._ref.get(key, 0) + 1
         elif rc == -2: refused_slot[0] += 1
         return rc
     CCore.send_data = send_probe
@@ -625,8 +631,13 @@ def load(mk, jitter):
                 # assumption (10.2): the end user supplies the correct
                 # destination geo with the message - the bridge-node
                 # rule can route even outside the own graph
-                kn.core.send_data(dst, bytes(payload), ack3=False, geo=node_geo[dst])
+                rc = kn.core.send_data(dst, bytes(payload), ack3=False, geo=node_geo[dst])
                 attempted[0] += 1
+                if not hasattr(gen, '_att'): gen._att = {}
+                gen._att[kn.id] = gen._att.get(kn.id, 0) + 1
+                if rc != 0:
+                    if not hasattr(gen, '_ref'): gen._ref = {}
+                    gen._ref[(kn.id, rc)] = gen._ref.get((kn.id, rc), 0) + 1
         radio.schedule(interval_us, gen)
     radio.schedule(interval_us, gen)
     radio.run(until_us=warmup_us + duration_us)
@@ -636,6 +647,34 @@ def load(mk, jitter):
     out(f"unicast attempts {att}, refused: dst not in graph {refused_graph[0]}, "
         f"no pending slot {refused_slot[0]}; delivered {dlv} "
         f"({100*dlv/max(att,1):.1f}% of attempts, last-hop retries seen {retries_seen[0]})")
+    if refused_graph[0] and hasattr(send_probe, '_ref'):
+        ref = send_probe._ref
+        pairs = sorted(ref.items(), key=lambda kv: -kv[1])[:10]
+        out(f"'dst not in graph' by (source, destination): "
+            f"{sum(ref.values())} over {len(ref)} pairs; top {len(pairs)}:")
+        for (s, d), c in pairs:
+            out(f"  {s} -> {d}: {c}x")
+    if hasattr(gen, '_att') and hasattr(CCore.rx, '_times'):
+        per_src = {}
+        for (mid, s), t in CCore.rx._times.items():
+            per_src[s] = per_src.get(s, 0) + 1
+        rows = []
+        for nid, a in sorted(gen._att.items()):
+            d = per_src.get(nid, 0)
+            rows.append((d / max(a, 1), nid, a, d, gen._ref.get((nid, -1), 0)))
+        rows.sort()
+        out("per source: attempts / delivered / refused-not-in-graph (worst delivery first)")
+        for r, nid, a, d, rf in rows[:8]:
+            out(f"  node {nid}: {a} attempts, {d} delivered ({100*r:.0f}%), refused {rf}")
+    if delivered and hasattr(CCore.rx, '_times'):
+        times = list(CCore.rx._times.values())
+        multi = [t for t in times if t > 1]
+        if multi:
+            dist = {}
+            for t in multi: dist[t] = dist.get(t, 0) + 1
+            out(f"arrived more than once at the destination: {len(multi)} of {len(times)} "
+                f"delivered messages ({100*len(multi)/len(times):.1f}%), "
+                f"receptions per duplicated message: {dist}")
     if first_rx:
         ls = sorted(first_rx.values())
         out(f"latency (last hop delivery): median {ls[len(ls)//2]:.1f} s, "
