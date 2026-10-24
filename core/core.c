@@ -409,36 +409,58 @@ static mimeshi_mapnode *map_find(mimeshi_node *n, uint16_t id) {
     return 0;
 }
 
+/* Connectedness of a map node in the OWN link store (4.3): the number
+ * of stored links that touch it - the eviction tie-break (phase 2):
+ * among equally far entries the better connected one is routing
+ * capital (bridge candidates, Gabriel witnesses). */
+static uint8_t map_degree(mimeshi_node *n, mimeshi_mapnode *m) {
+    uint8_t d = 0;
+    for (int j = 0; j < MC_MAX_LINKS; j++)
+        if (n->lnk[j].alive && (n->lnk[j].a == m->id || n->lnk[j].b == m->id)) d++;
+    return d;
+}
+
+static void map_slot_init(mimeshi_node *n, mimeshi_mapnode *m, uint16_t id) {
+    m->alive = 1; m->id = id;
+    m->geo_lat = 0; m->geo_lon = 0;
+    m->quality = 0; m->age_ticks = 255;
+    m->hops = 7;
+    m->arrived_tick = n->tick;
+}
+
 static mimeshi_mapnode *map_add(mimeshi_node *n, uint16_t id) {
     mimeshi_mapnode *m = map_find(n, id);
     if (m) return m;
     for (int i = 0; i < MC_MAP_NODES; i++)
         if (!n->map[i].alive) {
-            n->map[i].alive = 1; n->map[i].id = id;
-            n->map[i].geo_lat = 0; n->map[i].geo_lon = 0;
-            n->map[i].quality = 0; n->map[i].age_ticks = 255;
-            n->map[i].arrived_tick = n->tick;
+            map_slot_init(n, &n->map[i], id);
             return &n->map[i];
         }
-    /* pool full (4.4): recycle the LEAST FRESH entry - never the
-     * newest; the freshest knowledge is the routing capital. */
-    int victim = -1; uint32_t worst = 0;
+    /* pool full (4.4, phase-2 criterion): evict the entry with the
+     * MOST hops; among equals the LEAST connected (own link store);
+ * among those the least fresh. Nearby, well-connected knowledge is
+     * the routing capital; far stale presence goes first. Direct
+     * neighbours never (they live in the prefix). */
+    int victim = -1;
+    uint8_t v_hops = 0, v_deg = 255; uint32_t v_age = 0;
     for (int i = 0; i < MC_MAP_NODES; i++) {
         if (!n->map[i].alive) continue;
-        /* direct neighbours never: they live in the prefix */
         if (nbr_find(n, n->map[i].id)) continue;
+        uint8_t h = n->map[i].hops;
+        uint8_t d = map_degree(n, &n->map[i]);
         uint32_t a = map_age_ticks(n, &n->map[i]);
-        if (a > worst) { worst = a; victim = i; }
+        if (victim < 0 || h > v_hops
+            || (h == v_hops && d < v_deg)
+            || (h == v_hops && d == v_deg && a > v_age)) {
+            victim = i; v_hops = h; v_deg = d; v_age = a;
+        }
     }
     if (victim < 0) {                            /* only direct neighbours in the map */
         printf("[core] node %u: map full, entry %u dropped\n", n->id, id);
         return 0;
     }
     map_evict(n, &n->map[victim]);
-    n->map[victim].alive = 1; n->map[victim].id = id;
-    n->map[victim].geo_lat = 0; n->map[victim].geo_lon = 0;
-    n->map[victim].quality = 0; n->map[victim].age_ticks = 255;
-    n->map[victim].arrived_tick = n->tick;
+    map_slot_init(n, &n->map[victim], id);
     return &n->map[victim];
 }
 
@@ -472,6 +494,40 @@ static mimeshi_link *lnk_add(mimeshi_node *n, uint16_t a, uint16_t b) {
 #define MC_TBL_WIN_US   3600000000ull /* bundling window: 1 h (4.3, to measure) */
 #define MC_CHUNK_MAX_ENTRIES 8        /* entries per chunk: 8 x (9 B + links) fits 230 B */
 #define MC_TBL_PERIOD_TICKS 384u          /* prefix re-share: ~6 h in ~56 s ticks (4.3: every chunk at least ~1x/day) */
+#define MC_TAIL_CHUNKS_PER_RESHARE 5u      /* tail chunks per re-share: a ~70-entry tail passes in ~12 h instead of ~52 h (4.3) */
+
+/* Category cadence (Oct 2026, phase-1 test regime 4.3): every node sends
+ * one chunk per MC_CAT_PERIOD_US (10 min), cycling the categories
+ *   1: own links + neighbours (the prefix round, cursor over sym table)
+ *   2: 2-hop map nodes (the map tail, cursor part A)
+ *   3: the rest of the map (the map tail, cursor part B)
+ * Because a full round takes a different number of chunks per category
+ * (1: ~1, 2: a few, 3: many), local knowledge is shared far more often
+ * than far knowledge - nearby weighs heavier without a weighting rule.
+ * Hubs (sym > MC_HUB_MIN_SYM) run a reduced regime: class 1 checked for
+ * a diff every 15 min (sent only on change, the mutation push already
+ * does this) plus one round-robin chunk per hour, classes 2+3 merged
+ * into one round-robin chunk per hour - ~2 chunks/h at rest instead of
+ * 6, keeping the airtime around a dense hub bounded (measured 9.4%
+ * channel occupation at the normal cadence). */
+#define MC_CAT_PERIOD_US    600000000ull  /* normal cadence: one chunk per 10 min */
+#define MC_CAT_PERIOD_TICKS ((uint32_t)(MC_CAT_PERIOD_US / MC_KEEPALIVE_TICK_US))  /* ~10.7 in ~56 s ticks */
+#define MC_HUB_PERIOD_US    3600000000ull /* hub cadence: one round-robin chunk per hour */
+#define MC_HUB_PERIOD_TICKS ((uint32_t)(MC_HUB_PERIOD_US / MC_KEEPALIVE_TICK_US))  /* ~64 ticks */
+#define MC_HUB_MIN_SYM      32u           /* above this confirmed-neighbour count a node is a hub (to calibrate) */
+
+/* Hop-scaled map lifetime (4.4, phase-2 test): nearby knowledge lives
+ * long (it refreshes often), far knowledge must prove freshness within
+ * its refresh cycle. lifetime = 2 x T_active >> (hops-2), floored at
+ * ~6 h: hop 1-2 ~24 h, hop 3 ~18 h, hop 4 ~12 h, hop 5+ ~6 h. */
+static uint32_t map_lifetime_ticks(uint8_t hops) {
+    uint32_t lt = 2u * MC_T_ACTIVE_TICKS;
+    if (hops > 2) {
+        lt >>= (hops < 5) ? (hops - 2) : 3;
+        if (lt < (2u * MC_T_ACTIVE_TICKS) / 4u) lt = (2u * MC_T_ACTIVE_TICKS) / 4u;
+    }
+    return lt;
+}
 
 static void tbl_push_fire(mimeshi_node *n, void *ud);
 
@@ -488,6 +544,7 @@ static uint64_t tbl_win_us(mimeshi_node *n) {
     uint16_t sym = 0;
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
         if (n->nbr[i].alive && n->nbr[i].sym) sym++;
+    if (sym > MC_HUB_MIN_SYM) return MC_TBL_WIN_FAST_US;   /* hub: diff check every 15 min (4.3, phase-1) */
     return ((sym + MC_CHUNK_MAX_ENTRIES - 1) / MC_CHUNK_MAX_ENTRIES <= MC_TBL_FAST_MAX_CHUNKS)
            ? MC_TBL_WIN_FAST_US : MC_TBL_WIN_US;
 }
@@ -817,8 +874,13 @@ static void delta_neg_send(mimeshi_node *n, uint16_t id) {
  * prefix chunk, flagged with F_TAIL. Entries are map nodes that are NOT
  * direct neighbours; their links come from the link store (classes per
  * direction). The tail cycles through the periodic re-shares via
- * tail_cursor: one tail chunk per re-share keeps the airtime bounded
- * (4.3 rising cadence), a full tail thereby passes in a few days.
+ * tail_cursor: a few tail chunks per re-share keep the airtime bounded
+ * (4.3 rising cadence), a full tail thereby passes well within the
+ * ~24 h map expiry. The cursor first sweeps the entries WITH geo -
+ * they are the routing capital (bridge-node candidates, 10.2) - and
+ * the bare link-endpoints only after: a hop that has to choose a next
+ * step toward an unknown destination can do more with a geo than with
+ * a quality-less presence.
  * Age per entry: effective age in proof ticks (4.4), capped at 255. */
 static void tail_chunk_send(mimeshi_node *n) {
     uint8_t p[230];
@@ -830,6 +892,9 @@ static void tail_chunk_send(mimeshi_node *n) {
         mimeshi_mapnode *m = &n->map[i];
         if (!m->alive) continue;
         if (nbr_find(n, m->id)) continue;               /* direct neighbours: prefix work */
+        int geo_half = (start % (2 * MC_MAP_NODES)) < MC_MAP_NODES;
+        if (geo_half && !m->geo_lat) continue;    /* geo sweep first (cursor half 1) */
+        if (!geo_half && m->geo_lat) continue;     /* bare sweep after (cursor half 2) */
         wr16(p + len, m->id);
         /* both directions in one byte, like the prefix (6.2, 4.3): the
          * forwarded class in the high nibble - the class our source
@@ -853,9 +918,18 @@ static void tail_chunk_send(mimeshi_node *n) {
         }
         p[lcnt_off] = lcnt;
         cnt++;
-        n->tail_cursor = (uint8_t)((i + 1) % MC_MAP_NODES);
+        n->tail_cursor = (uint16_t)((i + 1) % MC_MAP_NODES);
     }
-    if (cnt == 0) { n->tail_cursor = 0; return; }        /* empty tail: next time from the top */
+    if (cnt == 0) {
+        /* empty sweep: the geo half falls through to the bare half (and
+         * an empty bare half means an empty tail - back to the top) */
+        n->tail_cursor = (start < MC_MAP_NODES) ? MC_MAP_NODES : 0;
+        return;
+    }
+    if (n->tail_cursor == start) {
+        /* one full sweep done: geo half -> bare half (cursor space 2 x map) */
+        n->tail_cursor = (start < MC_MAP_NODES) ? MC_MAP_NODES : 0;
+    }
     p[0] = (uint8_t)(PKT_TABLE_CHUNK | F_TAIL);
     wr16(p + 1, n->id);
     p[3] = n->chunk_nr++;
@@ -995,6 +1069,7 @@ static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t 
         om->geo_lat = rd16(pkt + 5); om->geo_lon = rd16(pkt + 7);
         om->quality = quality_of(rssi);       /* our measurement of owner->us */
         om->age_ticks = 0; om->arrived_tick = n->tick;
+        om->hops = 1;                          /* the owner is a direct source (4.4, phase-2) */
     }
     mimeshi_neighbor *nb = nbr_find(n, owner);
     if (!nb) nb = nbr_add(n, owner);
@@ -1025,6 +1100,11 @@ static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t 
         } else {
             mimeshi_mapnode *em = map_add(n, eid);
             if (em) {
+                /* hop distance from us (4.4, phase-2): entries of a
+                 * direct source sit one hop beyond it; nearer paths
+                 * win (min), stale material keeps its old count. */
+                uint8_t h = om ? (om->hops + 1) : 7;
+                if (h < em->hops) em->hops = h;
                 if (gl) { em->geo_lat = gl; em->geo_lon = go; }   /* (0,0) = none (5) */
                 uint8_t travelled = age;
                 if (cls && (!em->quality || travelled < map_age_eff(n, em))) {
@@ -1044,7 +1124,15 @@ static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t 
             uint8_t lb = pkt[off + 2];
             off += 3;
             if (peer == n->id) continue;       /* link to us: covered by our own entry */
-            map_add(n, peer);                 /* presence in the 2-hop set (10.1) */
+            {   /* presence in the 2-hop set (10.1); hop = entry hops + 1,
+                 * unless we already know it nearer (phase-2, 4.4) */
+                mimeshi_mapnode *pm = map_add(n, peer);
+                if (pm) {
+                    mimeshi_mapnode *em2 = map_find(n, eid);
+                    uint8_t h = em2 ? (em2->hops + 1) : 7;
+                    if (h < pm->hops) pm->hops = h;
+                }
+            }
             lnk_set_class(n, eid, peer, (uint8_t)(lb >> 4));
             lnk_set_class(n, peer, eid, (uint8_t)(lb & 0x0F));
         }
@@ -1086,20 +1174,50 @@ static void proof_tick(mimeshi_node *n, void *ud) {
     for (int i = 0; i < MC_MAP_NODES; i++) {
         if (!n->map[i].alive) continue;
         if (nbr_find(n, n->map[i].id)) continue;           /* prefix work */
-        if (map_age_ticks(n, &n->map[i]) >= 2 * MC_T_ACTIVE_TICKS)
-            map_evict(n, &n->map[i]);
+        if (map_age_ticks(n, &n->map[i]) >= map_lifetime_ticks(n->map[i].hops))
+            map_evict(n, &n->map[i]);      /* hop-scaled lifetime (4.4, phase-2) */
     }
-    /* Periodic prefix re-share (4.3): without traffic there are no
-     * mutations, and a chunk missed by a neighbour (collision, away
-     * from home) would then never return. Every MC_TBL_PERIOD_TICKS
-     * (~6 h) the prefix goes out again once -- every chunk thereby
-     * comes by at least a few times per day on average, at a fraction
-     * of the airtime of the old 10-min re-share. The per-node phase
-     * offset (id mod period) spreads the moments; the random jitter
-     * in the bundling window adds the fine spreading. */
-    if ((n->tick + (n->id % MC_TBL_PERIOD_TICKS)) % MC_TBL_PERIOD_TICKS == 0) {
-        tbl_mark_dirty(n);
-        tail_chunk_send(n);                    /* tail: one chunk per re-share (4.3) */
+    /* Category cadence (4.3, phase-1 regime): every MC_CAT_PERIOD_US
+     * one chunk goes out, cycling cat 1 (prefix), cat 2 (near map
+     * tail), cat 3 (far map tail). Because the rounds differ in length
+     * per category, nearby knowledge is shared more often than far
+     * knowledge. A missed chunk returns at the next round of its
+     * category - no repair pull (4.3). The per-node phase offset (id
+     * mod period) spreads the moments over the cadence.
+     * Hubs (sym > MC_HUB_MIN_SYM) run the reduced regime: one
+     * round-robin chunk per MC_HUB_PERIOD_US, alternating prefix and
+     * merged tail - their prefix stays fresh via the mutation pushes
+     * (diff every bundling window), their far tail is best-effort
+     * (their neighbours hold the same knowledge redundantly). */
+    if ((n->tick + (n->id % MC_CAT_PERIOD_TICKS)) % MC_CAT_PERIOD_TICKS == 0) {
+        uint16_t sym = 0;
+        for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
+            if (n->nbr[i].alive && n->nbr[i].sym) sym++;
+        if (sym > MC_HUB_MIN_SYM) {
+            /* hub regime (4.3, phase-1 test): one chunk per ~hour,
+             * alternating cat 1 (prefix round-robin) and cat 2+3
+             * (merged tail round-robin). Mutations keep their own
+             * 15-min diff path via the bundling window (tbl_win_us),
+             * so a hub's near field stays fresh under churn. */
+            n->cat_tick++;
+            if ((n->cat_tick % 6) == 0) {          /* 6 x 10 min = 1 h */
+                if (n->cat_tick & (1 << 1)) chunk_send(n);   /* cat 1: one prefix chunk */
+                else tail_chunk_send(n);                      /* cat 2+3: one tail chunk */
+            }
+        } else {
+            /* normal regime: 1 chunk per 10 min, cycling cat 1,2,3 */
+            switch (n->cat_tick % 3) {
+            case 0: chunk_send(n);        /* cat 1: one prefix chunk, cursor continues */
+                break;
+            case 1: n->tail_cursor = (uint16_t)(n->tail_cursor % MC_MAP_NODES);
+                tail_chunk_send(n);       /* cat 2: near tail (geo half) */
+                break;
+            case 2: if (n->tail_cursor < MC_MAP_NODES) n->tail_cursor = MC_MAP_NODES;
+                tail_chunk_send(n);       /* cat 3: far tail (bare half) */
+                break;
+            }
+            n->cat_tick++;
+        }
     }
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++)          /* evidence ages per tick (4.2) */
         if (n->nbr[i].alive && n->nbr[i].proven_age_us < MC_T_SYM_US)

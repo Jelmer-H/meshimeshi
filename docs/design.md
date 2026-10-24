@@ -758,12 +758,13 @@ Every hop recomputes: as soon as the destination (or a node that knows it) enter
 
 **Radio model (proposal, Oct 2026; NL calibration open).** Scenarios with more than a few nodes use a node list with GPS position and height (`id,lat,lon,height_m,name`). The link budget per direction:
 
-- reception = TX (27 dBm ERP) − FSPL(869 MHz) − 2 × clutter(h), with clutter(h) = 30 − 14 · log10(1 + h) dB;
+- reception = TX (27 dBm ERP) − path loss − clutter(h1) − clutter(h2), with clutter(h) = 30 − 14 · log10(1 + h) dB;
+- the path loss itself depends on the heights: n = 2 + 1.5 · (clutter(h1) + clutter(h2)) / 60, so the distance decay is free-space (n = 2) between high masts and urban-steep (up to n = 3.5) between street-level antennas;
 - radio horizon: d ≤ 4.12 · (√h1 + √h2) km, including refraction;
 - reception succeeds above −110 dBm, with fade margin included;
 - per direction a deterministic fading offset of ±5 dB, so that links are asymmetric as they are in practice.
 
-Roughly calibrated: masts of 20–40 m reach about 12–14 km; tall masts (300–375 m) cover a province.
+Roughly calibrated: masts of 20–40 m reach about 12–14 km; tall masts (300–375 m) cover a province. With the height-dependent exponent the dense urban scenarios calm down: the 500-node Utrecht crop gives an average degree of about 15 with a median link distance of 2.4 km, instead of an unrealistic fully-meshed neighbourhood.
 
 **Layers 2–3: hello, table, data and acks.** The core runs the real state machines: adaptive hello interval, RSSI-driven spreading of hello acks, switching rule, ack1/ack2 with retries (3 neighbours × 2 attempts), pending records with `T_ack2`, and budget 32. On top of the core, the simulator measures home deafness per node, and failed unicast transmissions by cause (collision, no ack1, neighbour gone).
 

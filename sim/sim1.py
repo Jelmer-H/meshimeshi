@@ -107,17 +107,43 @@ class DutyLedger:
 
 # ---------------- node list and link budget (scenario layer) -----------
 # Radio model (Proposal; NL calibration: Open, see design 14.1):
-#   reception = TX - FSPL(d) - 2 x clutter(h), bounded by the radio horizon.
+#   reception = TX - FSPL_ref(d, n(h1,h2)) - clutter(h1) - clutter(h2),
+#   bounded by the radio horizon.
 # clutter(h) = 30 - 14 log10(1+h) dB: low masts lose a lot to the
-# environment, high masts look over it. Per direction a fading offset of
-# +-5 dB so links are asymmetric, as in practice.
+# environment, high masts look over it. The clutter also degrades the
+# distance decay: the path-loss exponent rises above the free-space 2 as
+# either end sits lower in the clutter (urban street canyons),
+#   n = 2 + 1.5 * (clutter(h1) + clutter(h2)) / 60.
+# Per direction a fading offset of +-5 dB so links are asymmetric, as in
+# practice.
 TX_DBM = 27.0          # ERP in the 869.4-869.65 MHz sub-band (500 mW)
 RX_MIN_DBM = -110.0    # reception threshold incl. fade margin
 FSPL_1KM_DB = 91.2    # free-space loss at 869 MHz over 1 km
+CLUTTER_MAX_DB = 30.0 # clutter(h) at h = 0 (street level)
+N_EXP_K = 1.5          # extra path-loss exponent at full clutter both ends
+
+def _node_field(raw, base=0):
+    """Parse a node CSV field: degrees (float) or hex (mac/ipv6 style,
+    e.g. '9a3c'); empty -> None. A dotless id/lat/lon field is hex (the
+    hex notation may consist of digits 0-9 only, e.g. '3602')."""
+    raw = raw.strip()
+    if not raw:
+        return None
+    if base == 16:
+        try:
+            return int(raw, 16)
+        except ValueError:
+            return float(raw)
+    try:
+        return float(raw)
+    except ValueError:
+        return int(raw, base)
 
 def load_nodes_csv(path):
     """Node list with GPS position and height. Format per line:
-    id,lat,lon,height_m,name — '#' is a comment."""
+    id,lat,lon,height_m,name[,...] — '#' is a comment.
+    id is 16-bit (hex or 0x-prefixed); lat/lon are degrees, or the on-air
+    16-bit geo grid as hex (design.md section 5); height may be empty."""
     nodes = []
     with open(path) as f:
         for line in f:
@@ -125,8 +151,18 @@ def load_nodes_csv(path):
             if not line or line.startswith('#'):
                 continue
             d = [v.strip() for v in line.split(',')]
-            nodes.append({'id': int(d[0], 0), 'lat': float(d[1]),
-                          'lon': float(d[2]), 'h': float(d[3]),
+            if d[0] == 'id':  # header row
+                continue
+            nid = _node_field(d[0], 16)
+            lat = _node_field(d[1], 16)
+            if isinstance(lat, int):
+                lat = -90.0 + lat / 65535.0 * 180.0
+            lon = _node_field(d[2], 16)
+            if isinstance(lon, int):
+                lon = -180.0 + lon / 65535.0 * 360.0
+            h = _node_field(d[3]) or 0.0
+            nodes.append({'id': nid, 'lat': lat,
+                          'lon': lon, 'h': h,
                           'name': d[4] if len(d) > 4 else ''})
     return nodes
 
@@ -137,20 +173,26 @@ def project(lat, lon, lat0, lon0):
     y = math.radians(lat - lat0) * 6371000.0
     return x, y
 
+def clutter_db(h):
+    """Environment loss of an antenna at height h (m): street level
+    loses the maximum, a high mast looks over the clutter."""
+    return max(0.0, CLUTTER_MAX_DB - 14.0 * math.log10(1.0 + h))
+
 def linkbudget(pa, pb):
     """Raw reception strength in dBm from a to b (positions in meters,
     heights in meters), without fading and without threshold.
     None = link physically impossible: radio horizon (refraction counted
-    in, d <= 4.12 (sqrt(h1) + sqrt(h2)) km)."""
+    in, d <= 4.12 (sqrt(h1) + sqrt(h2)) km). The distance decay itself
+    depends on the heights: cluttered (low) ends steepen the exponent."""
     d_km = math.hypot(pa[0] - pb[0], pa[1] - pb[1]) / 1000.0
     if d_km <= 1e-3:
         return None
     if d_km > 4.12 * (math.sqrt(pa[2]) + math.sqrt(pb[2])):
         return None
-    fspl = FSPL_1KM_DB + 20.0 * math.log10(d_km)
-    clutter = (30.0 - 14.0 * math.log10(1.0 + pa[2])) + \
-              (30.0 - 14.0 * math.log10(1.0 + pb[2]))
-    return TX_DBM - fspl - clutter
+    c = clutter_db(pa[2]) + clutter_db(pb[2])
+    n_exp = 2.0 + N_EXP_K * c / (2.0 * CLUTTER_MAX_DB)
+    path_loss = FSPL_1KM_DB - 20.0 * math.log10(1.0) + n_exp * 20.0 * math.log10(d_km)
+    return TX_DBM - path_loss - c
 
 class Radio:  # virtual radio + clock
     def __init__(self):
@@ -348,6 +390,7 @@ class CMapNode(ctypes.Structure):
                 ("quality", ctypes.c_uint8),
                 ("arrived_tick", ctypes.c_uint16),
                 ("age_ticks", ctypes.c_uint8),
+                ("hops", ctypes.c_uint8),
                 ("alive", ctypes.c_uint8)]
 
 class CLink(ctypes.Structure):
@@ -377,8 +420,9 @@ CNode._fields_ = [
     ("geo_lat", ctypes.c_uint16), ("geo_lon", ctypes.c_uint16),  # own geo grid (5)
     ("tick", ctypes.c_uint32),          # local time base in proof ticks (4.4)
     ("chunk_nr", ctypes.c_uint8), ("dedup_seq", ctypes.c_uint16),
-    ("chunk_cursor", ctypes.c_uint8), ("tail_cursor", ctypes.c_uint8), ("tbl_dirty", ctypes.c_uint8),
-    ("tbl_push_sched", ctypes.c_uint8),
+    ("chunk_cursor", ctypes.c_uint8),
+    ("tail_cursor", ctypes.c_uint16), ("tbl_dirty", ctypes.c_uint8),
+    ("tbl_push_sched", ctypes.c_uint8), ("cat_tick", ctypes.c_uint8),
     ("map", CMapNode * MC_MAP_NODES),   # 2-hop map (10.1)
     ("lnk", CLink * MC_MAX_LINKS),      # link store (4.3)
     ("tx", TX_FN), ("timer", TIMER_FN), ("switch_ch", SWITCH_FN), ("rand", RAND_FN),

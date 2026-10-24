@@ -104,6 +104,10 @@ typedef struct {
     uint8_t  quality;        /* advertised quality of the link to its owner (4.3) */
     uint16_t arrived_tick;
     uint8_t  age_ticks;
+    uint8_t  hops;          /* hop distance from us, derived contextually:
+                              prefix of a direct neighbour = 1, tail entry
+                              = hops(owner)+1, capped at 7 (4.4). Drives
+                              the hop-scaled lifetime. */
     uint8_t  alive;
 } mimeshi_mapnode;
 
@@ -173,12 +177,15 @@ struct mimeshi_node {
     uint8_t  chunk_cursor;             /* table position where the next chunk
                                           continues: tables larger than one
                                           chunk cycle through the pushes (4.3) */
-    uint8_t  tail_cursor;               /* map position where the next tail
+    uint16_t tail_cursor;               /* map position where the next tail
                                           chunk continues (4.3): the 2-hop
                                           entries cycle through the
                                           periodic re-shares */
     uint8_t  tbl_dirty;               /* prefix mutation pending (4.3) */
     uint8_t  tbl_push_sched;          /* push window/period timer running */
+    uint8_t  cat_tick;               /* category cadence tick counter (4.3):
+                                         normal regime counts 0,1,2 = cat 1,2,3;
+                                         the hub regime counts its hourly slots */
     mimeshi_mapnode map[MC_MAP_NODES];  /* 2-hop map (10.1) */
     mimeshi_link   lnk[MC_MAX_LINKS];  /* links between map nodes (4.3) */
     mimeshi_tx_fn     tx;
