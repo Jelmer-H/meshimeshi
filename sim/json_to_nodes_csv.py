@@ -29,8 +29,9 @@ def convert(in_path, out_path):
             skipped += 1
             continue
         loc = node.get("location") or {}
+        pubkey = node.get("public_key", "")
         rows.append([
-            node.get("short_id", ""),
+            pubkey[:8],  # first 4 bytes of the public key
             loc.get("latitude", ""),
             loc.get("longitude", ""),
             "",  # hoogte_m: not available in the JSON export
