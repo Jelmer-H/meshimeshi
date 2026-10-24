@@ -419,8 +419,9 @@ CNode._fields_ = [
     ("geo_lat", ctypes.c_uint16), ("geo_lon", ctypes.c_uint16),  # own geo grid (5)
     ("tick", ctypes.c_uint32),          # local time base in proof ticks (4.4)
     ("chunk_nr", ctypes.c_uint8), ("dedup_seq", ctypes.c_uint16),
-    ("chunk_cursor", ctypes.c_uint8), ("tail_cursor", ctypes.c_uint8), ("tbl_dirty", ctypes.c_uint8),
-    ("tbl_push_sched", ctypes.c_uint8),
+    ("chunk_cursor", ctypes.c_uint8),
+    ("tail_cursor", ctypes.c_uint16), ("tbl_dirty", ctypes.c_uint8),
+    ("tbl_push_sched", ctypes.c_uint8), ("cat_tick", ctypes.c_uint8),
     ("map", CMapNode * MC_MAP_NODES),   # 2-hop map (10.1)
     ("lnk", CLink * MC_MAX_LINKS),      # link store (4.3)
     ("tx", TX_FN), ("timer", TIMER_FN), ("switch_ch", SWITCH_FN), ("rand", RAND_FN),
