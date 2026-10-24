@@ -107,20 +107,33 @@ class DutyLedger:
 
 # ---------------- node list and link budget (scenario layer) -----------
 # Radio model (Proposal; NL calibration: Open, see design 14.1):
-#   reception = TX - FSPL(d) - 2 x clutter(h), bounded by the radio horizon.
+#   reception = TX - FSPL_ref(d, n(h1,h2)) - clutter(h1) - clutter(h2),
+#   bounded by the radio horizon.
 # clutter(h) = 30 - 14 log10(1+h) dB: low masts lose a lot to the
-# environment, high masts look over it. Per direction a fading offset of
-# +-5 dB so links are asymmetric, as in practice.
+# environment, high masts look over it. The clutter also degrades the
+# distance decay: the path-loss exponent rises above the free-space 2 as
+# either end sits lower in the clutter (urban street canyons),
+#   n = 2 + 1.5 * (clutter(h1) + clutter(h2)) / 60.
+# Per direction a fading offset of +-5 dB so links are asymmetric, as in
+# practice.
 TX_DBM = 27.0          # ERP in the 869.4-869.65 MHz sub-band (500 mW)
 RX_MIN_DBM = -110.0    # reception threshold incl. fade margin
 FSPL_1KM_DB = 91.2    # free-space loss at 869 MHz over 1 km
+CLUTTER_MAX_DB = 30.0 # clutter(h) at h = 0 (street level)
+N_EXP_K = 1.5          # extra path-loss exponent at full clutter both ends
 
 def _node_field(raw, base=0):
     """Parse a node CSV field: degrees (float) or hex (mac/ipv6 style,
-    e.g. '9a3c'); empty -> None."""
+    e.g. '9a3c'); empty -> None. A dotless id/lat/lon field is hex (the
+    hex notation may consist of digits 0-9 only, e.g. '3602')."""
     raw = raw.strip()
     if not raw:
         return None
+    if base == 16:
+        try:
+            return int(raw, 16)
+        except ValueError:
+            return float(raw)
     try:
         return float(raw)
     except ValueError:
@@ -160,20 +173,26 @@ def project(lat, lon, lat0, lon0):
     y = math.radians(lat - lat0) * 6371000.0
     return x, y
 
+def clutter_db(h):
+    """Environment loss of an antenna at height h (m): street level
+    loses the maximum, a high mast looks over the clutter."""
+    return max(0.0, CLUTTER_MAX_DB - 14.0 * math.log10(1.0 + h))
+
 def linkbudget(pa, pb):
     """Raw reception strength in dBm from a to b (positions in meters,
     heights in meters), without fading and without threshold.
     None = link physically impossible: radio horizon (refraction counted
-    in, d <= 4.12 (sqrt(h1) + sqrt(h2)) km)."""
+    in, d <= 4.12 (sqrt(h1) + sqrt(h2)) km). The distance decay itself
+    depends on the heights: cluttered (low) ends steepen the exponent."""
     d_km = math.hypot(pa[0] - pb[0], pa[1] - pb[1]) / 1000.0
     if d_km <= 1e-3:
         return None
     if d_km > 4.12 * (math.sqrt(pa[2]) + math.sqrt(pb[2])):
         return None
-    fspl = FSPL_1KM_DB + 20.0 * math.log10(d_km)
-    clutter = (30.0 - 14.0 * math.log10(1.0 + pa[2])) + \
-              (30.0 - 14.0 * math.log10(1.0 + pb[2]))
-    return TX_DBM - fspl - clutter
+    c = clutter_db(pa[2]) + clutter_db(pb[2])
+    n_exp = 2.0 + N_EXP_K * c / (2.0 * CLUTTER_MAX_DB)
+    path_loss = FSPL_1KM_DB - 20.0 * math.log10(1.0) + n_exp * 20.0 * math.log10(d_km)
+    return TX_DBM - path_loss - c
 
 class Radio:  # virtual radio + clock
     def __init__(self):
