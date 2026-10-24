@@ -104,6 +104,10 @@ typedef struct {
     uint8_t  quality;        /* advertised quality of the link to its owner (4.3) */
     uint16_t arrived_tick;
     uint8_t  age_ticks;
+    uint8_t  hops;          /* hop distance from us, derived contextually:
+                              prefix of a direct neighbour = 1, tail entry
+                              = hops(owner)+1, capped at 7 (4.4). Drives
+                              the hop-scaled lifetime. */
     uint8_t  alive;
 } mimeshi_mapnode;
 

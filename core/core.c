@@ -409,36 +409,58 @@ static mimeshi_mapnode *map_find(mimeshi_node *n, uint16_t id) {
     return 0;
 }
 
+/* Connectedness of a map node in the OWN link store (4.3): the number
+ * of stored links that touch it - the eviction tie-break (phase 2):
+ * among equally far entries the better connected one is routing
+ * capital (bridge candidates, Gabriel witnesses). */
+static uint8_t map_degree(mimeshi_node *n, mimeshi_mapnode *m) {
+    uint8_t d = 0;
+    for (int j = 0; j < MC_MAX_LINKS; j++)
+        if (n->lnk[j].alive && (n->lnk[j].a == m->id || n->lnk[j].b == m->id)) d++;
+    return d;
+}
+
+static void map_slot_init(mimeshi_node *n, mimeshi_mapnode *m, uint16_t id) {
+    m->alive = 1; m->id = id;
+    m->geo_lat = 0; m->geo_lon = 0;
+    m->quality = 0; m->age_ticks = 255;
+    m->hops = 7;
+    m->arrived_tick = n->tick;
+}
+
 static mimeshi_mapnode *map_add(mimeshi_node *n, uint16_t id) {
     mimeshi_mapnode *m = map_find(n, id);
     if (m) return m;
     for (int i = 0; i < MC_MAP_NODES; i++)
         if (!n->map[i].alive) {
-            n->map[i].alive = 1; n->map[i].id = id;
-            n->map[i].geo_lat = 0; n->map[i].geo_lon = 0;
-            n->map[i].quality = 0; n->map[i].age_ticks = 255;
-            n->map[i].arrived_tick = n->tick;
+            map_slot_init(n, &n->map[i], id);
             return &n->map[i];
         }
-    /* pool full (4.4): recycle the LEAST FRESH entry - never the
-     * newest; the freshest knowledge is the routing capital. */
-    int victim = -1; uint32_t worst = 0;
+    /* pool full (4.4, phase-2 criterion): evict the entry with the
+     * MOST hops; among equals the LEAST connected (own link store);
+ * among those the least fresh. Nearby, well-connected knowledge is
+     * the routing capital; far stale presence goes first. Direct
+     * neighbours never (they live in the prefix). */
+    int victim = -1;
+    uint8_t v_hops = 0, v_deg = 255; uint32_t v_age = 0;
     for (int i = 0; i < MC_MAP_NODES; i++) {
         if (!n->map[i].alive) continue;
-        /* direct neighbours never: they live in the prefix */
         if (nbr_find(n, n->map[i].id)) continue;
+        uint8_t h = n->map[i].hops;
+        uint8_t d = map_degree(n, &n->map[i]);
         uint32_t a = map_age_ticks(n, &n->map[i]);
-        if (a > worst) { worst = a; victim = i; }
+        if (victim < 0 || h > v_hops
+            || (h == v_hops && d < v_deg)
+            || (h == v_hops && d == v_deg && a > v_age)) {
+            victim = i; v_hops = h; v_deg = d; v_age = a;
+        }
     }
     if (victim < 0) {                            /* only direct neighbours in the map */
         printf("[core] node %u: map full, entry %u dropped\n", n->id, id);
         return 0;
     }
     map_evict(n, &n->map[victim]);
-    n->map[victim].alive = 1; n->map[victim].id = id;
-    n->map[victim].geo_lat = 0; n->map[victim].geo_lon = 0;
-    n->map[victim].quality = 0; n->map[victim].age_ticks = 255;
-    n->map[victim].arrived_tick = n->tick;
+    map_slot_init(n, &n->map[victim], id);
     return &n->map[victim];
 }
 
@@ -493,6 +515,19 @@ static mimeshi_link *lnk_add(mimeshi_node *n, uint16_t a, uint16_t b) {
 #define MC_HUB_PERIOD_US    3600000000ull /* hub cadence: one round-robin chunk per hour */
 #define MC_HUB_PERIOD_TICKS ((uint32_t)(MC_HUB_PERIOD_US / MC_KEEPALIVE_TICK_US))  /* ~64 ticks */
 #define MC_HUB_MIN_SYM      32u           /* above this confirmed-neighbour count a node is a hub (to calibrate) */
+
+/* Hop-scaled map lifetime (4.4, phase-2 test): nearby knowledge lives
+ * long (it refreshes often), far knowledge must prove freshness within
+ * its refresh cycle. lifetime = 2 x T_active >> (hops-2), floored at
+ * ~6 h: hop 1-2 ~24 h, hop 3 ~18 h, hop 4 ~12 h, hop 5+ ~6 h. */
+static uint32_t map_lifetime_ticks(uint8_t hops) {
+    uint32_t lt = 2u * MC_T_ACTIVE_TICKS;
+    if (hops > 2) {
+        lt >>= (hops < 5) ? (hops - 2) : 3;
+        if (lt < (2u * MC_T_ACTIVE_TICKS) / 4u) lt = (2u * MC_T_ACTIVE_TICKS) / 4u;
+    }
+    return lt;
+}
 
 static void tbl_push_fire(mimeshi_node *n, void *ud);
 
@@ -1034,6 +1069,7 @@ static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t 
         om->geo_lat = rd16(pkt + 5); om->geo_lon = rd16(pkt + 7);
         om->quality = quality_of(rssi);       /* our measurement of owner->us */
         om->age_ticks = 0; om->arrived_tick = n->tick;
+        om->hops = 1;                          /* the owner is a direct source (4.4, phase-2) */
     }
     mimeshi_neighbor *nb = nbr_find(n, owner);
     if (!nb) nb = nbr_add(n, owner);
@@ -1064,6 +1100,11 @@ static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t 
         } else {
             mimeshi_mapnode *em = map_add(n, eid);
             if (em) {
+                /* hop distance from us (4.4, phase-2): entries of a
+                 * direct source sit one hop beyond it; nearer paths
+                 * win (min), stale material keeps its old count. */
+                uint8_t h = om ? (om->hops + 1) : 7;
+                if (h < em->hops) em->hops = h;
                 if (gl) { em->geo_lat = gl; em->geo_lon = go; }   /* (0,0) = none (5) */
                 uint8_t travelled = age;
                 if (cls && (!em->quality || travelled < map_age_eff(n, em))) {
@@ -1083,7 +1124,15 @@ static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t 
             uint8_t lb = pkt[off + 2];
             off += 3;
             if (peer == n->id) continue;       /* link to us: covered by our own entry */
-            map_add(n, peer);                 /* presence in the 2-hop set (10.1) */
+            {   /* presence in the 2-hop set (10.1); hop = entry hops + 1,
+                 * unless we already know it nearer (phase-2, 4.4) */
+                mimeshi_mapnode *pm = map_add(n, peer);
+                if (pm) {
+                    mimeshi_mapnode *em2 = map_find(n, eid);
+                    uint8_t h = em2 ? (em2->hops + 1) : 7;
+                    if (h < pm->hops) pm->hops = h;
+                }
+            }
             lnk_set_class(n, eid, peer, (uint8_t)(lb >> 4));
             lnk_set_class(n, peer, eid, (uint8_t)(lb & 0x0F));
         }
@@ -1125,8 +1174,8 @@ static void proof_tick(mimeshi_node *n, void *ud) {
     for (int i = 0; i < MC_MAP_NODES; i++) {
         if (!n->map[i].alive) continue;
         if (nbr_find(n, n->map[i].id)) continue;           /* prefix work */
-        if (map_age_ticks(n, &n->map[i]) >= 2 * MC_T_ACTIVE_TICKS)
-            map_evict(n, &n->map[i]);
+        if (map_age_ticks(n, &n->map[i]) >= map_lifetime_ticks(n->map[i].hops))
+            map_evict(n, &n->map[i]);      /* hop-scaled lifetime (4.4, phase-2) */
     }
     /* Category cadence (4.3, phase-1 regime): every MC_CAT_PERIOD_US
      * one chunk goes out, cycling cat 1 (prefix), cat 2 (near map

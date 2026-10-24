@@ -371,11 +371,17 @@ def local_net(mk, jitter):
         hubs = [kn.core.map_size() for kn in nodes if hub_of(kn)]
         norm = [kn.core.map_size() for kn in nodes if not hub_of(kn)]
         pools = [sum(1 for m in kn.core.mn.map if m.alive) for kn in nodes]
+        hop_hist = {}
+        for kn in nodes:
+            for m in kn.core.mn.map:
+                if m.alive:
+                    hop_hist[m.hops] = hop_hist.get(m.hops, 0) + 1
+        hs = ' '.join(f"h{h}:{c}" for h, c in sorted(hop_hist.items()))
         out(f"[sample {radio.now/3.6e9:6.1f} h] map avg "
             f"{sum(hubs+norm)/max(len(hubs+norm),1):6.1f} | "
             f"hub ({len(hubs)}): {sum(hubs)/max(len(hubs),1):6.1f} | "
             f"normal ({len(norm)}): {sum(norm)/max(len(norm),1):6.1f} | "
-            f"pools >= 240: {sum(1 for p in pools if p >= 240)} of {len(pools)}")
+            f"pools >= 240: {sum(1 for p in pools if p >= 240)} of {len(pools)} | {hs}")
         radio.schedule(3_600_000_000, occupancy_sample)
     radio.schedule(7_200_000_000, occupancy_sample)
     radio.run(until_us=duration_us)

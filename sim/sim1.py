@@ -390,6 +390,7 @@ class CMapNode(ctypes.Structure):
                 ("quality", ctypes.c_uint8),
                 ("arrived_tick", ctypes.c_uint16),
                 ("age_ticks", ctypes.c_uint8),
+                ("hops", ctypes.c_uint8),
                 ("alive", ctypes.c_uint8)]
 
 class CLink(ctypes.Structure):
