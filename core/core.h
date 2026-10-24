@@ -173,7 +173,7 @@ struct mimeshi_node {
     uint8_t  chunk_cursor;             /* table position where the next chunk
                                           continues: tables larger than one
                                           chunk cycle through the pushes (4.3) */
-    uint8_t  tail_cursor;               /* map position where the next tail
+    uint16_t tail_cursor;               /* map position where the next tail
                                           chunk continues (4.3): the 2-hop
                                           entries cycle through the
                                           periodic re-shares */

@@ -472,6 +472,7 @@ static mimeshi_link *lnk_add(mimeshi_node *n, uint16_t a, uint16_t b) {
 #define MC_TBL_WIN_US   3600000000ull /* bundling window: 1 h (4.3, to measure) */
 #define MC_CHUNK_MAX_ENTRIES 8        /* entries per chunk: 8 x (9 B + links) fits 230 B */
 #define MC_TBL_PERIOD_TICKS 384u          /* prefix re-share: ~6 h in ~56 s ticks (4.3: every chunk at least ~1x/day) */
+#define MC_TAIL_CHUNKS_PER_RESHARE 5u      /* tail chunks per re-share: a ~70-entry tail passes in ~12 h instead of ~52 h (4.3) */
 
 static void tbl_push_fire(mimeshi_node *n, void *ud);
 
@@ -817,8 +818,13 @@ static void delta_neg_send(mimeshi_node *n, uint16_t id) {
  * prefix chunk, flagged with F_TAIL. Entries are map nodes that are NOT
  * direct neighbours; their links come from the link store (classes per
  * direction). The tail cycles through the periodic re-shares via
- * tail_cursor: one tail chunk per re-share keeps the airtime bounded
- * (4.3 rising cadence), a full tail thereby passes in a few days.
+ * tail_cursor: a few tail chunks per re-share keep the airtime bounded
+ * (4.3 rising cadence), a full tail thereby passes well within the
+ * ~24 h map expiry. The cursor first sweeps the entries WITH geo -
+ * they are the routing capital (bridge-node candidates, 10.2) - and
+ * the bare link-endpoints only after: a hop that has to choose a next
+ * step toward an unknown destination can do more with a geo than with
+ * a quality-less presence.
  * Age per entry: effective age in proof ticks (4.4), capped at 255. */
 static void tail_chunk_send(mimeshi_node *n) {
     uint8_t p[230];
@@ -830,6 +836,9 @@ static void tail_chunk_send(mimeshi_node *n) {
         mimeshi_mapnode *m = &n->map[i];
         if (!m->alive) continue;
         if (nbr_find(n, m->id)) continue;               /* direct neighbours: prefix work */
+        int geo_half = (start % (2 * MC_MAP_NODES)) < MC_MAP_NODES;
+        if (geo_half && !m->geo_lat) continue;    /* geo sweep first (cursor half 1) */
+        if (!geo_half && m->geo_lat) continue;     /* bare sweep after (cursor half 2) */
         wr16(p + len, m->id);
         /* both directions in one byte, like the prefix (6.2, 4.3): the
          * forwarded class in the high nibble - the class our source
@@ -853,9 +862,18 @@ static void tail_chunk_send(mimeshi_node *n) {
         }
         p[lcnt_off] = lcnt;
         cnt++;
-        n->tail_cursor = (uint8_t)((i + 1) % MC_MAP_NODES);
+        n->tail_cursor = (uint16_t)((i + 1) % MC_MAP_NODES);
     }
-    if (cnt == 0) { n->tail_cursor = 0; return; }        /* empty tail: next time from the top */
+    if (cnt == 0) {
+        /* empty sweep: the geo half falls through to the bare half (and
+         * an empty bare half means an empty tail - back to the top) */
+        n->tail_cursor = (start < MC_MAP_NODES) ? MC_MAP_NODES : 0;
+        return;
+    }
+    if (n->tail_cursor == start) {
+        /* one full sweep done: geo half -> bare half (cursor space 2 x map) */
+        n->tail_cursor = (start < MC_MAP_NODES) ? MC_MAP_NODES : 0;
+    }
     p[0] = (uint8_t)(PKT_TABLE_CHUNK | F_TAIL);
     wr16(p + 1, n->id);
     p[3] = n->chunk_nr++;
@@ -1099,7 +1117,8 @@ static void proof_tick(mimeshi_node *n, void *ud) {
      * in the bundling window adds the fine spreading. */
     if ((n->tick + (n->id % MC_TBL_PERIOD_TICKS)) % MC_TBL_PERIOD_TICKS == 0) {
         tbl_mark_dirty(n);
-        tail_chunk_send(n);                    /* tail: one chunk per re-share (4.3) */
+        for (uint8_t t = 0; t < MC_TAIL_CHUNKS_PER_RESHARE; t++)
+            tail_chunk_send(n);              /* tail: a few chunks per re-share (4.3) */
     }
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++)          /* evidence ages per tick (4.2) */
         if (n->nbr[i].alive && n->nbr[i].proven_age_us < MC_T_SYM_US)

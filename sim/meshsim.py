@@ -551,6 +551,7 @@ def load(mk, jitter):
     for i, nd in enumerate(nodes_list):
         kn = Node(radio, nd['id'])
         kn.core = set_jitter(mk(kn), jitter)
+        kn.core.set_geo(*grid_geo(nd['lat'], nd['lon']))   # published geo (5, 4.3)
         nodes.append(kn)
         radio.schedule(i * 250_000, kn.core.start)
     ids = [n['id'] for n in nodes_list]
