@@ -51,19 +51,18 @@
 #define MC_HELLO_ACK_WIN_US 3000000ull     /* max response time hello-acks: 3 s (2) */
 #define MC_HELLO_ACK_JITTER_US (MC_HELLO_ACK_WIN_US / 16u)  /* ~187 ms, > t_ack + S (2) */
 #define MC_BUDGET_INIT     32              /* initial value budget byte (9) */
-/* attempt plan (7.4, experiment Oct 2026): candidates from full
- * Dijkstra runs; attempts round-robin over them. 1 candidate = 1 fast
- * (0.25-0.75 s) + 3 slow (2-3 s) retries; 2 candidates = 5 alternating
- * (A,B,A,B,A); 3 candidates = 6 alternating (A,B,C,A,B,C). */
-#define MC_PLAN_FAST_MIN_US 250000ull
-#define MC_PLAN_FAST_SPAN_US 500000ull
-#define MC_PLAN_SLOW1_MIN_US 2000000ull    /* single candidate: 2-3 s */
-#define MC_PLAN_SLOW2_MIN_US 1000000ull    /* multiple candidates: 1-2 s */
-#define MC_PLAN_SPAN_US 1000000ull
+/* ---------------- attempt schedule (7.4) -------------------------
+ * One schedule per hop, no rebuild. Waits: a small fixed gap inside a
+ * pass over the candidates (the next attempt goes to a DIFFERENT
+ * node), an escalating gap at each pass boundary (the same node comes
+ * back there - the damper belongs there). +-25% jitter on every gap:
+ * two nodes that collided once must not retry in lock-step. With 1
+ * candidate every attempt is a boundary; the pass table then runs
+ * 0.8, 1.2, 1.8 s. Worst case total (6 attempts, 3 candidates):
+ * ~6 s incl. attempt times - inside T_ack2 = 8 s (7.3). */
+#define PLAN_INTRA_MS       400u           /* A->B within a pass (different node) */
+static const uint32_t PLAN_PASS_MS[3] = { 800, 1200, 1800 };  /* escalating per pass (same node) */
 #define MC_ACK1_MARGIN_US   80000ull       /* processing + margin on top of t_data + t_ack (7.3) */
-#define MC_RETRY_WAIT_US    2000000ull     /* between the two attempts of one series: 2 s (7.4) */
-#define MC_RETRY_JITTER_US  1000000ull     /* + random 0..1 s on top (7.4) */
-#define MC_ROUTE_ALT        2u             /* alternative-hop series after the first choice (7.4: max 3 neighbours) */
 #define MC_T_ACK2_US        8000000ull    /* ack2 timeout (7.3, revised Oct 2026): 8 s - the attempt
                                    schedule of the next hop (7.4) completes in ~6 s worst case,
                                    so silence beyond 8 s means its forwarding truly stalled;
@@ -1253,9 +1252,9 @@ static void ack2_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint16_t p
 }
 
 static void pending_try(mimeshi_node *n, mimeshi_pending *p);
-static void plan_fail(mimeshi_node *n, mimeshi_pending *p);
+static void schedule_fail(mimeshi_node *n, mimeshi_pending *p);
 
-/* Candidate collector for the attempt plan (7.4): every candidate is
+/* Candidate collector for the attempt schedule (7.4): every candidate is
  * the BEST HOP of a full Dijkstra run - not a ranking of own edges.
  * Candidate 1 is the computed route toward dst; candidate 2 is the
  * best route that does not start with candidate 1; candidate 3
@@ -1264,7 +1263,7 @@ static void plan_fail(mimeshi_node *n, mimeshi_pending *p);
  * candidate always leads. Same admission rules as every route
  * (10.1/10.2): confirmed symmetric, above the quality gate, never
  * the previous hop (no bounce). */
-static uint8_t plan_candidates(mimeshi_node *n, uint16_t dst,
+static uint8_t schedule_candidates(mimeshi_node *n, uint16_t dst,
                                 uint16_t gl, uint16_t go,
                                 uint16_t prev,
                                 const uint16_t *excl, uint8_t excl_cnt,
@@ -1291,19 +1290,24 @@ static uint8_t plan_candidates(mimeshi_node *n, uint16_t dst,
 
 /* attempts of the plan by its size: 1 candidate = 4 (1 fast + 3 slow);
  * 2 = 5 alternating (the best hop gets the extra attempt); 3 = 6. */
-static uint8_t plan_attempts(const mimeshi_pending *p) {
-    return (uint8_t)(p->cand_cnt + 3);
+/* Total attempts of the schedule by its size (7.4): 1 candidate = 4
+ * (A,A,A,A - the damper table then runs 0.8, 1.2, 1.8 s); 2 = 6
+ * (A,B,A,B,A,B - each node 3x); 3 = 6 (A,B,C,A,B,C - each node 2x).
+ * At most 4 toward the same node, at most 6 total. */
+static uint8_t schedule_attempts(const mimeshi_pending *p) {
+    return p->cand_cnt == 1 ? 4 : 6;
 }
 
-/* The wait before the next attempt of the plan. Fast retry after the
- * first miss (0.25-0.75 s): most misses are a lost packet or a lost
- * ack1, and speed wins there. Slow retry for every next attempt
- * (2-3 s single candidate, 1-2 s multiple): then the cause is
- * structural (collision, home-deafness), and distance is the damper. */
-static uint64_t plan_wait_us(mimeshi_node *n, const mimeshi_pending *p) {
-    if (p->try_idx == 0) return MC_PLAN_FAST_MIN_US + (n->rand(n) % MC_PLAN_FAST_SPAN_US);
-    if (p->cand_cnt == 1) return MC_PLAN_SLOW1_MIN_US + (n->rand(n) % MC_PLAN_SPAN_US);
-    return MC_PLAN_SLOW2_MIN_US + (n->rand(n) % MC_PLAN_SPAN_US);
+/* The wait before attempt try_idx+1 (7.4). Small fixed gap inside a
+ * pass over the candidates - the next attempt goes to a DIFFERENT
+ * node, so no damper needed; escalating gap at each pass boundary -
+ * the same node comes back there. */
+static uint64_t schedule_wait_us(mimeshi_node *n, const mimeshi_pending *p) {
+    uint8_t pass = p->try_idx / p->cand_cnt;            /* completed passes */
+    uint8_t boundary = (uint8_t)((p->try_idx % p->cand_cnt) == 0 && pass > 0);
+    uint32_t base = boundary ? PLAN_PASS_MS[pass > 2 ? 2 : pass] : PLAN_INTRA_MS;
+    uint32_t jit = base / 4;                            /* +-25% */
+    return 1000ull * (base - jit + (n->rand(n) % (2 * jit + 1)));
 }
 
 static void retry_fire(mimeshi_node *n, void *ud) {
@@ -1314,27 +1318,27 @@ static void retry_fire(mimeshi_node *n, void *ud) {
     pending_try(n, p);
 }
 
-/* Ack1 stayed out: attempts left -> retry after plan_wait_us; otherwise
- * the plan for this hop failed definitively (cumulative exclusion +
+/* Ack1 stayed out: attempts left -> retry after schedule_wait_us; otherwise
+ * the schedule for this hop failed definitively (cumulative exclusion +
  * negative ack2, 7.4). */
 static void ack1_timeout(mimeshi_node *n, void *ud) {
     mimeshi_pending *p = (mimeshi_pending *)ud;
     if (!p->active || p->acked1) return;
-    if (p->try_idx < plan_attempts(p) - 1 && p->budget_left > 0) {
-        n->timer(n, plan_wait_us(n, p), retry_fire, p);
+    if (p->try_idx < schedule_attempts(p) - 1 && p->budget_left > 0) {
+        n->timer(n, schedule_wait_us(n, p), retry_fire, p);
         return;
     }
-    plan_fail(n, p);
+    schedule_fail(n, p);
 }
 
-/* The attempt plan toward this destination is exhausted (7.4,
+/* The attempt schedule toward this destination is exhausted (7.4,
  * revised Oct 2026 - no rebuild: the 6 attempts ARE the retry space of
  * the hop). All candidates go into the cumulative exclusion together
  * and the message fails definitively with the negative ack2 to the
  * previous hop, the spent budget along. The previous hop decides with
  * its own plan and budget whether another route remains. */
-static void plan_fail(mimeshi_node *n, mimeshi_pending *p) {
-    printf("[core] node %u: plan failed toward %u..%u (msg %u)\n",
+static void schedule_fail(mimeshi_node *n, mimeshi_pending *p) {
+    printf("[core] node %u: schedule failed toward %u..%u (msg %u)\n",
            n->id, p->cand[0], p->cand[p->cand_cnt ? p->cand_cnt - 1 : 0], p->msg_id);
     for (uint8_t k = 0; k < p->cand_cnt && p->excl_cnt < 3; k++) {
         p->excl[p->excl_cnt++] = p->cand[k];      /* cumulative (7.4) */
@@ -1367,13 +1371,13 @@ static void ack2_timeout(mimeshi_node *n, void *ud) {
            (uint8_t)(p->budget_left > MC_ACK2_BUDGET_PENALTY ? p->budget_left - MC_ACK2_BUDGET_PENALTY : 0));
     p->budget_left = (uint8_t)(p->budget_left > MC_ACK2_BUDGET_PENALTY ? p->budget_left - MC_ACK2_BUDGET_PENALTY : 0);
     p->acked1 = 0;
-    p->try_idx = (uint8_t)(plan_attempts(p) - 1);   /* the wait consumed the remaining attempts (7.3) */
-    plan_fail(n, p);
+    p->try_idx = (uint8_t)(schedule_attempts(p) - 1);   /* the wait consumed the remaining attempts (7.3) */
+    schedule_fail(n, p);
 }
 
 static void pending_try(mimeshi_node *n, mimeshi_pending *p) {
-    if (p->cand_cnt == 0) return;             /* no plan: nothing to send (defensive) */
-    p->next_hop = p->cand[p->try_idx % p->cand_cnt];   /* round-robin over the plan (7.4) */
+    if (p->cand_cnt == 0) return;             /* no schedule: nothing to send (defensive) */
+    p->next_hop = p->cand[p->try_idx % p->cand_cnt];   /* round-robin over the schedule (7.4) */
     p->pkt[9] = p->budget_left;
     wr16(p->pkt + 10, p->next_hop);           /* next hop in the header (6.1) */
     bound_send(n, (uint8_t)(p->next_hop % MC_N_CHANNELS), p->pkt, p->pkt_len, t_data_us(p->pkt_len));
@@ -1410,9 +1414,9 @@ int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uin
     memset(p, 0, sizeof(*p));
     p->active = 1;
     p->budget_left = MC_BUDGET_INIT;
-    /* attempt plan (7.4): up to 3 Dijkstra-best hops toward dst; the
+    /* attempt schedule (7.4): up to 3 Dijkstra-best hops toward dst; the
      * route itself is the first candidate - or the send is refused. */
-    p->cand_cnt = plan_candidates(n, dst, dest_lat, dest_lon, n->id, 0, 0, p->cand);
+    p->cand_cnt = schedule_candidates(n, dst, dest_lat, dest_lon, n->id, 0, 0, p->cand);
     if (p->cand_cnt == 0) return -1;           /* not in the graph: no flood (10.2) */
     uint16_t nh = p->cand[0];
     p->msg_id = (uint16_t)n->rand(n);
@@ -1599,8 +1603,8 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                 if (flags & F_NEG_ACK2) {
                     if (len >= 8 && pkt[7] < p->budget_left) p->budget_left = pkt[7];
                     p->acked1 = 0;
-                    p->try_idx = (uint8_t)(plan_attempts(p) - 1);   /* the plan toward this hop is done */
-                    plan_fail(n, p);          /* exclusion + next plan (7.4) */
+                    p->try_idx = (uint8_t)(schedule_attempts(p) - 1);   /* the plan toward this hop is done */
+                    schedule_fail(n, p);          /* exclusion + next plan (7.4) */
                 }
                 return;
             }
@@ -1683,13 +1687,13 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
             if (!p) return;                       /* no slot: cannot forward (step 3 sends the negative ack2) */
             memset(p, 0, sizeof(*p));
             p->budget_left = (uint8_t)(budget - 1);
-            /* attempt plan (7.4): up to 3 Dijkstra-best hops toward
+            /* attempt schedule (7.4): up to 3 Dijkstra-best hops toward
              * dst; the collector never proposes the previous hop (the
              * 10.2 prev-hop exclusion is thereby part of every
              * candidate, not only the first). active goes on only
              * after the check - an unforwardable message must not
              * leak its pending slot. */
-            p->cand_cnt = plan_candidates(n, dst, gl, go, prev, 0, 0, p->cand);
+            p->cand_cnt = schedule_candidates(n, dst, gl, go, prev, 0, 0, p->cand);
             if (p->cand_cnt == 0) return;         /* no routable path: the hop fails (negative ack2 / report follow in step 3) */
             p->active = 1;
             p->msg_id = msg_id; p->src = src; p->dst = dst; p->prev_hop = prev;
