@@ -362,6 +362,22 @@ def local_net(mk, jitter):
         phase.update(air=radio.airtime[:], hello=radio.hello_air[:],
                      ack=radio.ack_air[:], t=radio.now)
     radio.schedule(3_700_000_000, phase_border)
+
+    # hourly pool-occupancy sample (map fill curve): hub vs normal split
+    HUB_SYM = 32
+    def hub_of(kn):
+        return sym_count(kn) > HUB_SYM
+    def occupancy_sample():
+        hubs = [kn.core.map_size() for kn in nodes if hub_of(kn)]
+        norm = [kn.core.map_size() for kn in nodes if not hub_of(kn)]
+        pools = [sum(1 for m in kn.core.mn.map if m.alive) for kn in nodes]
+        out(f"[sample {radio.now/3.6e9:6.1f} h] map avg "
+            f"{sum(hubs+norm)/max(len(hubs+norm),1):6.1f} | "
+            f"hub ({len(hubs)}): {sum(hubs)/max(len(hubs),1):6.1f} | "
+            f"normal ({len(norm)}): {sum(norm)/max(len(norm),1):6.1f} | "
+            f"pools >= 240: {sum(1 for p in pools if p >= 240)} of {len(pools)}")
+        radio.schedule(3_600_000_000, occupancy_sample)
+    radio.schedule(7_200_000_000, occupancy_sample)
     radio.run(until_us=duration_us)
     out("\n=== Measurements ===")
     t1 = phase.get('t', radio.now)

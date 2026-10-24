@@ -474,6 +474,26 @@ static mimeshi_link *lnk_add(mimeshi_node *n, uint16_t a, uint16_t b) {
 #define MC_TBL_PERIOD_TICKS 384u          /* prefix re-share: ~6 h in ~56 s ticks (4.3: every chunk at least ~1x/day) */
 #define MC_TAIL_CHUNKS_PER_RESHARE 5u      /* tail chunks per re-share: a ~70-entry tail passes in ~12 h instead of ~52 h (4.3) */
 
+/* Category cadence (Oct 2026, phase-1 test regime 4.3): every node sends
+ * one chunk per MC_CAT_PERIOD_US (10 min), cycling the categories
+ *   1: own links + neighbours (the prefix round, cursor over sym table)
+ *   2: 2-hop map nodes (the map tail, cursor part A)
+ *   3: the rest of the map (the map tail, cursor part B)
+ * Because a full round takes a different number of chunks per category
+ * (1: ~1, 2: a few, 3: many), local knowledge is shared far more often
+ * than far knowledge - nearby weighs heavier without a weighting rule.
+ * Hubs (sym > MC_HUB_MIN_SYM) run a reduced regime: class 1 checked for
+ * a diff every 15 min (sent only on change, the mutation push already
+ * does this) plus one round-robin chunk per hour, classes 2+3 merged
+ * into one round-robin chunk per hour - ~2 chunks/h at rest instead of
+ * 6, keeping the airtime around a dense hub bounded (measured 9.4%
+ * channel occupation at the normal cadence). */
+#define MC_CAT_PERIOD_US    600000000ull  /* normal cadence: one chunk per 10 min */
+#define MC_CAT_PERIOD_TICKS ((uint32_t)(MC_CAT_PERIOD_US / MC_KEEPALIVE_TICK_US))  /* ~10.7 in ~56 s ticks */
+#define MC_HUB_PERIOD_US    3600000000ull /* hub cadence: one round-robin chunk per hour */
+#define MC_HUB_PERIOD_TICKS ((uint32_t)(MC_HUB_PERIOD_US / MC_KEEPALIVE_TICK_US))  /* ~64 ticks */
+#define MC_HUB_MIN_SYM      32u           /* above this confirmed-neighbour count a node is a hub (to calibrate) */
+
 static void tbl_push_fire(mimeshi_node *n, void *ud);
 
 /* Bundling window, adaptive to the table size (4.3): the airtime of a
@@ -489,6 +509,7 @@ static uint64_t tbl_win_us(mimeshi_node *n) {
     uint16_t sym = 0;
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
         if (n->nbr[i].alive && n->nbr[i].sym) sym++;
+    if (sym > MC_HUB_MIN_SYM) return MC_TBL_WIN_FAST_US;   /* hub: diff check every 15 min (4.3, phase-1) */
     return ((sym + MC_CHUNK_MAX_ENTRIES - 1) / MC_CHUNK_MAX_ENTRIES <= MC_TBL_FAST_MAX_CHUNKS)
            ? MC_TBL_WIN_FAST_US : MC_TBL_WIN_US;
 }
@@ -1107,18 +1128,47 @@ static void proof_tick(mimeshi_node *n, void *ud) {
         if (map_age_ticks(n, &n->map[i]) >= 2 * MC_T_ACTIVE_TICKS)
             map_evict(n, &n->map[i]);
     }
-    /* Periodic prefix re-share (4.3): without traffic there are no
-     * mutations, and a chunk missed by a neighbour (collision, away
-     * from home) would then never return. Every MC_TBL_PERIOD_TICKS
-     * (~6 h) the prefix goes out again once -- every chunk thereby
-     * comes by at least a few times per day on average, at a fraction
-     * of the airtime of the old 10-min re-share. The per-node phase
-     * offset (id mod period) spreads the moments; the random jitter
-     * in the bundling window adds the fine spreading. */
-    if ((n->tick + (n->id % MC_TBL_PERIOD_TICKS)) % MC_TBL_PERIOD_TICKS == 0) {
-        tbl_mark_dirty(n);
-        for (uint8_t t = 0; t < MC_TAIL_CHUNKS_PER_RESHARE; t++)
-            tail_chunk_send(n);              /* tail: a few chunks per re-share (4.3) */
+    /* Category cadence (4.3, phase-1 regime): every MC_CAT_PERIOD_US
+     * one chunk goes out, cycling cat 1 (prefix), cat 2 (near map
+     * tail), cat 3 (far map tail). Because the rounds differ in length
+     * per category, nearby knowledge is shared more often than far
+     * knowledge. A missed chunk returns at the next round of its
+     * category - no repair pull (4.3). The per-node phase offset (id
+     * mod period) spreads the moments over the cadence.
+     * Hubs (sym > MC_HUB_MIN_SYM) run the reduced regime: one
+     * round-robin chunk per MC_HUB_PERIOD_US, alternating prefix and
+     * merged tail - their prefix stays fresh via the mutation pushes
+     * (diff every bundling window), their far tail is best-effort
+     * (their neighbours hold the same knowledge redundantly). */
+    if ((n->tick + (n->id % MC_CAT_PERIOD_TICKS)) % MC_CAT_PERIOD_TICKS == 0) {
+        uint16_t sym = 0;
+        for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
+            if (n->nbr[i].alive && n->nbr[i].sym) sym++;
+        if (sym > MC_HUB_MIN_SYM) {
+            /* hub regime (4.3, phase-1 test): one chunk per ~hour,
+             * alternating cat 1 (prefix round-robin) and cat 2+3
+             * (merged tail round-robin). Mutations keep their own
+             * 15-min diff path via the bundling window (tbl_win_us),
+             * so a hub's near field stays fresh under churn. */
+            n->cat_tick++;
+            if ((n->cat_tick % 6) == 0) {          /* 6 x 10 min = 1 h */
+                if (n->cat_tick & (1 << 1)) chunk_send(n);   /* cat 1: one prefix chunk */
+                else tail_chunk_send(n);                      /* cat 2+3: one tail chunk */
+            }
+        } else {
+            /* normal regime: 1 chunk per 10 min, cycling cat 1,2,3 */
+            switch (n->cat_tick % 3) {
+            case 0: chunk_send(n);        /* cat 1: one prefix chunk, cursor continues */
+                break;
+            case 1: n->tail_cursor = (uint16_t)(n->tail_cursor % MC_MAP_NODES);
+                tail_chunk_send(n);       /* cat 2: near tail (geo half) */
+                break;
+            case 2: if (n->tail_cursor < MC_MAP_NODES) n->tail_cursor = MC_MAP_NODES;
+                tail_chunk_send(n);       /* cat 3: far tail (bare half) */
+                break;
+            }
+            n->cat_tick++;
+        }
     }
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++)          /* evidence ages per tick (4.2) */
         if (n->nbr[i].alive && n->nbr[i].proven_age_us < MC_T_SYM_US)

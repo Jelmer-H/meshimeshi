@@ -179,6 +179,9 @@ struct mimeshi_node {
                                           periodic re-shares */
     uint8_t  tbl_dirty;               /* prefix mutation pending (4.3) */
     uint8_t  tbl_push_sched;          /* push window/period timer running */
+    uint8_t  cat_tick;               /* category cadence tick counter (4.3):
+                                         normal regime counts 0,1,2 = cat 1,2,3;
+                                         the hub regime counts its hourly slots */
     mimeshi_mapnode map[MC_MAP_NODES];  /* 2-hop map (10.1) */
     mimeshi_link   lnk[MC_MAX_LINKS];  /* links between map nodes (4.3) */
     mimeshi_tx_fn     tx;
