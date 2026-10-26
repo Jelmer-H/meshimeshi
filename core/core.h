@@ -105,6 +105,13 @@ typedef struct {
     uint16_t arrived_tick;
     uint8_t  age_ticks;
     uint8_t  alive;
+    uint8_t  star_fwd_tick;  /* star round (4.5): tick of the round in
+                                which this star was last carried as
+                                CONTENT - a star that changed after
+                                this is queued again (0 = never) */
+    uint8_t  star_miss_ctr;  /* star round (4.5): missed-list damping -
+                                fetch attempts for this star that yielded
+                                no new content; reset on a real update */
 } mimeshi_mapnode;
 
 /* A link between two map nodes with the advertised quality class (3
@@ -179,6 +186,21 @@ struct mimeshi_node {
                                           periodic re-shares */
     uint8_t  tbl_dirty;               /* prefix mutation pending (4.3) */
     uint8_t  tbl_push_sched;          /* push window/period timer running */
+    uint8_t  star_round_on;           /* star-round mode (4.5, proposal):
+                                         0 = the 4.3 cadence (default),
+                                         1 = the uniform star round. Set
+                                         before mimeshi_start(); the A/B
+                                         arms of simulation scenario 6
+                                         differ exactly here */
+    uint8_t  star_round_sched;        /* star-round timer running (4.5) */
+    uint8_t  star_own_ctr;            /* star rounds since the own star last
+                                         traveled in full; the guaranteed
+                                         own-star round fires when this
+                                         reaches the hour bound (4.5) */
+    uint8_t  star_tick;               /* heartbeat tick of the own star (4.5):
+                                         +1 at every guaranteed own-star
+                                         round; rides in the age byte and
+                                         drives the derivable digest */
     mimeshi_mapnode map[MC_MAP_NODES];  /* 2-hop map (10.1) */
     mimeshi_link   lnk[MC_MAX_LINKS];  /* links between map nodes (4.3) */
     mimeshi_tx_fn     tx;
@@ -251,5 +273,12 @@ uint8_t mimeshi_star_digest(uint8_t content_hash, uint8_t tick);
  * tick, 1..k_max = advanced), -1 = no fit (content change or unknown). */
 int mimeshi_star_tick_match(uint8_t received, uint8_t content_hash,
                            uint8_t stored_tick, uint8_t k_max);
+
+/* Enable the uniform star round (4.5, proposal): one chunk per
+ * interval (15 min starting value), content stars first (own star
+ * guaranteed in full at least once per hour), catalogue in the
+ * remaining space. Call before mimeshi_start(). Without it the 4.3
+ * cadence runs - the A/B arms of simulation scenario 6. */
+void mimeshi_star_round_enable(mimeshi_node *n);
 
 #endif /* MCORE_H */

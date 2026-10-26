@@ -650,6 +650,174 @@ uint8_t mimeshi_star_digest(uint8_t content_hash, uint8_t tick) {
  * stored_tick + k for some k in 0..k_max? Returns the matched tick
  * advance (1..k_max), 0 for an exact same-tick match, or -1 when no
  * k fits (real content change, or a star we do not have). */
+/* ---- star round (4.5, proposal): the uniform convergence cadence --- */
+/* One chunk per interval (starting value 15 min = 16 proof ticks of
+ * ~56 s), all three channels like the re-share round. Content first
+ * (stars that changed since they were last forwarded, nearest hops
+ * first, the own star at the front), catalogue in the remaining space
+ * ((node id, digest) at 3 B per star). Hard bound: never more than
+ * one chunk per node per interval, whatever happens (4.5). The own
+ * star travels in full at least once per hour regardless of its
+ * queue position (4.5): the guaranteed own-star round. */
+#define MC_STAR_ROUND_TICKS   16u    /* 15 min interval in proof ticks */
+#define MC_STAR_ROUNDS_PER_H  4u     /* 60 min / 15 min: own-star bound */
+#define PKT_STAR_ROUND        10     /* new packet type (4.5) */
+#define F_STAR_CATALOGUE 0x10       /* chunk contains catalogue entries */
+
+/* Star age byte (4.5 heartbeat): the tick counter of the origin.
+ * The round is also the tick driver of the own star: at the
+ * guaranteed own-star round the tick advances and rides in the age
+ * byte; neighbours derive the new digest without content. */
+static uint8_t star_own_tick(mimeshi_node *n) { return n->star_tick; }
+
+/* Build and send one star-round chunk (4.5). Return value: number of
+ * content stars carried (0 = the chunk still went out, catalogue-only). */
+static uint8_t star_round_send(mimeshi_node *n) {
+    uint8_t p[230];
+    uint16_t len = 10;
+    p[0] = (uint8_t)PKT_STAR_ROUND;
+    wr16(p + 1, n->id);
+    p[3] = n->chunk_nr++;
+    p[4] = 0;                                   /* content star count, filled below */
+    wr16(p + 5, n->geo_lat); wr16(p + 7, n->geo_lon);
+    p[9] = 1;                                   /* firmware version (4.3 header shape) */
+
+    /* --- content area: own star first, then nearest-first queue ---
+     * The own star: the entry of n itself with its confirmed links,
+     * serialised through the same canonical form. It is always a
+     * candidate; with the own-star guarantee it goes in as soon as
+     * the hour bound is reached, and its tick advances then. */
+    uint8_t carried = 0;
+    int own_due = (uint8_t)(n->star_own_ctr + 1) >= MC_STAR_ROUNDS_PER_H;
+    int own_star_changed = n->tbl_dirty;         /* prefix mutation pending = own star changed */
+    if (own_due || own_star_changed) {
+        /* The own star in the chunk entry layout: id, both classes,
+         * tick, geo, links - via the canonical serialiser over the
+         * own map entry. */
+        uint8_t sbuf[MC_STAR_BUF]; uint16_t age_off;
+        /* ensure the own map entry exists (geo, presence) */
+        mimeshi_mapnode *om = map_find(n, n->id);
+        if (!om) { om = map_add(n, n->id); }
+        if (om) {
+            om->geo_lat = n->geo_lat; om->geo_lon = n->geo_lon;
+            uint16_t sl = mimeshi_star_serialize(n, n->id, sbuf, sizeof sbuf, &age_off);
+            if (sl > 0 && len + sl <= 230) {
+                if (own_due) { n->star_own_ctr = 0; n->star_tick++; }
+                else n->star_own_ctr++;
+                sbuf[age_off] = star_own_tick(n);   /* heartbeat tick in the age byte (4.5) */
+                memcpy(p + len, sbuf, sl);
+                len = (uint16_t)(len + sl);
+                carried++;
+            }
+        }
+    } else {
+        n->star_own_ctr++;
+    }
+
+    /* queue: map stars that were refreshed after their last forward,
+     * nearest hops first - here: prefix stars (direct neighbours)
+     * before tail stars, in map order (the map is filled with the
+     * nearest material first in practice). A star whose content is
+     * unchanged since its last forward is NOT re-sent: its catalogue
+     * entry below is the cheap confirmation (4.5). */
+    for (int pass = 0; pass < 2 && carried < MC_CHUNK_MAX_ENTRIES; pass++) {
+        for (int i = 0; i < MC_MAP_NODES && carried < MC_CHUNK_MAX_ENTRIES; i++) {
+            mimeshi_mapnode *m = &n->map[i];
+            if (!m->alive || m->id == n->id) continue;
+            int is_prefix = nbr_find(n, m->id) != 0;
+            if ((pass == 0) != (is_prefix != 0)) continue;   /* pass 0: prefix first */
+            if (m->star_fwd_tick >= (uint8_t)(n->tick & 0xFF)) continue; /* heuristic guard */
+            /* queued when updated after the last forward: the arrival
+             * tick is the update moment; both are 8-bit local wraps. */
+            if ((uint8_t)(m->arrived_tick - m->star_fwd_tick) == 0) continue;
+            uint8_t sbuf[MC_STAR_BUF];
+            uint16_t sl = mimeshi_star_serialize(n, m->id, sbuf, sizeof sbuf, 0);
+            if (sl == 0 || len + sl > 230) continue;
+            memcpy(p + len, sbuf, sl);
+            len = (uint16_t)(len + sl);
+            carried++;
+            m->star_fwd_tick = (uint8_t)(n->tick & 0xFF);
+        }
+    }
+    p[4] = carried;
+
+    /* --- catalogue area: (node id, digest) in the remaining space ---
+     * 3 B per star: what we have, in which version - the receiver
+     * resets ages on a derivable match and prunes its own queue (4.5).
+     * Own entry first (content hash of the own star + tick), then the
+     * map, nearest first again. */
+    uint16_t cat_cnt = 0;
+    if (len + 3 <= 230) {
+        uint8_t sbuf[MC_STAR_BUF];
+        mimeshi_mapnode *om = map_find(n, n->id);
+        if (om) {
+            uint16_t sl = mimeshi_star_serialize(n, n->id, sbuf, sizeof sbuf, 0);
+            if (sl > 0) {
+                uint8_t h = mimeshi_star_content_hash(sbuf, sl, 3);
+                wr16(p + len, n->id);
+                p[len + 2] = mimeshi_star_digest(h, star_own_tick(n));
+                len += 3; cat_cnt++;
+            }
+        }
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < MC_MAP_NODES && len + 3 <= 230; i++) {
+            mimeshi_mapnode *m = &n->map[i];
+            if (!m->alive || m->id == n->id) continue;
+            int is_prefix = nbr_find(n, m->id) != 0;
+            if ((pass == 0) != (is_prefix != 0)) continue;
+            uint8_t sbuf[MC_STAR_BUF];
+            uint16_t sl = mimeshi_star_serialize(n, m->id, sbuf, sizeof sbuf, 0);
+            if (sl == 0) continue;
+            uint8_t h = mimeshi_star_content_hash(sbuf, sl, 3);
+            /* tick of a foreign star: its forwarded age byte at arrival
+             * (the origin's tick as it reached us); stored per map entry
+             * as the low bits of arrived_tick are local - the tick
+             * itself rides in the age byte of the star content, which
+             * the digest derivation adds. Use the star's own age byte:
+             * the serialised age IS the tick (4.5). */
+            uint8_t tick = sbuf[3];
+            wr16(p + len, m->id);
+            p[len + 2] = mimeshi_star_digest(h, tick);
+            len += 3; cat_cnt++;
+        }
+    }
+    (void)cat_cnt;
+    if (cat_cnt) p[0] |= F_STAR_CATALOGUE;
+
+    for (uint8_t k = 0; k < MC_N_CHANNELS; k++) {
+        uint8_t c = (uint8_t)((n->home_ch + 1 + k) % MC_N_CHANNELS);
+        bound_send(n, c, p, len, t_data_us(len));
+        ka_called(n, c);
+    }
+    return carried;
+}
+
+/* Round timer (4.5): per-node phase offset like the re-share; the
+ * interval is the hard bound - one chunk per node per interval. */
+static void star_round_tick(mimeshi_node *n, void *ud) {
+    (void)ud;
+    n->star_round_sched = 0;
+    if (!n->star_round_on) return;
+    if (n->tbl_dirty) { n->tbl_dirty = 0; }       /* the round carries mutations (4.5) */
+    star_round_send(n);
+    n->star_round_sched = 1;
+    n->timer(n, MC_STAR_ROUND_TICKS * MC_KEEPALIVE_TICK_US
+             + (n->rand(n) % MC_KEEPALIVE_TICK_US), star_round_tick, 0);
+}
+
+/* Enable the star round (4.5): call before mimeshi_start(). Starts the
+ * first round after a random phase so simultaneous boots do not sync. */
+void mimeshi_star_round_enable(mimeshi_node *n) {
+    n->star_round_on = 1;
+    n->star_own_ctr = 0;
+    n->star_tick = 0;
+    if (n->star_round_sched) return;
+    n->star_round_sched = 1;
+    n->timer(n, (n->rand(n) % MC_STAR_ROUND_TICKS) * MC_KEEPALIVE_TICK_US,
+             star_round_tick, 0);
+}
+
 int mimeshi_star_tick_match(uint8_t received, uint8_t content_hash,
                            uint8_t stored_tick, uint8_t k_max) {
     if (received == mimeshi_star_digest(content_hash, stored_tick)) return 0;

@@ -53,5 +53,12 @@ target_compile_options(test_star PRIVATE -UNDEBUG)
 target_link_libraries(test_star mimeshi_static)
 add_test(NAME star COMMAND test_star)
 
+# The uniform star round (4.5): hard bound, content priority, own-star
+# guarantee, heartbeat tick, catalogue.
+add_executable(test_star_round tests/test_star_round.c)
+target_compile_options(test_star_round PRIVATE -UNDEBUG)
+target_link_libraries(test_star_round mimeshi_static)
+add_test(NAME star_round COMMAND test_star_round)
+
 # ---- platform layers (stubs; per platform only the hardware interface) ----
 add_subdirectory(platform/host)
