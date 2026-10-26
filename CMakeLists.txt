@@ -46,5 +46,12 @@ target_compile_options(test_routing PRIVATE -UNDEBUG)
 target_link_libraries(test_routing mimeshi_static)
 add_test(NAME routing COMMAND test_routing)
 
+# Star canonicalisation and digest (4.5): sorted links, order-independent
+# bytes, age-excluded content hash, derivable tick match with wrap.
+add_executable(test_star tests/test_star.c)
+target_compile_options(test_star PRIVATE -UNDEBUG)
+target_link_libraries(test_star mimeshi_static)
+add_test(NAME star COMMAND test_star)
+
 # ---- platform layers (stubs; per platform only the hardware interface) ----
 add_subdirectory(platform/host)

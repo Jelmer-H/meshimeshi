@@ -544,6 +544,122 @@ static void lnk_set_class(mimeshi_node *n, uint16_t from, uint16_t to, uint8_t c
     else           l->q = (uint8_t)((l->q & 0xF0) | cls);
 }
 
+/* ---- star canonicalisation (4.5, proposal) ---------------------------- */
+/* The star is the unit of sharing in the star-round concept: one node
+ * entry plus the links it owns. Canonical form (4.5): links sorted by
+ * neighbour id, so the star has a deterministic byte representation
+ * independent of the internal table order - the basis for content
+ * digests and the derivable heartbeat match. The entry layout follows
+ * the chunk entry of 4.3 exactly (id, quality byte, age, geo), so a
+ * star serialises to bytes a chunk receiver already understands. */
+#define MC_STAR_MAX_LINKS 64
+#define MC_STAR_MAX_BYTES (9 + 3 * MC_STAR_MAX_LINKS)
+
+/* Serialise the star of node `center` as known by n: the entry (id,
+ * both quality classes, age, geo) followed by its links, each (peer
+ * id, class center->peer << 4 | class peer->center), sorted by peer id.
+ * age_out receives the age byte position in buf (the heartbeat tick
+ * lives there, 4.5); the age byte itself is written but excluded from
+ * the content hash (mimeshi_star_content_hash). Returns the total
+ * length, or 0 if the star does not exist (not a known node) or does
+ * not fit in maxlen. */
+uint16_t mimeshi_star_serialize(const mimeshi_node *n, uint16_t center,
+                               uint8_t *buf, uint16_t maxlen,
+                               uint16_t *age_off_out) {
+    mimeshi_mapnode *m = map_find((mimeshi_node *)n, center);
+    if (!m) return 0;
+    mimeshi_neighbor *nb = nbr_find((mimeshi_node *)n, center);
+    if (maxlen < 9) return 0;
+
+    wr16(buf, center);
+    if (nb && nb->sym) {
+        buf[2] = (uint8_t)((adv_class_of(nb->quality) << 4)
+                           | adv_class_of(nb->rev_quality));
+        buf[3] = 0;                            /* direct measurement: fresh (4.3) */
+    } else {
+        /* tail star (4.3): the forwarded class of the link owner->center
+         * as last advertised, and the travelled age. */
+        buf[2] = (uint8_t)((adv_class_of(m->quality) << 4) | 0);
+        buf[3] = map_age_ticks((mimeshi_node *)n, m);
+    }
+    wr16(buf + 4, m->geo_lat);
+    wr16(buf + 6, m->geo_lon);
+    if (age_off_out) *age_off_out = 3;
+
+    /* links of the star, sorted by peer id (canonical form, 4.5). */
+    uint16_t ids[MC_STAR_MAX_LINKS];
+    uint8_t qc[MC_STAR_MAX_LINKS];
+    uint16_t cnt = 0;
+    for (int i = 0; i < MC_MAX_LINKS && cnt < MC_STAR_MAX_LINKS; i++) {
+        if (!n->lnk[i].alive) continue;
+        uint16_t peer = 0;
+        if (n->lnk[i].a == center)      peer = n->lnk[i].b;
+        else if (n->lnk[i].b == center) peer = n->lnk[i].a;
+        else continue;
+        if (map_find((mimeshi_node *)n, peer) == 0) continue;  /* link endpoints are map nodes */
+        uint8_t cf = lnk_class((mimeshi_node *)n, center, peer);
+        if (cf == 0xFF) continue;
+        uint8_t cr = lnk_class((mimeshi_node *)n, peer, center);
+        ids[cnt] = peer;
+        qc[cnt] = (uint8_t)((cf << 4) | (cr == 0xFF ? 0 : cr));
+        cnt++;
+    }
+    for (uint16_t i = 1; i < cnt; i++) {         /* insertion sort by peer id */
+        uint16_t id = ids[i]; uint8_t q = qc[i];
+        uint16_t j = i;
+        while (j > 0 && ids[j-1] > id) { ids[j] = ids[j-1]; qc[j] = qc[j-1]; j--; }
+        ids[j] = id; qc[j] = q;
+    }
+    if (9 + 3 * cnt > maxlen) return 0;          /* does not fit */
+    buf[8] = (uint8_t)cnt;                       /* link count, chunk entry layout (4.3) */
+    for (uint16_t i = 0; i < cnt; i++) {
+        wr16(buf + 9 + 3 * i, ids[i]);
+        buf[9 + 3 * i + 2] = qc[i];
+    }
+    return (uint16_t)(9 + 3 * cnt);
+}
+
+/* 1-byte content hash over the canonical star bytes EXCLUDING the age
+ * byte (4.5): the digest covers what is advertised (identity, links,
+ * quality classes), not how old the advertisement is - silent EWMA
+ * movement under the hysteresis does not change it, and the heartbeat
+ * tick (added separately in the digest) can change freely. CRC-8/ATM
+ * (poly 0x07, init 0): cheap, fixed table-free, good avalanche for the
+ * small fixed-size input. */
+uint8_t mimeshi_star_content_hash(const uint8_t *star, uint16_t len,
+                                  uint16_t age_off) {
+    uint8_t crc = 0;
+    for (uint16_t i = 0; i < len; i++) {
+        if (i == age_off) continue;              /* age excluded (4.5) */
+        crc ^= star[i];
+        for (int b = 0; b < 8; b++)
+            crc = (uint8_t)((crc & 0x80) ? (crc << 1) ^ 0x07 : crc << 1);
+    }
+    return crc;
+}
+
+/* Digest of a star as carried in the catalogue (4.5):
+ * digest = (content_hash + tick) mod 256 - derivable: a receiver that
+ * has the star can compute the expected digest for tick + k for small
+ * k, which is the heartbeat match. */
+uint8_t mimeshi_star_digest(uint8_t content_hash, uint8_t tick) {
+    return (uint8_t)(content_hash + tick);
+}
+
+/* Heartbeat match (4.5): does `received` fit content_hash at
+ * stored_tick + k for some k in 0..k_max? Returns the matched tick
+ * advance (1..k_max), 0 for an exact same-tick match, or -1 when no
+ * k fits (real content change, or a star we do not have). */
+int mimeshi_star_tick_match(uint8_t received, uint8_t content_hash,
+                           uint8_t stored_tick, uint8_t k_max) {
+    if (received == mimeshi_star_digest(content_hash, stored_tick)) return 0;
+    for (uint8_t k = 1; k <= k_max; k++)
+        if (received == mimeshi_star_digest(content_hash,
+                                            (uint8_t)(stored_tick + k)))
+            return (int)k;
+    return -1;
+}
+
 /* ---------------- route computation (10.2, building block 2) ------
  * Stateless per message: no path in the header, every hop computes its
  * own first step on the own known graph. Cost model (decided, Oct

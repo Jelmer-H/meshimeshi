@@ -222,4 +222,34 @@ void mimeshi_set_geo(mimeshi_node *n, uint16_t lat, uint16_t lon);
 void mimeshi_rx(mimeshi_node *n, uint8_t channel, int8_t rssi_db,
               const uint8_t *pkt, uint16_t len);
 
+/* ---- star canonicalisation and digest (4.5, proposal) --------------- */
+/* Buffer bound for one serialised star: entry (9 B) + max 64 links
+ * (3 B each) — the largest possible star (4.5: 64 links at the
+ * neighbor table limit). */
+#define MC_STAR_BUF (9 + 3 * 64)
+
+/* Serialise the star of node `center` as known by this node: entry (id,
+ * both quality classes, age, geo) + its links, each (peer id, classes
+ * per direction), SORTED by peer id - the canonical byte form of 4.5.
+ * age_off_out (optional) receives the offset of the age byte (the
+ * heartbeat tick lives there). Returns the length, 0 = star unknown or
+ * maxlen too small. */
+uint16_t mimeshi_star_serialize(const mimeshi_node *n, uint16_t center,
+                               uint8_t *buf, uint16_t maxlen,
+                               uint16_t *age_off_out);
+
+/* 1-byte content hash over the canonical star bytes EXCLUDING the age
+ * byte (4.5). */
+uint8_t mimeshi_star_content_hash(const uint8_t *star, uint16_t len,
+                                  uint16_t age_off);
+
+/* Catalogue digest (4.5): (content_hash + tick) mod 256 - derivable. */
+uint8_t mimeshi_star_digest(uint8_t content_hash, uint8_t tick);
+
+/* Heartbeat match (4.5): does `received` fit content_hash at
+ * stored_tick + k, k in 0..k_max? Returns the tick advance (0 = same
+ * tick, 1..k_max = advanced), -1 = no fit (content change or unknown). */
+int mimeshi_star_tick_match(uint8_t received, uint8_t content_hash,
+                           uint8_t stored_tick, uint8_t k_max);
+
 #endif /* MCORE_H */
