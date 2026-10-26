@@ -105,10 +105,17 @@ typedef struct {
     uint16_t arrived_tick;
     uint8_t  age_ticks;
     uint8_t  alive;
-    uint8_t  star_fwd_tick;  /* star round (4.5): tick of the round in
-                                which this star was last carried as
-                                CONTENT - a star that changed after
-                                this is queued again (0 = never) */
+    uint16_t star_fwd_tick;  /* star round (4.5): tick when this star
+                                was last carried as CONTENT (0 = never;
+                                same 16-bit time base as arrived_tick,
+                                so wrap arithmetic is exact) */
+    uint8_t  star_fwd_hash;  /* star round (4.5): content hash of the
+                                star AS LAST CARRIED. Queuing is driven
+                                by content: a star goes back on the
+                                queue only when its advertised content
+                                (hash over the canonical bytes, age
+                                excluded) differs from this - not when
+                                a bookkeeping tick merely moved (4.5) */
     uint8_t  star_miss_ctr;  /* star round (4.5): missed-list damping -
                                 fetch attempts for this star that yielded
                                 no new content; reset on a real update */

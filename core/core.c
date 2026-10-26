@@ -714,29 +714,33 @@ static uint8_t star_round_send(mimeshi_node *n) {
         n->star_own_ctr++;
     }
 
-    /* queue: map stars that were refreshed after their last forward,
-     * nearest hops first - here: prefix stars (direct neighbours)
-     * before tail stars, in map order (the map is filled with the
-     * nearest material first in practice). A star whose content is
-     * unchanged since its last forward is NOT re-sent: its catalogue
-     * entry below is the cheap confirmation (4.5). */
+    /* queue: stars whose CONTENT changed since they were last
+     * carried, nearest hops first - prefix stars (direct neighbours)
+     * before tail stars, in map order. The queue decision is the
+     * content hash (4.5): a star goes back on the queue only when its
+     * advertised content differs from the hash of its last carried
+     * form; a mere age/refresh touch or sub-hysteresis EWMA movement
+     * does NOT re-send it - the catalogue entry below is the cheap
+     * confirmation. star_fwd_tick uses the same 16-bit time base as
+     * arrived_tick, so wrap arithmetic is exact and no heuristic
+     * guard is needed. */
     for (int pass = 0; pass < 2 && carried < MC_CHUNK_MAX_ENTRIES; pass++) {
         for (int i = 0; i < MC_MAP_NODES && carried < MC_CHUNK_MAX_ENTRIES; i++) {
             mimeshi_mapnode *m = &n->map[i];
             if (!m->alive || m->id == n->id) continue;
             int is_prefix = nbr_find(n, m->id) != 0;
             if ((pass == 0) != (is_prefix != 0)) continue;   /* pass 0: prefix first */
-            if (m->star_fwd_tick >= (uint8_t)(n->tick & 0xFF)) continue; /* heuristic guard */
-            /* queued when updated after the last forward: the arrival
-             * tick is the update moment; both are 8-bit local wraps. */
-            if ((uint8_t)(m->arrived_tick - m->star_fwd_tick) == 0) continue;
             uint8_t sbuf[MC_STAR_BUF];
             uint16_t sl = mimeshi_star_serialize(n, m->id, sbuf, sizeof sbuf, 0);
             if (sl == 0 || len + sl > 230) continue;
+            uint8_t h = mimeshi_star_content_hash(sbuf, sl, 3);
+            if (m->star_fwd_tick != 0 && h == m->star_fwd_hash) continue;
+             /* unchanged since the last carry (content, not age) */
             memcpy(p + len, sbuf, sl);
             len = (uint16_t)(len + sl);
             carried++;
-            m->star_fwd_tick = (uint8_t)(n->tick & 0xFF);
+            m->star_fwd_tick = n->tick;
+            m->star_fwd_hash = h;
         }
     }
     p[4] = carried;

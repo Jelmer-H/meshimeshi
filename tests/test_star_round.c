@@ -212,6 +212,23 @@ int main(void) {
         assert(tick_last > tick_first);          /* the tick advances */
     }
 
+    /* content-hash queue (4.5): the far star 0x0301 never changes
+     * after its first carry - it must travel as CONTENT exactly once
+     * per channel, never again; its later presence is catalogue only. */
+    {
+        int far_content = 0;
+        for (int k = 0; k < star_rec_n; k++) {
+            uint8_t *p = star_rec[k].pkt;
+            uint16_t off = 10;
+            for (uint8_t e = 0; e < p[4]; e++) {
+                if (t_rd16(p + off) == 0x0301) far_content++;
+                off += 9 + 3 * p[off + 8];
+            }
+        }
+        printf("far star content carries: %d (of %d chunks)\n", far_content, star_rec_n);
+        assert(far_content == 3);              /* once, on each of the 3 channels */
+    }
+
     printf("test_star_round: all assertions passed\n");
     return 0;
 }
