@@ -73,5 +73,12 @@ target_compile_options(test_star_missed PRIVATE -UNDEBUG)
 target_link_libraries(test_star_missed mimeshi_static)
 add_test(NAME star_missed COMMAND test_star_missed)
 
+# The graph pruning check (4.5): forward only toward strictly farther
+# neighbours; never prune on missing information.
+add_executable(test_star_prune tests/test_star_prune.c)
+target_compile_options(test_star_prune PRIVATE -UNDEBUG)
+target_link_libraries(test_star_prune mimeshi_static)
+add_test(NAME star_prune COMMAND test_star_prune)
+
 # ---- platform layers (stubs; per platform only the hardware interface) ----
 add_subdirectory(platform/host)

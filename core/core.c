@@ -690,6 +690,89 @@ uint8_t mimeshi_star_digest(uint8_t content_hash, uint8_t tick) {
  * byte; neighbours derive the new digest without content. */
 static uint8_t star_own_tick(mimeshi_node *n) { return n->star_tick; }
 
+static int r_idx(mimeshi_node *n, uint16_t id);
+
+/* Star-forward usefulness (4.5, graph check): does forwarding the star
+ * of `center` reach any neighbour that lies strictly FARTHER from the
+ * center than we do? Hop distances over the known graph (map + link
+ * store + our own edges), the same material routing uses - but pure
+ * hop counting, no ETX: the question is reach, not cost.
+ *
+ * A BFS from the center over the routing-reachable edges gives the
+ * distance of every known node. Our own distance: the minimum over
+ * our neighbours (we are the virtual start edge, as in route_next_hop).
+ * If no known neighbour lies strictly farther, the forwarding is an
+ * echo back into the gradient: everyone we could reach got the star
+ * from the same side we did. Unknown neighbours (no map slot, no
+ * edges) count as FARTHER - absence of knowledge never silences the
+ * forward (never prune on missing information, 4.5).
+ *
+ * Return 1 = useful (forward), 0 = useless (skip). */
+static uint8_t star_dist[MC_MAP_NODES];     /* BFS distances, 0xFF = unreached */
+static uint8_t star_fwd_useful(mimeshi_node *n, uint16_t center) {
+    int ci = r_idx(n, center);
+    if (ci < 0) return 1;                     /* center unknown to us: forward */
+    for (int i = 0; i < MC_MAP_NODES; i++) star_dist[i] = 0xFF;
+
+    /* BFS from the center. Edges: the symmetric threshold links of the
+     * link store (both directions usable when the class is known) -
+     * hop reach, not route cost, so undirected relaxation over both
+     * nibbles with a non-zero class. */
+    static uint16_t qbuf[MC_MAP_NODES];       /* BFS queue of map indices */
+    uint16_t qh = 0, qt = 0;
+    star_dist[ci] = 0;
+    qbuf[qt++] = (uint16_t)ci;
+    while (qh < qt) {
+        uint16_t u = qbuf[qh++];
+        if (star_dist[u] >= 0xFE) continue;
+        uint16_t uid = n->map[u].id;
+        for (int j = 0; j < MC_MAX_LINKS; j++) {
+            if (!n->lnk[j].alive) continue;
+            uint16_t o;
+            if (n->lnk[j].a == uid) o = n->lnk[j].b;
+            else if (n->lnk[j].b == uid) o = n->lnk[j].a;
+            else continue;
+            /* either direction known with a class = a hop for reach */
+            uint8_t cf = (uint8_t)((n->lnk[j].q >> 4) & 0x0F);
+            uint8_t cr = (uint8_t)(n->lnk[j].q & 0x0F);
+            if (!cf && !cr) continue;         /* no measured direction: no hop */
+            int oi = r_idx(n, o);
+            if (oi < 0 || star_dist[oi] != 0xFF) continue;
+            star_dist[oi] = (uint8_t)(star_dist[u] + 1);
+            qbuf[qt++] = (uint16_t)oi;
+        }
+    }
+
+    /* our distance: the best hop over our own edges (virtual start);
+     * plus the trivial case: the center IS a direct neighbour (dist 1) */
+    int my_dist = 0x7FFFFFFF;
+    if (nbr_find(n, center) && nbr_find(n, center)->sym) my_dist = 1;
+    for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
+        mimeshi_neighbor *nb = &n->nbr[i];
+        if (!nb->alive || !nb->sym) continue;
+        int bi = r_idx(n, nb->id);
+        if (bi < 0) continue;
+        if (star_dist[bi] == 0xFF) continue;
+        int d = star_dist[bi] + 1;
+        if (d < my_dist) my_dist = d;
+    }
+    if (my_dist == 0x7FFFFFFF) return 1;       /* we are not on the graph of the
+                                                  star: our buren are unknown
+                                                  territory - forward */
+
+    /* useful iff at least one neighbour lies STRICTLY farther */
+    for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
+        mimeshi_neighbor *nb = &n->nbr[i];
+        if (!nb->alive || !nb->sym) continue;
+        int bi = r_idx(n, nb->id);
+        if (bi < 0) return 1;                 /* unknown neighbour: forward */
+        if (star_dist[bi] == 0xFF) return 1;  /* not reached by the star's graph:
+                                                 forward */
+        if (star_dist[bi] > my_dist) return 1;/* strictly farther: reach to gain */
+    }
+    return 0;                                 /* everyone is closer or equal: echo */
+}
+
 /* Build and send one star-round chunk (4.5). Return value: number of
  * content stars carried (0 = the chunk still went out, catalogue-only). */
 static uint8_t star_round_send(mimeshi_node *n) {
@@ -767,6 +850,14 @@ static uint8_t star_round_send(mimeshi_node *n) {
             if (!m->alive || m->id == n->id) continue;
             int is_prefix = nbr_find(n, m->id) != 0;
             if ((pass == 0) != (is_prefix != 0)) continue;   /* pass 0: prefix first */
+            /* graph pruning (4.5): skip the star when every known
+             * neighbour lies closer to (or level with) its center than
+             * we do - the forward would be an echo back into the
+             * gradient. Unknown neighbours never silence: no pruning
+             * on missing information. The star stays in the map and
+             * keeps its queue state; the missed list of a neighbour
+             * that nevertheless wants it re-queues it explicitly. */
+            if (!star_fwd_useful(n, m->id)) continue;
             uint8_t sbuf[MC_STAR_BUF];
             uint16_t sl = mimeshi_star_serialize(n, m->id, sbuf, sizeof sbuf, 0);
             if (sl == 0 || len + sl > 230 - MC_STAR_CAT_RESERVE) continue;  /* full
