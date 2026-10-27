@@ -521,6 +521,9 @@ def local_net(mk, jitter):
     out(f"neighbors per node: seen avg {sum(seen)/len(seen):.1f} (min {min(seen)}, max {max(seen)}), "
         f"confirmed symmetric avg {sum(conf)/len(conf):.1f}")
     out(f"nodes without confirmed neighbor: {sum(1 for b in conf if b == 0)} of {len(conf)}")
+    ids_set = set(n['id'] for n in nodes_list)
+    ghost = [m.id for kn in nodes for m in kn.core.mn.map if m.alive and m.id not in ids_set]
+    out(f"ghost map entries (not in the node list): {len(ghost)}, sample: {[hex(g) for g in ghost[:8]]}")
     maps = [kn.core.map_size() for kn in nodes]
     links = [kn.core.link_count() for kn in nodes]
     geos = [sum(1 for m in kn.core.mn.map if m.alive and m.geo_lat) for kn in nodes]

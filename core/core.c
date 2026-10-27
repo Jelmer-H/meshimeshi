@@ -643,6 +643,41 @@ uint16_t mimeshi_star_serialize(const mimeshi_node *n, uint16_t center,
     uint16_t ids[MC_STAR_MAX_LINKS];
     uint8_t qc[MC_STAR_MAX_LINKS];
     uint16_t cnt = 0;
+    if (center == n->id) {
+        /* the OWN star: the origin's own links come from the NEIGHBOR
+         * TABLE, not the link store (4.3) - the origin is the source
+         * of its own star, and at startup the store is still empty
+         * (bootstrap: no star received yet, no link stored yet). Every
+         * confirmed symmetric neighbour with the ownership bit on our
+         * side travels, with the own measured class and the peer's
+         * reported reverse class (4.2), published under hysteresis
+         * (4.3): a >= 2-step class move re-publishes, sub-threshold
+         * EWMA movement does not. */
+        for (int i = 0; i < MC_MAX_NEIGHBORS && cnt < MC_STAR_MAX_LINKS; i++) {
+            mimeshi_neighbor *pnb = &((mimeshi_node *)n)->nbr[i];
+            if (!pnb->alive || !pnb->sym) continue;
+            if (lnk_owner(n->id, pnb->id) != n->id) continue;   /* owned share */
+            uint8_t fresh = (uint8_t)((adv_class_of(pnb->quality) << 4)
+                                      | adv_class_of(pnb->rev_quality));
+            pnb->adv_class = adv_byte_hyst(pnb->adv_class, fresh);
+            ids[cnt] = pnb->id;
+            qc[cnt] = pnb->adv_class;
+            cnt++;
+        }
+        for (uint16_t i = 1; i < cnt; i++) {         /* insertion sort by peer id */
+            uint16_t id = ids[i]; uint8_t q = qc[i];
+            uint16_t j = i;
+            while (j > 0 && ids[j-1] > id) { ids[j] = ids[j-1]; qc[j] = qc[j-1]; j--; }
+            ids[j] = id; qc[j] = q;
+        }
+        if (9 + 3 * cnt > maxlen) return 0;          /* does not fit */
+        buf[8] = (uint8_t)cnt;                       /* link count, chunk entry layout (4.3) */
+        for (uint16_t i = 0; i < cnt; i++) {
+            wr16(buf + 9 + 3 * i, ids[i]);
+            buf[9 + 3 * i + 2] = qc[i];
+        }
+        return (uint16_t)(9 + 3 * cnt);
+    }
     for (int i = 0; i < MC_MAX_LINKS && cnt < MC_STAR_MAX_LINKS; i++) {
         if (!n->lnk[i].alive) continue;
         uint16_t peer = 0;
@@ -650,24 +685,6 @@ uint16_t mimeshi_star_serialize(const mimeshi_node *n, uint16_t center,
         else if (n->lnk[i].b == center) peer = n->lnk[i].a;
         else continue;
         if (lnk_owner(center, peer) != center) continue;   /* owned share (4.3) */
-        if (center == n->id) {
-            mimeshi_neighbor *pnb = nbr_find((mimeshi_node *)n, peer);
-            if (pnb && pnb->sym) {
-                /* the own star: the link to a confirmed neighbour
-                 * carries the own measurement and the peer's reported
-                 * reverse class (4.2) - this node IS the origin of
-                 * this form. Published under hysteresis (4.3): the
-                 * form re-publishes only on a >= 2-step class move,
-                 * keeping the own star's content hash stable. */
-                uint8_t fresh = (uint8_t)((adv_class_of(pnb->quality) << 4)
-                                         | adv_class_of(pnb->rev_quality));
-                pnb->adv_class = adv_byte_hyst(pnb->adv_class, fresh);
-                ids[cnt] = peer;
-                qc[cnt] = pnb->adv_class;
-                cnt++;
-                continue;
-            }
-        }
         if (map_find((mimeshi_node *)n, peer) == 0) continue;  /* link endpoints are map nodes */
         uint8_t cf = lnk_class((mimeshi_node *)n, center, peer);
         if (cf == 0xFF) continue;
@@ -1120,12 +1137,16 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
      * chunk_rx stored it into age_ticks; we move it to star_tick and
      * reset age_ticks to 0 - the star arrived NOW, its travelled age
      * starts here (4.4 semantics), and the tick is the liveness. */
-    chunk_rx_mode(n, rssi, pkt, len, 1);
+    uint16_t cend = 10;                      /* end of the content area */
+    for (uint8_t e = 0; e < pkt[4] && cend + 9 <= len; e++)
+        cend = (uint16_t)(cend + 9 + 3 * pkt[cend + 8]);   /* walk the content stars */
+    chunk_rx_mode(n, rssi, pkt, cend, 1);   /* entries only: the catalogue and
+                                               missed bytes are not entries */
     uint16_t rx_star[MC_CHUNK_MAX_ENTRIES];     /* content stars of THIS packet */
     uint8_t rx_star_n = 0;
     {
         uint16_t off = 10;
-        for (uint8_t e = 0; e < pkt[4] && off + 9 <= len; e++) {
+        for (uint8_t e = 0; e < pkt[4] && off + 9 <= cend; e++) {
             uint16_t eid = rd16(pkt + off);
             if (eid != n->id) {                    /* our own star is not in the map */
                 mimeshi_mapnode *em = map_find(n, eid);
@@ -1154,9 +1175,7 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
      * The number of content stars is p[4]; the entries follow the
      * chunk entry layout, so the catalogue starts after the last
      * content star. (n, digest) triples fill the rest. */
-    uint16_t off = 10;
-    for (uint8_t e = 0; e < pkt[4] && off + 9 <= len; e++)
-        off += 9 + 3 * pkt[off + 8];           /* skip content stars */
+    uint16_t off = cend;                       /* the content walk ended here */
     if (!(pkt[0] & F_STAR_CATALOGUE)) { off = len; }
     uint8_t cat_n = pkt[3];                    /* catalogue count (header) */
     uint16_t cat_end = off + 3 * cat_n;
@@ -1519,18 +1538,34 @@ static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
         uint16_t gl = rd16(pkt + off + 4), go = rd16(pkt + off + 6);
         uint8_t lcnt = pkt[off + 8];
         off += 9;
-        if (eid == n->id) {                    /* owner names us: reverse evidence (10.1) */
+        if (eid == n->id) {                    /* the origin's own entry naming US: reverse evidence (10.1) */
             if (nb) {
                 nb->proven_age_us = 0;
-                /* the owner's entry class for us IS its measurement of
+                /* the origin's entry class for us IS its measurement of
                  * our signal: our reverse quality, refreshed with every
-                 * chunk that names us (6.2) — no extra airtime */
+                 * star that names us (6.2) — no extra airtime */
                 uint8_t oq = quality_from_class(cls);
                 nb->rev_quality = quality_ewma(nb->rev_quality ? nb->rev_quality : oq, oq);
                 if (quality_ok(nb->quality)) {
                     if (!nb->sym) tbl_nbr_added(n, owner);
                     nb->sym = 1; nb->ack_try = 0;
                 }
+            }
+            /* our entry in the origin's star carries the origin's links,
+             * ours included: consume them like every entry's links and
+             * store them as received (the owner's advertised form of OUR
+             * link is routing material, 4.3) - the link loop below runs
+             * for this entry too. */
+            for (uint8_t k = 0; k < lcnt && off + 3 <= len; k++) {
+                uint16_t peer = rd16(pkt + off);
+                uint8_t lb = pkt[off + 2];
+                off += 3;
+                if (peer == n->id || peer == owner) continue;  /* our own entry in
+                    the origin's star names only us; a self-link does not exist */
+                mimeshi_mapnode *pm = map_add(n, peer);  /* named by the link (10.1) */
+                if (pm) { pm->age_ticks = age; pm->arrived_tick = n->tick; }
+                lnk_set_class(n, eid, peer, (uint8_t)(lb >> 4));
+                lnk_set_class(n, peer, eid, (uint8_t)(lb & 0x0F));
             }
         } else {
             mimeshi_mapnode *em = map_add(n, eid);
@@ -1576,7 +1611,13 @@ static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
                          * measurement of our signal, the low nibble our class
                          * as it reported it. Only meaningful when the origin
                          * is a direct neighbour of ours (the claim reaches us
-                         * possibly via a forwarder, 4.3). */
+                         * possibly via a forwarder, 4.3). The link itself is
+                         * stored as received like every other claim (4.3):
+                         * the owner's advertised form of OUR link is routing
+                         * material - the old cadence covered it in our own
+                         * entry, the star round carries it only here. */
+                        lnk_set_class(n, eid, peer, (uint8_t)(lb >> 4));
+                        lnk_set_class(n, peer, eid, (uint8_t)(lb & 0x0F));
                         mimeshi_neighbor *enb = nbr_find(n, eid);
                         if (enb) {
                             enb->proven_age_us = 0;
