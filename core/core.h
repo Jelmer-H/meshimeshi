@@ -55,8 +55,11 @@ typedef struct {
                                to us, proof list in which we appear, ack1
                                on our data, or table chunk naming us);
                                0 = only seen, one direction (4.2, 10.1) */
-    uint8_t  adv_class;     /* last advertised quality class (3 bits,
-                               hysteresis >= 2 steps, 4.3) */
+    uint8_t  adv_class;     /* the link byte last advertised for this
+                              neighbour in the own star (both direction
+                              nibbles) - hysteresis: only a >= 2-step
+                              class change on either side re-publishes,
+                              sub-threshold EWMA movement does not (4.3) */
     uint8_t  penalty;       /* local failure counter (10.4): +1 per failed
                               series toward this neighbour, -1 per ack1,
                               floor 0; raises the own-edge route cost.
@@ -101,7 +104,15 @@ typedef struct { uint16_t msg_id, src; uint16_t seq; } mimeshi_dedup;
 typedef struct {
     uint16_t id;
     uint16_t geo_lat, geo_lon;
-    uint8_t  quality;        /* advertised quality of the link to its owner (4.3) */
+    uint8_t  quality;        /* local measurement of this node's signal,
+                                refreshed on every identifying reception
+                                of it (snooping, chunks); routing-weight
+                                material, never forwarded */
+    uint8_t  adv_q;        /* entry class byte (both directions) exactly
+                              as the origin advertised it in its star
+                              (4.3 storage-as-received): reproduced
+                              byte-exactly on every hop, hashed by the
+                              content hash. 0 = not received yet. */
     uint16_t arrived_tick;
     uint8_t  age_ticks;
     uint8_t  star_tick;   /* star round (4.5): the origin's heartbeat
@@ -127,6 +138,12 @@ typedef struct {
     uint8_t  star_miss_ctr;  /* star round (4.5): missed-list damping -
                                 fetch attempts for this star that yielded
                                 no new content; reset on a real update */
+    uint16_t star_wanted;    /* star round (4.3): local tick when a
+                                neighbour last requested this star - an
+                                explicit ask overrides the forward
+                                pruning for a few intervals (the missed
+                                list is the net for what the gradient
+                                check gets wrong) */
 } mimeshi_mapnode;
 
 /* A link between two map nodes with the advertised quality class (3

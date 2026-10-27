@@ -413,14 +413,16 @@ MC_MAP_NODES, MC_MAX_LINKS = 256, 1536
 class CMapNode(ctypes.Structure):
     _fields_ = [("id", ctypes.c_uint16),
                 ("geo_lat", ctypes.c_uint16), ("geo_lon", ctypes.c_uint16),
-                ("quality", ctypes.c_uint8),
+                ("quality", ctypes.c_uint8),   # local measurement of the node's signal
+                ("adv_q", ctypes.c_uint8),      # entry class byte as the origin advertised (4.3)
                 ("arrived_tick", ctypes.c_uint16),
                 ("age_ticks", ctypes.c_uint8),
-                ("star_tick", ctypes.c_uint8),      # origin heartbeat tick (4.5)
+                ("star_tick", ctypes.c_uint8),      # origin heartbeat tick (4.3)
                 ("alive", ctypes.c_uint8),
-                ("star_fwd_tick", ctypes.c_uint16), # last carried as content (4.5)
-                ("star_fwd_hash", ctypes.c_uint8),  # content hash as last carried (4.5)
-                ("star_miss_ctr", ctypes.c_uint8)]  # missed-list damping (4.5)
+                ("star_fwd_tick", ctypes.c_uint16), # last carried as content (4.3)
+                ("star_fwd_hash", ctypes.c_uint8),  # content hash as last carried (4.3)
+                ("star_miss_ctr", ctypes.c_uint8),  # missed-list damping (4.3)
+                ("star_wanted", ctypes.c_uint16)]   # tick of the last explicit ask (4.3)
 
 class CLink(ctypes.Structure):
     _fields_ = [("a", ctypes.c_uint16), ("b", ctypes.c_uint16),

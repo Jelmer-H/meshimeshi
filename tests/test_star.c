@@ -98,37 +98,36 @@ int main(void) {
     mimeshi_init(&S, 0x0102, vrtx, sched, vrsw, vrrand, vrcad, 0);
     mimeshi_set_geo(&S, 1000, 2000);
 
-    /* S knows a far star through a chunk from owner 0x0200: entry
-     * 0x0301 (class 5, age 20, geo), with links to 0x0303 (class 5->4)
-     * and 0x0302 (class 6->3). Injected UNSORTED (peer 0x0303 before
-     * 0x0302) to prove the serialiser sorts. */
+    /* S receives the star of 0x0301 (origin 0x0301, entry classes 5,
+     * tick 20, geo) with its OWNED links: {0x0301, 0x0200} and
+     * {0x0301, 0x0303} are owned by 0x0301 (per-link hash bit, 4.3),
+     * {0x0301, 0x0302} is owned by 0x0302 and never travels in this
+     * star. Injected UNSORTED (peer 0x0303 before 0x0200) to prove
+     * the serialiser sorts. The link bytes as received: class
+     * center->peer in the high nibble, peer->center in the low. */
     {
-        uint16_t peers[2] = { 0x0303, 0x0302 };
-        uint8_t pc[2] = { 0x54, 0x63 };
-        inject_chunk_1star(&S, 0x0200, 900, 1800,
-                          0x0301, 0x50, 20, 400, 500, peers, pc, 2);
+        uint16_t peers[2] = { 0x0303, 0x0200 };
+        uint8_t pc[2] = { 0x54, 0x50 };
+        inject_chunk_1star(&S, 0x0301, 900, 1800,
+                          0x0301, 0x55, 20, 400, 500, peers, pc, 2);
     }
 
     uint8_t star[MC_STAR_BUF];
     uint16_t age_off = 0xFFFF;
     uint16_t slen = mimeshi_star_serialize(&S, 0x0301, star, sizeof star, &age_off);
-    /* the star of 0x0301 owns THREE links as known by S: to the owner
-     * 0x0200 (injected as owner->entry, class 5->0) and to the two
-     * peers (0x0302, 0x0303) - every link under exactly one endpoint
-     * (4.5), and the star owns all links of its center. */
-    assert(slen == 9 + 3 * 3);                 /* entry + three links */
+    /* the star of 0x0301: the entry plus the two OWNED links - the
+     * share the origin advertises (4.3), stored as received. */
+    assert(slen == 9 + 3 * 2);                 /* entry + two owned links */
     assert(age_off == 3);                     /* age byte position */
     assert(t_rd16(star) == 0x0301);           /* entry id */
-    assert(star[2] == 0x50);                  /* forwarded class of a tail star */
+    assert(star[2] == 0x55);                  /* entry classes as received */
     assert(t_rd16(star + 4) == 400);          /* geo */
     assert(t_rd16(star + 6) == 500);
     /* canonical: links sorted by peer id */
     assert(t_rd16(star + 9) == 0x0200);       /* sorted: 0x0200 first */
-    assert(star[9 + 2] == 0x05);              /* owner->entry class 5, rev unknown 0 */
-    assert(t_rd16(star + 12) == 0x0302);
-    assert(star[12 + 2] == 0x63);
-    assert(t_rd16(star + 15) == 0x0303);      /* unsorted on the wire: 0x0303 came first */
-    assert(star[15 + 2] == 0x54);
+    assert(star[9 + 2] == 0x50);              /* link bytes as received */
+    assert(t_rd16(star + 12) == 0x0303);
+    assert(star[12 + 2] == 0x54);
 
     /* unknown star: length 0 */
     assert(mimeshi_star_serialize(&S, 0x9999, star, sizeof star, 0) == 0);
@@ -137,12 +136,12 @@ int main(void) {
     assert(mimeshi_star_serialize(&S, 0x0301, star, 11, 0) == 0);
 
     /* canonicity: the same content, injected again in a DIFFERENT link
-     * order (0x0302 before 0x0303), serialises to the SAME bytes. */
+     * order (0x0200 before 0x0303), serialises to the SAME bytes. */
     {
-        uint16_t peers[2] = { 0x0302, 0x0303 };
-        uint8_t pc[2] = { 0x63, 0x54 };
-        inject_chunk_1star(&S, 0x0200, 900, 1800,
-                          0x0301, 0x50, 20, 400, 500, peers, pc, 2);
+        uint16_t peers[2] = { 0x0200, 0x0303 };
+        uint8_t pc[2] = { 0x50, 0x54 };
+        inject_chunk_1star(&S, 0x0301, 900, 1800,
+                          0x0301, 0x55, 20, 400, 500, peers, pc, 2);
     }
     uint8_t star2[MC_STAR_BUF];
     uint16_t slen2 = mimeshi_star_serialize(&S, 0x0301, star2, sizeof star2, 0);
@@ -151,10 +150,10 @@ int main(void) {
 
     /* content change: a link class changes -> different bytes */
     {
-        uint16_t peers[2] = { 0x0302, 0x0303 };
-        uint8_t pc[2] = { 0x63, 0x74 };        /* class 5->4 instead of 5->4? no: 0x74 differs */
-        inject_chunk_1star(&S, 0x0200, 900, 1800,
-                          0x0301, 0x50, 20, 400, 500, peers, pc, 2);
+        uint16_t peers[2] = { 0x0303, 0x0200 };
+        uint8_t pc[2] = { 0x64, 0x50 };        /* the 0x0303 link class differs */
+        inject_chunk_1star(&S, 0x0301, 900, 1800,
+                          0x0301, 0x55, 20, 400, 500, peers, pc, 2);
     }
     uint8_t star3[MC_STAR_BUF];
     uint16_t slen3 = mimeshi_star_serialize(&S, 0x0301, star3, sizeof star3, 0);
