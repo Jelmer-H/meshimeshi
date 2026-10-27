@@ -806,6 +806,81 @@ static uint8_t star_round_send(mimeshi_node *n) {
     return carried;
 }
 
+/* Reception of a star-round chunk (4.5, receiver step).
+ *
+ * The CONTENT area carries stars in exactly the chunk entry layout of
+ * 4.3 (id, classes, age, geo, links) - so the content processing goes
+ * through the ordinary chunk entry path: a receiver that only
+ * understands chunks still gets the full benefit of the content, and
+ * the symmetry evidence (an owner naming us) keeps working (4.3).
+ *
+ * The CATALOGUE area carries (node id, digest) at 3 B: what the
+ * sender has, in which version. For each entry about a star we know:
+ *  - derivable match (digest = content_hash + tick + k, k <= window):
+ *    the star is unchanged and its origin is alive; we advance the
+ *    tick and RESET the travelled age of that star as received from
+ *    this source (4.5): fresh-beats-old keeps working without a
+ *    single content byte.
+ *  - no fit: a real content change or a gap - the missed-list step
+ *    (later sub-step of 4.5) takes this from here.
+ *
+ * We cannot see the sender's own star tick directly: the catalogue
+ * entry for the sender's own star carries its digest, and a match
+ * there also confirms the sender's liveness.
+ *
+ * The digest of a foreign star in OUR store: the content hash over
+ * our canonical serialisation (age excluded) plus the tick we last
+ * saw riding in the star's age byte - stored per map entry.
+ */
+#define MC_STAR_K_MAX 8u        /* tick-lag window (4.5, starting value) */
+
+static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t len);
+
+static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t len) {
+    if (len < 10) return;
+
+    /* --- content area: chunk entry layout, processed via chunk_rx ---
+     * The header (10 B) is identical to a 4.3 chunk, and the entries
+     * follow the same layout. chunk_rx() expects p[4] entries and
+     * processes exactly that: reuse it wholesale by handing it the
+     * same packet. Its F_NEG/F_TAIL flags are not set here; the type
+     * nibble differs but chunk_rx does not look at it. */
+    chunk_rx(n, rssi, pkt, len);
+
+    /* --- catalogue area: after the content stars (4.5) ---
+     * The number of content stars is p[4]; the entries follow the
+     * chunk entry layout, so the catalogue starts after the last
+     * content star. (n, digest) triples fill the rest. */
+    if (!(pkt[0] & F_STAR_CATALOGUE)) return;
+    uint16_t off = 10;
+    for (uint8_t e = 0; e < pkt[4] && off + 9 <= len; e++)
+        off += 9 + 3 * pkt[off + 8];           /* skip content stars */
+    for (; off + 3 <= len; off += 3) {
+        uint16_t sid = rd16(pkt + off);
+        uint8_t digest = pkt[off + 2];
+        if (sid == n->id) continue;              /* our own star: we are the origin */
+        mimeshi_mapnode *m = map_find(n, sid);
+        if (!m) continue;                       /* star not known: missed-list step */
+        /* our version: content hash over our canonical bytes (age
+         * excluded), tick = the age byte we last stored for it. */
+        uint8_t sbuf[MC_STAR_BUF];
+        uint16_t sl = mimeshi_star_serialize(n, sid, sbuf, sizeof sbuf, 0);
+        if (sl == 0) continue;
+        uint8_t h = mimeshi_star_content_hash(sbuf, sl, 3);
+        uint8_t our_tick = m->age_ticks;        /* tick as it reached us (4.5) */
+        int k = mimeshi_star_tick_match(digest, h, our_tick, MC_STAR_K_MAX);
+        if (k >= 0) {
+            /* derivable match (4.5): unchanged, origin alive. Advance
+             * the tick and reset the travelled age - the knowledge is
+             * confirmed without content. */
+            m->age_ticks = (uint8_t)(our_tick + (uint8_t)k);
+            m->arrived_tick = n->tick;          /* fresh as of NOW (4.4) */
+        }
+        /* k < 0: content change or gap - handled by the missed-list
+         * sub-step of 4.5 (not built yet). */
+    }
+}
+
 /* Round timer (4.5): per-node phase offset like the re-share; the
  * interval is the hard bound - one chunk per node per interval. */
 static void star_round_tick(mimeshi_node *n, void *ud) {
@@ -1916,6 +1991,10 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
     }
     case PKT_TABLE_CHUNK: {
         chunk_rx(n, rssi, pkt, len);
+        break;
+    }
+    case PKT_STAR_ROUND: {
+        star_round_rx(n, rssi, pkt, len);
         break;
     }
     case PKT_DATA: {
