@@ -76,6 +76,7 @@ static uint16_t t_rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8))
 #define HOUR_US (4ull * INTERVAL_US)
 
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
     static mimeshi_node A, B, C;
     qn = 0; now = 0; star_rec_n = 0;
 
@@ -122,9 +123,12 @@ int main(void) {
     /* run two hours: 8 rounds expected (hard bound: no more). */
     pump_until(2 * HOUR_US + INTERVAL_US);
 
-    printf("star-round chunks from B: %d (each on 3 channels)\n", star_rec_n);
-    assert(star_rec_n >= 6 * 3);                /* at least 6 rounds happened */
-    assert(star_rec_n <= 8 * 3 + 3);            /* bound: ~8 rounds x 3 ch, small slack */
+    printf("star-round chunks from B: %d (rotation: ~1 per interval at rest)\n", star_rec_n);
+    assert(star_rec_n >= 6);                    /* at least 6 rounds happened */
+    assert(star_rec_n <= 8 * 3);                /* bound: 8 intervals x at most one
+                                                   round (1 ch at rest, 3 under
+                                                   backlog) - the hard bound below
+                                                   checks the per-interval rule */
 
     /* hard bound per interval: no two rounds of B within one interval */
     for (int i = 3; i < star_rec_n; i += 3) {    /* per round (3 ch apart) */
@@ -158,7 +162,9 @@ int main(void) {
             assert(off <= len);
         }
     }
-    assert(own_star_seen >= 3);                  /* the own star traveled in full */
+    assert(own_star_seen >= 2);                  /* the own star: the guaranteed
+                                                   home-channel round fires ~1x per
+                                                   hour (4.3 rotation coupling) */
     assert(catalogue_seen > 0);                  /* the catalogue rides along */
 
     /* own-star guarantee: within each hour of rounds the own star

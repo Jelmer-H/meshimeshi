@@ -124,17 +124,23 @@ typedef struct {
                             0 = never seen via a star round (a star
                             from a plain 4.3 chunk has no tick yet). */
     uint8_t  alive;
-    uint16_t star_fwd_tick;  /* star round (4.5): tick when this star
-                                was last carried as CONTENT (0 = never;
-                                same 16-bit time base as arrived_tick,
-                                so wrap arithmetic is exact) */
-    uint8_t  star_fwd_hash;  /* star round (4.5): content hash of the
-                                star AS LAST CARRIED. Queuing is driven
-                                by content: a star goes back on the
-                                queue only when its advertised content
-                                (hash over the canonical bytes, age
-                                excluded) differs from this - not when
-                                a bookkeeping tick merely moved (4.5) */
+    uint16_t star_fwd_tick;  /* star round (4.3): tick when this star
+                                last entered the content queue (0 =
+                                never; same 16-bit time base as
+                                arrived_tick, wrap-exact) */
+    uint8_t  star_fwd_hash;  /* star round (4.3): content hash of the
+                                star as last CARRIED. Queuing is driven
+                                by content: a star re-enters the queue
+                                when its advertised content (hash over
+                                the canonical bytes, tick excluded)
+                                differs from this - not when a
+                                bookkeeping tick merely moved */
+    uint8_t  star_fwd_bits;  /* star round (4.3): carried-on-channel bits
+                                (bit c = carried on channel c). A star
+                                leaves the content queue only at 7 (all
+                                three channels, 4.3 rotation); a content
+                                change resets the bits. Set in one blow
+                                by a full-spread (backlog) round */
     uint8_t  star_miss_ctr;  /* star round (4.5): missed-list damping -
                                 fetch attempts for this star that yielded
                                 no new content; reset on a real update */
@@ -224,6 +230,13 @@ struct mimeshi_node {
     uint16_t dedup_seq;               /* FIFO insertion counter of the dedup cache (14) */
     uint8_t  tbl_dirty;               /* own-star content change pending (4.3) */
     uint8_t  star_round_sched;        /* star-round timer running (4.3) */
+    uint8_t  star_rot_ctr;           /* rotation counter (4.3): the round
+                                        transmits on channel
+                                        (home + ctr) mod 3 at rest, and
+                                        on all three under backlog; the
+                                        guaranteed own-star round (tick)
+                                        fires when the rotation lands on
+                                        the own home channel */
     mimeshi_star_miss star_miss[MC_STAR_MISS_MAX];  /* missed-list (4.5):
                                          bounded, damped, per neighbour */
     uint8_t  star_own_ctr;            /* star rounds since the own star last

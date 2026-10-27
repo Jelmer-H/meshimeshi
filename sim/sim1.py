@@ -419,8 +419,9 @@ class CMapNode(ctypes.Structure):
                 ("age_ticks", ctypes.c_uint8),
                 ("star_tick", ctypes.c_uint8),      # origin heartbeat tick (4.3)
                 ("alive", ctypes.c_uint8),
-                ("star_fwd_tick", ctypes.c_uint16), # last carried as content (4.3)
+                ("star_fwd_tick", ctypes.c_uint16), # queue entry tick (4.3)
                 ("star_fwd_hash", ctypes.c_uint8),  # content hash as last carried (4.3)
+                ("star_fwd_bits", ctypes.c_uint8),  # carried-on-channel bits (4.3 rotation)
                 ("star_miss_ctr", ctypes.c_uint8),  # missed-list damping (4.3)
                 ("star_wanted", ctypes.c_uint16)]   # tick of the last explicit ask (4.3)
 
@@ -457,9 +458,10 @@ CNode._fields_ = [
     ("dedup_seq", ctypes.c_uint16),
     ("tbl_dirty", ctypes.c_uint8),             # own-star content change pending (4.3)
     ("star_round_sched", ctypes.c_uint8),     # star-round timer running (4.3)
-    ("star_miss", CStarMiss * 12),           # missed list (4.5, MC_STAR_MISS_MAX)
-    ("star_own_ctr", ctypes.c_uint8),         # rounds since the last own-star carry (4.5)
-    ("star_tick", ctypes.c_uint8),            # own-star heartbeat tick (4.5)
+    ("star_rot_ctr", ctypes.c_uint8),         # rotation counter (4.3)
+    ("star_miss", CStarMiss * 12),           # missed list (4.3, MC_STAR_MISS_MAX)
+    ("star_own_ctr", ctypes.c_uint8),         # home rounds since the last own-star carry (4.3)
+    ("star_tick", ctypes.c_uint8),            # own-star heartbeat tick (4.3)
     ("map", CMapNode * MC_MAP_NODES),   # 2-hop map (10.1)
     ("lnk", CLink * MC_MAX_LINKS),      # link store (4.3)
     ("tx", TX_FN), ("timer", TIMER_FN), ("switch_ch", SWITCH_FN), ("rand", RAND_FN),

@@ -866,9 +866,21 @@ static uint8_t star_round_send(mimeshi_node *n) {
      * The own star: the entry of n itself with its confirmed links,
      * serialised through the same canonical form. It is always a
      * candidate; with the own-star guarantee it goes in as soon as
-     * the hour bound is reached, and its tick advances then. */
+     * the hour bound is reached, and its tick advances then. Under
+     * the rotation (4.3) the guaranteed own-star round fires when the
+     * rotation lands on the OWN HOME channel: the tick stays coupled
+     * to the home channel, ~1x per hour at the 15-min starting value. */
     uint8_t carried = 0;
-    int own_due = (uint8_t)(n->star_own_ctr + 1) >= MC_STAR_ROUNDS_PER_H;
+    uint8_t queued_left = 0;                /* stars packed but not yet fully carried */
+    uint8_t rot_ch = (uint8_t)((n->home_ch + n->star_rot_ctr) % MC_N_CHANNELS);
+    int home_round = (rot_ch == n->home_ch);
+    /* guaranteed own-star round: every time the rotation lands on the
+     * own home channel (~1x per 3 intervals = ~45 min at the 15-min
+     * starting value - the once-per-hour bound of 4.3 stays honoured
+     * as a lower bound). star_own_ctr counts home rounds since the
+     * last guaranteed carry. */
+    int own_due = home_round
+                  && (uint8_t)(n->star_own_ctr + 1) >= (MC_STAR_ROUNDS_PER_H + 2) / 3;
     int own_star_changed = n->tbl_dirty;         /* prefix mutation pending = own star changed */
     if (own_due || own_star_changed) {
         /* The own star in the chunk entry layout: id, both classes,
@@ -946,13 +958,18 @@ static uint8_t star_round_send(mimeshi_node *n) {
                                           or would eat the catalogue reserve (4.3):
                                           stays queued for the next round */
             uint8_t h = mimeshi_star_content_hash(sbuf, sl, 3);
-            if (m->star_fwd_tick != 0 && h == m->star_fwd_hash) continue;
-             /* unchanged since the last carry (content, not age) */
+            if (m->star_fwd_tick != 0) {
+                if (h == m->star_fwd_hash && (m->star_fwd_bits & 7) == 7)
+                    continue;   /* unchanged and fully carried: done (4.3) */
+                if (h != m->star_fwd_hash)
+                    m->star_fwd_bits = 0;   /* content change: all channels again */
+            }
             memcpy(p + len, sbuf, sl);
             len = (uint16_t)(len + sl);
             carried++;
             m->star_fwd_tick = n->tick;
             m->star_fwd_hash = h;
+            queued_left++;                /* may stay queued: other channels pending */
         }
     }
     p[4] = carried;
@@ -1044,10 +1061,34 @@ static uint8_t star_round_send(mimeshi_node *n) {
         if (carried_miss) { p[0] |= F_STAR_MISSED; len = off; }
     }
 
-    for (uint8_t k = 0; k < MC_N_CHANNELS; k++) {
-        uint8_t c = (uint8_t)((n->home_ch + 1 + k) % MC_N_CHANNELS);
-        bound_send(n, c, p, len, t_data_us(len));
-        ka_called(n, c);
+    /* --- channel rotation with the backlog override (4.3) ---
+     * At rest (no backlog: everything packed fits, nothing stays
+     * queued) the round goes out on ONE channel: the rotation channel
+     * (home + round counter) mod 3. The resting overhead is paid once
+     * per interval instead of three times, the node is away from its
+     * home channel at most one interval in three, and per channel only
+     * the third of the nodes whose rotation it is transmits.
+     * Under backlog (packed stars still await other channels, or the
+     * queue did not fit) the round goes out on ALL THREE channels -
+     * a backlog drains at full speed, exactly the old cadence: under
+     * backlog every channel's throughput counts, and the full-spread
+     * round sets all three carried bits in one blow. */
+    {
+        int backlog = (queued_left > 0) || (carried >= 8);
+        uint8_t mask = backlog ? 7u : (uint8_t)(1u << rot_ch);
+        for (uint8_t c = 0; c < MC_N_CHANNELS; c++) {
+            if (!(mask & (1u << c))) continue;
+            bound_send(n, c, p, len, t_data_us(len));
+            ka_called(n, c);
+        }
+        /* carried-on-channel bits (4.3): a star leaves the queue only
+         * when all three bits stand (or a content change resets them) */
+        for (int i = 0; i < MC_MAP_NODES; i++) {
+            mimeshi_mapnode *m = &n->map[i];
+            if (!m->alive || m->id == n->id) continue;
+            if (m->star_fwd_tick == n->tick) m->star_fwd_bits |= mask;
+        }
+        n->star_rot_ctr++;
     }
     return carried;
 }
