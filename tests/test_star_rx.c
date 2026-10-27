@@ -99,6 +99,10 @@ int main(void) {
     uint8_t age_before = m->age_ticks;
     printf("far star: age_ticks=%u arrived=%u\n", age_before, arrived_before);
     assert(age_before == 30);
+    /* The star arrived via a plain 4.3 chunk: no heartbeat tick yet
+     * (star_tick = 0, its meaning). Give it one, as a star-round
+     * carry would have: the origin's tick as it reached us. */
+    m->star_tick = 40;
 
     /* let the local time base advance so the freshness reset is
      * provable: the star arrived at tick 0; at tick 5 a reset must
@@ -114,18 +118,23 @@ int main(void) {
         uint16_t sl = mimeshi_star_serialize(&B, 0x0301, sbuf, sizeof sbuf, 0);
         assert(sl > 0);
         uint8_t h = mimeshi_star_content_hash(sbuf, sl, 3);
-        uint8_t digest = mimeshi_star_digest(h, (uint8_t)(age_before + 2));
+        uint8_t digest = mimeshi_star_digest(h, (uint8_t)(m->star_tick + 2));
         uint16_t ids[1] = { 0x0301 };
         uint8_t dig[1] = { digest };
         uint8_t p[230];
         uint16_t len = craft_catalogue(p, 0x0100, ids, dig, 1);
         mimeshi_rx(&B, 0, -60, p, len);
     }
-    /* derivable match: tick advanced by 2, age refreshed to now. */
-    assert(m->age_ticks == (uint8_t)(age_before + 2));   /* heartbeat advanced */
-    assert(m->arrived_tick == B.tick);                    /* fresh as of NOW, visibly moved from 0 */
+    /* derivable match (4.5): the HEARTBEAT TICK advanced by 2
+     * (liveness) and the travelled age RESTARTED at 0 (freshness) -
+     * two separate fields now: age_ticks keeps its 4.4 routing
+     * meaning, star_tick is the origin's liveness. */
+    assert(m->star_tick == 42);                           /* heartbeat advanced */
+    assert(m->age_ticks == 0);                            /* travelled age restarted */
+    assert(m->arrived_tick == B.tick);                    /* fresh as of NOW, visibly moved */
     assert(m->arrived_tick != arrived_before);            /* the reset is real, not a no-op */
-    printf("after derivable match: age_ticks=%u arrived=%u\n", m->age_ticks, m->arrived_tick);
+    printf("after match: star_tick=%u age_ticks=%u arrived=%u\n",
+           m->star_tick, m->age_ticks, m->arrived_tick);
 
     /* a catalogue entry that fits NO tick (content changed upstream):
      * nothing may reset. */
@@ -139,6 +148,7 @@ int main(void) {
         mimeshi_rx(&B, 0, -60, p, len);
     }
     assert(m->age_ticks == age_stale);          /* untouched */
+    assert(m->star_tick == 42);                 /* the heartbeat also untouched */
     assert(m->arrived_tick == arrived_stale);   /* untouched */
 
     /* a catalogue entry for a star B does not have: ignored, no crash,

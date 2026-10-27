@@ -104,6 +104,14 @@ typedef struct {
     uint8_t  quality;        /* advertised quality of the link to its owner (4.3) */
     uint16_t arrived_tick;
     uint8_t  age_ticks;
+    uint8_t  star_tick;   /* star round (4.5): the origin's heartbeat
+                            tick as it reached us - carried in the age
+                            byte of the canonical star form. Separate
+                            from age_ticks: age_ticks keeps its 4.3
+                            meaning (travelled age for route weighing
+                            and map eviction); star_tick is liveness.
+                            0 = never seen via a star round (a star
+                            from a plain 4.3 chunk has no tick yet). */
     uint8_t  alive;
     uint16_t star_fwd_tick;  /* star round (4.5): tick when this star
                                 was last carried as CONTENT (0 = never;

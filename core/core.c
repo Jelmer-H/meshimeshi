@@ -494,6 +494,9 @@ static uint64_t tbl_win_us(mimeshi_node *n) {
 
 static void tbl_mark_dirty(mimeshi_node *n) {
     n->tbl_dirty = 1;
+    if (n->star_round_on) return;      /* star round (4.5): the next round
+                                          carries the mutation as content;
+                                          no 4.3 bundling window, no delta */
     if (!n->tbl_push_sched) {
         n->tbl_push_sched = 1;
         uint64_t w = tbl_win_us(n);
@@ -507,6 +510,12 @@ static void delta_send(mimeshi_node *n, uint16_t id);
  * packet, quality-gated like every confirmation); the table round
  * follows in the normal cadence. */
 static void tbl_nbr_added(mimeshi_node *n, uint16_t id) {
+    if (n->star_round_on) {             /* star round (4.5): no delta packet;
+                                           the new neighbour is a content change
+                                           of the own star - next round */
+        tbl_mark_dirty(n);
+        return;
+    }
     delta_send(n, id);
     tbl_mark_dirty(n);
 }
@@ -575,13 +584,16 @@ uint16_t mimeshi_star_serialize(const mimeshi_node *n, uint16_t center,
     if (nb && nb->sym) {
         buf[2] = (uint8_t)((adv_class_of(nb->quality) << 4)
                            | adv_class_of(nb->rev_quality));
-        buf[3] = 0;                            /* direct measurement: fresh (4.3) */
     } else {
         /* tail star (4.3): the forwarded class of the link owner->center
-         * as last advertised, and the travelled age. */
+         * as last advertised. */
         buf[2] = (uint8_t)((adv_class_of(m->quality) << 4) | 0);
-        buf[3] = map_age_ticks((mimeshi_node *)n, m);
     }
+    buf[3] = m->star_tick;              /* heartbeat tick in the age byte (4.5):
+                                           the origin's liveness, not the
+                                           travelled age - travelled age is
+                                           local (4.4) and never travels in
+                                           the canonical star form */
     wr16(buf + 4, m->geo_lat);
     wr16(buf + 6, m->geo_lon);
     if (age_off_out) *age_off_out = 3;
@@ -844,8 +856,30 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
      * follow the same layout. chunk_rx() expects p[4] entries and
      * processes exactly that: reuse it wholesale by handing it the
      * same packet. Its F_NEG/F_TAIL flags are not set here; the type
-     * nibble differs but chunk_rx does not look at it. */
+     * nibble differs but chunk_rx does not look at it.
+     *
+     * After the pass, the star semantics differ from a plain 4.3
+     * chunk in exactly one field: the age byte of a star-round entry
+     * carries the ORIGIN HEARTBEAT TICK (4.5), not the travelled age.
+     * chunk_rx stored it into age_ticks; we move it to star_tick and
+     * reset age_ticks to 0 - the star arrived NOW, its travelled age
+     * starts here (4.4 semantics), and the tick is the liveness. */
     chunk_rx(n, rssi, pkt, len);
+    {
+        uint16_t off = 10;
+        for (uint8_t e = 0; e < pkt[4] && off + 9 <= len; e++) {
+            uint16_t eid = rd16(pkt + off);
+            if (eid != n->id) {                    /* our own star is not in the map */
+                mimeshi_mapnode *em = map_find(n, eid);
+                if (em) {
+                    em->star_tick = pkt[off + 3];  /* the tick as it traveled (4.5) */
+                    em->age_ticks = 0;              /* arrived NOW: travelled age starts here */
+                    em->arrived_tick = n->tick;
+                }
+            }
+            off += 9 + 3 * pkt[off + 8];
+        }
+    }
 
     /* --- catalogue area: after the content stars (4.5) ---
      * The number of content stars is p[4]; the entries follow the
@@ -867,13 +901,16 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
         uint16_t sl = mimeshi_star_serialize(n, sid, sbuf, sizeof sbuf, 0);
         if (sl == 0) continue;
         uint8_t h = mimeshi_star_content_hash(sbuf, sl, 3);
-        uint8_t our_tick = m->age_ticks;        /* tick as it reached us (4.5) */
+        uint8_t our_tick = m->star_tick;        /* origin heartbeat tick (4.5):
+                                                   separate from age_ticks, which
+                                                   keeps its 4.4 meaning */
         int k = mimeshi_star_tick_match(digest, h, our_tick, MC_STAR_K_MAX);
         if (k >= 0) {
             /* derivable match (4.5): unchanged, origin alive. Advance
              * the tick and reset the travelled age - the knowledge is
              * confirmed without content. */
-            m->age_ticks = (uint8_t)(our_tick + (uint8_t)k);
+            m->star_tick = (uint8_t)(our_tick + (uint8_t)k);
+            m->age_ticks = 0;                   /* travelled age restarts (4.4) */
             m->arrived_tick = n->tick;          /* fresh as of NOW (4.4) */
         }
         /* k < 0: content change or gap - handled by the missed-list
@@ -1442,7 +1479,10 @@ static void nbr_expire(mimeshi_node *n) {
             nb->alive = 0; nb->sym = 0; nb->ack_try = 0;
             nb->quality = 0; nb->rev_quality = 0; nb->proven_age_us = 0;
             tbl_mark_dirty(n);              /* the prefix loses the entry (4.3) */
-            delta_neg_send(n, dead_id);     /* negative delta: link gone (4.4) */
+            if (!n->star_round_on)
+                delta_neg_send(n, dead_id); /* negative delta: link gone (4.4);
+                                              under the star round the own star
+                                              simply changes - next round (4.5) */
             printf("[core] node %u: neighbour %u expired after ~4 h of silence\n", n->id, dead_id);
         }
     }
@@ -1470,8 +1510,14 @@ static void proof_tick(mimeshi_node *n, void *ud) {
      * offset (id mod period) spreads the moments; the random jitter
      * in the bundling window adds the fine spreading. */
     if ((n->tick + (n->id % MC_TBL_PERIOD_TICKS)) % MC_TBL_PERIOD_TICKS == 0) {
-        tbl_mark_dirty(n);
-        tail_chunk_send(n);                    /* tail: one chunk per re-share (4.3) */
+        if (n->star_round_on) {
+            /* star round (4.5): the uniform round replaces the periodic
+             * re-share and the tail cursor - catalogue and content carry
+             * both; no extra chunks on top of the round. */
+        } else {
+            tbl_mark_dirty(n);
+            tail_chunk_send(n);                /* tail: one chunk per re-share (4.3) */
+        }
     }
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++)          /* evidence ages per tick (4.2) */
         if (n->nbr[i].alive && n->nbr[i].proven_age_us < MC_T_SYM_US)
