@@ -229,6 +229,36 @@ int main(void) {
         assert(far_content == 3);              /* once, on each of the 3 channels */
     }
 
+    /* catalogue reserve (4.5): a heavy content backlog must not push
+     * the catalogue out of the chunk - the last 30 B stay free for
+     * (id, digest) entries, the heartbeat of the resting map. Fill B's
+     * queue with far stars (many changed stars, thick backlog) and
+     * check every round still carries catalogue entries. */
+    {
+        for (int inj = 0; inj < 20; inj++) {
+            uint8_t p[64]; uint16_t len = 25;
+            p[0] = 4;
+            p[1] = (uint8_t)(0x50 + inj); p[2] = 0x03;    /* owner 0x0350.. */
+            p[3] = 0; p[4] = 1;
+            p[5] = 0x84; p[6] = 0x03; p[7] = 0x08; p[8] = 0x07; p[9] = 1;
+            p[10] = (uint8_t)(0x40 + inj); p[11] = 0x04; p[12] = 0x50; p[13] = 20;
+            p[14] = 0x90; p[15] = 0x01; p[16] = 0xF4; p[17] = 0x01; p[18] = 2;
+            p[19] = 0x02; p[20] = 0x03; p[21] = 0x63;
+            p[22] = 0x03; p[23] = 0x03; p[24] = 0x54;
+            mimeshi_rx(&B, 0, -60, p, len);
+        }
+        pump_until(now + 4 * HOUR_US / 2);      /* several rounds under backlog */
+        int cat_rounds = 0, total = 0;
+        for (int k = 0; k < star_rec_n; k++) {
+            if ((star_rec[k].at) < 2 * HOUR_US) continue;   /* only the backlog era */
+            total++;
+            if (star_rec[k].pkt[0] & F_STAR_CATALOGUE_TEST) cat_rounds++;
+        }
+        printf("backlog era: %d rounds, %d with catalogue\n", total, cat_rounds);
+        assert(total > 0);
+        assert(cat_rounds == total);           /* EVERY round kept its catalogue */ 
+    }
+
     printf("test_star_round: all assertions passed\n");
     return 0;
 }

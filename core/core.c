@@ -673,6 +673,13 @@ uint8_t mimeshi_star_digest(uint8_t content_hash, uint8_t tick) {
  * queue position (4.5): the guaranteed own-star round. */
 #define MC_STAR_ROUND_TICKS   16u    /* 15 min interval in proof ticks */
 #define MC_STAR_ROUNDS_PER_H  4u     /* 60 min / 15 min: own-star bound */
+#define MC_STAR_CAT_RESERVE   30u     /* catalogue bytes reserved per round (4.5):
+                                        content may fill the chunk, but the last
+                                        30 B are for catalogue entries - the age
+                                        maintenance that keeps the resting map
+                                        alive must not be starved by a content
+                                        backlog; 4 rounds/h x 30 B = 40 entries/h
+                                        minimum on air */
 #define PKT_STAR_ROUND        10     /* new packet type (4.5) */
 #define F_STAR_CATALOGUE 0x10       /* chunk contains catalogue entries */
 #define F_STAR_MISSED   0x20         /* chunk contains missed-star requests (4.5) */
@@ -745,7 +752,15 @@ static uint8_t star_round_send(mimeshi_node *n) {
      * stars few. What was carried is remembered per star
      * (star_fwd_tick + star_fwd_hash), so the next round simply
      * continues with what did not fit: a backlog drains over rounds,
-     * bounded by the hard one-chunk-per-interval rule. */
+     * bounded by the hard one-chunk-per-interval rule.
+     *
+     * One exception (4.5): the last MC_STAR_CAT_RESERVE bytes stay free
+     * for catalogue entries. The catalogue is the heartbeat of the
+     * resting network - without a guaranteed trickle of digests the
+     * ages would run dry during a sustained content backlog and the
+     * maintenance side of the round would starve. A star that does
+     * not fit in the reserved space simply waits a round - the queue
+     * drains, a round slower under pressure. */
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < MC_MAP_NODES; i++) {
             mimeshi_mapnode *m = &n->map[i];
@@ -754,7 +769,9 @@ static uint8_t star_round_send(mimeshi_node *n) {
             if ((pass == 0) != (is_prefix != 0)) continue;   /* pass 0: prefix first */
             uint8_t sbuf[MC_STAR_BUF];
             uint16_t sl = mimeshi_star_serialize(n, m->id, sbuf, sizeof sbuf, 0);
-            if (sl == 0 || len + sl > 230) continue;
+            if (sl == 0 || len + sl > 230 - MC_STAR_CAT_RESERVE) continue;  /* full
+                                          or would eat the catalogue reserve (4.5):
+                                          stays queued for the next round */
             uint8_t h = mimeshi_star_content_hash(sbuf, sl, 3);
             if (m->star_fwd_tick != 0 && h == m->star_fwd_hash) continue;
              /* unchanged since the last carry (content, not age) */
