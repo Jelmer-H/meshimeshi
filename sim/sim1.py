@@ -170,9 +170,9 @@ class StarStats:
         # one round transmits on all three channels back to back (~180 ms
         # apart): count the ROUND once, not per channel. A second cluster
         # within an interval would be a real violation.
-        if d["times"] and now - d["times"][-1] < 1_000_000:      # < 1 s: same round
-            pass
-        else:
+        if d["times"] and now - d["times"][-1] < 3_200_000:      # < 3.2 s: same round
+            pass                                   # (a full-spread round spans 3
+        else:                                       # channels: ~3.9 s air total)
             d["rounds"] += 1
             d["times"].append(now)
         d["content"] += pkt[4]

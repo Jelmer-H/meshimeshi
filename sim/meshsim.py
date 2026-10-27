@@ -562,6 +562,98 @@ def collision(mk, jitter):
     report(radio)
 
 
+@scenario("star-rest", "scenario 6c (4.3): utrecht40 at rest, one node silenced mid-run - "
+                         "rest behaviour, freshness and remote liveness (tick stall and death)")
+def star_rest(mk, jitter):
+    """Design 4.3/4.4 scenario 6c. The uniform cadence at rest:
+      - rest behaviour: content drains to ~0, the catalogue carries
+        the maintenance (fill measured per 6-h block via star_stats);
+      - freshness: the effective age of the map entries must stay far
+        from the 24 h eviction while the origins live;
+      - remote liveness (the piece the old 4.4 lacked): one node is
+        silenced at half-time; its star's tick stops advancing and the
+        liveness axis (star_tick_seen, 4.4) must degrade the star
+        EVERYWHERE within the liveness threshold - first de-weighted,
+        then evicted, at every hop distance, not just at the direct
+        neighbours.
+    Reports per node: presence/tick/effective age of the silenced
+    node's star, at silencing time and every 6 h after."""
+    nodes_list = load_nodes_csv(_ARGS.nodes)
+    duration_h = _ARGS.duration if getattr(_ARGS, 'duration', None) else 48
+    duration_us = duration_h * 3_600_000_000
+    radio = Radio()
+    radio.wire.open = False
+    lat0 = sum(n['lat'] for n in nodes_list) / len(nodes_list)
+    lon0 = sum(n['lon'] for n in nodes_list) / len(nodes_list)
+    pos = {n['id']: (*project(n['lat'], n['lon'], lat0, lon0), n['h']) for n in nodes_list}
+    nodes = []
+    for i, nd in enumerate(nodes_list):
+        kn = Node(radio, nd['id'])
+        kn.core = set_jitter(mk(kn), jitter)
+        kn.core.set_geo(*grid_geo(nd['lat'], nd['lon']))
+        nodes.append(kn)
+        radio.schedule(i * 250_000, kn.core.start)
+    ids = [n['id'] for n in nodes_list]
+    for a in ids:
+        for b in ids:
+            if a == b: continue
+            raw = linkbudget(pos[a], pos[b])
+            if raw is None: continue
+            fade = ((a * 31 + b * 17) % 11) - 5
+            r = raw + fade
+            if r >= RX_MIN_DBM:
+                radio.wire.links[(a, b)] = max(-128, min(120, round(r)))
+    out(f"{len(nodes_list)} nodes from {_ARGS.nodes}, duration {duration_h} h")
+
+    # the silenced node: pick a mid-degree node (not a hub, not a leaf)
+    degree = {i: 0 for i in ids}
+    for (a, b) in radio.wire.links:
+        degree[a] += 1
+    victim = sorted(ids, key=lambda i: abs(degree[i] - 19))[0]
+    out(f"victim: {victim:#06x} (degree {degree[victim]}) - silenced at "
+        f"t = {duration_h//2} h")
+    victim_links = {k: v for k, v in radio.wire.links.items() if k[0] == victim}
+
+    def report_state(label):
+        out(f"\n--- {label} ---")
+        present = 0; ticks = []; ages = []
+        for kn in nodes:
+            if kn.id == victim: continue
+            p, t, a, eff = kn.core.star_state(victim)
+            if p:
+                present += 1; ticks.append(t); ages.append(eff)
+        if present:
+            out(f"victim's star present at {present}/{len(nodes)-1} nodes, "
+                f"tick min..max {min(ticks)}..{max(ticks)}, "
+                f"eff age avg {sum(ages)/len(ages):.0f} ticks "
+                f"(max {max(ages)}, eviction at {2*771})")
+        else:
+            out("victim's star present nowhere (evicted everywhere)")
+
+    # silence the victim at half-time: cut all its links (it goes deaf
+    # AND mute - the wire no longer carries anything to or from it)
+    def silence():
+        for k in list(radio.wire.links):
+            if k[0] == victim or k[1] == victim:
+                del radio.wire.links[k]
+        out(f"[t = {duration_h//2} h] {victim:#06x} silenced (links cut)")
+    radio.schedule((duration_h // 2) * 3_600_000_000, silence)
+
+    # snapshots: presence trend of the victim's star after silencing
+    def snap(label):
+        present = sum(1 for kn in nodes if kn.id != victim
+                      and kn.core.star_state(victim)[0])
+        out(f"[snapshot {label}] victim star present at {present}/{len(nodes)-1}")
+    for frac in (0.51, 0.6, 0.7, 0.8, 0.9):
+        ts = int(frac * duration_us)
+        label = f"t = {frac*duration_h:.1f} h"
+        radio.schedule(ts, (lambda l=label: (lambda: snap(l)))())
+
+    report_state("state at start (pre-run)")
+    radio.run(until_us=duration_us)
+    report_state(f"state at end (t = {duration_h} h)")
+    star_report(radio)
+
 @scenario("traffic", "local-net + periodic unicast between confirmed symmetric neighbor pairs")
 def traffic(mk, jitter):
     """Design 14.1 scenario 2 with workload: after the startup phase,
