@@ -167,8 +167,14 @@ class StarStats:
         d = self.per_node.setdefault(nid, dict(rounds=0, content=0, catalogue=0,
                                                 missed=0, content_b=0, cat_b=0,
                                                 miss_b=0, times=[]))
-        d["rounds"] += 1
-        d["times"].append(now)
+        # one round transmits on all three channels back to back (~180 ms
+        # apart): count the ROUND once, not per channel. A second cluster
+        # within an interval would be a real violation.
+        if d["times"] and now - d["times"][-1] < 1_000_000:      # < 1 s: same round
+            pass
+        else:
+            d["rounds"] += 1
+            d["times"].append(now)
         d["content"] += pkt[4]
         d["content_b"] += 0              # filled below from the entry walk
         cat = pkt[3] if (pkt[0] & 0x10) else 0
@@ -524,8 +530,25 @@ class CCore:
         lib.mimeshi_init(ctypes.byref(self.mn), node.id, _tx, _timer, _switch, _rand, _channel_free, None)
     def start(self):
         self.lib.mimeshi_start(ctypes.byref(self.mn))
+    STAR_PROBE = None   # (rx_id, tx_id): if set, prints type-10 rx (debug hook)
     def rx(self, arg):
         ch, rssi, pkt = arg
+        if CCore.STAR_PROBE and (pkt[0] & 0x0F) == 10:
+            want_rx, want_tx = CCore.STAR_PROBE
+            if want_tx is None or self.n.id == want_rx:
+                off = 10
+                cent = []
+                for _ in range(pkt[4]):
+                    cent.append(hex(pkt[off] | (pkt[off+1] << 8)))
+                    off += 9 + 3 * pkt[off + 8]
+                cat_end = off + 3 * pkt[3]
+                ids = []
+                while off + 3 <= min(cat_end, len(pkt)):
+                    ids.append(hex(pkt[off] | (pkt[off+1] << 8)))
+                    off += 3
+                print(f"[probe] rx {self.n.id:#06x}: "
+                      f"owner {pkt[1] | (pkt[2]<<8):#06x} content={cent} catalogue={ids}",
+                      flush=True)
         buf = (ctypes.c_uint8 * len(pkt)).from_buffer_copy(pkt) if pkt else (ctypes.c_uint8 * 1)()
         self.lib.mimeshi_rx(ctypes.byref(self.mn), ch, rssi, buf, len(pkt))
     def set_geo(self, lat, lon):

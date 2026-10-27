@@ -15,7 +15,7 @@ New scenarios: add a function with an (mk, jitter) signature, where
 mk(node) builds the C protocol core (CCore; there is no other core) and
 jitter is the max hello phase jitter in microseconds (None = core value).
 """
-import argparse, os, sys
+import argparse, ctypes, math, os, sys
 
 import random
 
@@ -137,6 +137,106 @@ def star_round(mk, jitter):
     present, tick, age, eff = a.core.star_state(0x0101)
     out(f"a's view of b's star: present={present} tick={tick} "
         f"age={age} effective_age={eff}")
+
+@scenario("star-line", "10 nodes in a line, 4 km spacing, only adjacent "
+                       "neighbours audible: tick propagation, remote liveness "
+                       "and duplicate work over 9 hops (4.5, 6a multi-hop)")
+def star_line(mk, jitter):
+    """Scenario 6a multi-hop (4.5). A line of 10 nodes at 10 m height,
+    4 km apart: adjacent pairs at ~-107 dBm (well above the -110
+    threshold), two hops (8 km) at ~-113 dBm - inaudible. So every node
+    has exactly one symmetric neighbour on each side (ends: one).
+
+    Measures over ~6 simulated hours (with the 15-min round: ample
+    room for a tick of node 0's own star to reach node 9 in 9 hops):
+      - tick propagation: the star_tick of node 0's star as seen by
+        every node, hop by hop (expect: latest tick, within the
+        k-window, arrived within ~hop x interval);
+      - remote liveness: the effective age of node 0's star everywhere
+        (expect: small - refreshed by the catalogue, not drifting
+        toward the 24 h eviction);
+      - duplicate work: how often node 0's star traveled as CONTENT
+        per link (expect ~1 per hop: the content hash suppresses
+        re-sends, the graph check suppresses echoes);
+      - hard bound: one round per node per interval, all nodes."""
+    N = 10
+    SPACING = 4000.0            # metres; height 10 m
+    H = 10.0
+    duration_h = _ARGS.duration if getattr(_ARGS, 'duration', None) else 6
+    duration_us = duration_h * 3_600_000_000
+
+    radio = Radio()
+    radio.wire.open = False     # closed world: only adjacent pairs
+    # positions: line along the x-axis; ids 0x0100..0x0109
+    pos = {}
+    nodes = []
+    lat0, lon0 = 52.09, 5.07    # around Utrecht - the grid_geo encoding needs real lat/lon
+    for i in range(N):
+        nid = 0x0100 + i
+        # exact x in metres along the line:
+        x, y = SPACING * i, 0.0
+        pos[nid] = (x, y, H)
+        kn = Node(radio, nid)
+        kn.core = set_jitter(mk(kn), jitter)
+        # real geo for the 16-bit grid: walk east ~4 km per step
+        d_lon = SPACING / (111320.0 * math.cos(math.radians(lat0)))
+        kn.core.set_geo(*grid_geo(lat0, lon0 + d_lon * i))
+        nodes.append(kn)
+    # links: EXPLICIT, not from the link budget. A controlled 6a
+    # topology: every adjacent pair bidirectionally at -95 dBm (well
+    # above the -110 threshold, comfortably below the +14 capture
+    # zone of the quality gate), no other pairs - the line is exactly
+    # one neighbour per side. The ID-dependent fade of local-net would
+    # cut some directions below the threshold at 4 km (measured: the
+    # 0x0101->0x0102 direction lands at -112 dBm and the line breaks
+    # in half); the radio model itself is exercised by the other
+    # scenarios - here the subject is the star round, not the link.
+    for i in range(N - 1):
+        a, b = 0x0100 + i, 0x0100 + i + 1
+        radio.wire.links[(a, b)] = -95
+        radio.wire.links[(b, a)] = -95
+    # non-adjacent pairs: simply no link entries in the closed world -
+    # the line has exactly N-1 bidirectional edges.
+
+    for i, kn in enumerate(nodes):
+        kn.core.star_round_enable()          # the A/B switch: star round on
+        radio.schedule(i * 250_000, kn.core.start)   # never start synchronously
+    radio.run(until_us=duration_us)
+
+    star_report(radio)
+
+    # hash-chain diagnosis: does the digest each node derives for node 0's
+    # star match what its upstream neighbour would advertise?
+    out("\n--- node 0's star: per-node content hash and tick ---")
+    for i in range(1, N):
+        core = nodes[i].core
+        present, tick, age, eff = core.star_state(0x0100)
+        if not present:
+            out(f"node {0x0100+i:#06x}: not present")
+            continue
+        buf = (ctypes.c_uint8 * 300)()
+        slb = core.lib
+        sl = slb.mimeshi_star_serialize(ctypes.byref(core.mn), 0x0100, buf, 300, None)
+        h = slb.mimeshi_star_content_hash(buf, sl, 3)
+        out(f"node {0x0100+i:#06x}: hash={h:#04x} tick={tick} "
+            f"digest={slb.mimeshi_star_digest(h, tick):#04x} slen={sl}")
+
+    # tick propagation: node 0's star as seen by every node
+    out("\n--- tick of node 0x0100's star per node (heartbeat propagation) ---")
+    for i in range(1, N):
+        nid = 0x0100 + i
+        core = nodes[i].core
+        present, tick, age, eff = core.star_state(0x0100)
+        out(f"node {nid:#06x} ({i} hops): present={present} tick={tick} "
+            f"age={age} effective_age={eff}")
+
+    # duplicate work: how often node 0's star traveled as content per hop
+    out("\n--- duplicate work: content carries of node 0x0100's star ---")
+    st = radio.star_stats
+    # count via the per-node content sum is aggregate; per-link counting
+    # needs the receiver side: report the aggregate and the per-node rounds
+    out(f"(aggregate: content stars total {st.summary()['content']}, "
+        f"rounds {st.summary()['rounds']}, missed requests {st.summary()['missed']})")
 
 @scenario("link-test", "2 nodes: hellos, unicast A->B and B->A with ack1/ack2/ack3")
 def link_test(mk, jitter):
