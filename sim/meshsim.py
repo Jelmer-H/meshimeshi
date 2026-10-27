@@ -22,7 +22,8 @@ import random
 import simpy
 
 from sim1 import (radio_log, Node, CCore, load_lib, Wire, sym_count, nbr_counts,
-                  load_nodes_csv, project, linkbudget, RX_MIN_DBM, DutyLedger, N_CH)
+                  load_nodes_csv, project, linkbudget, RX_MIN_DBM, DutyLedger, N_CH,
+                  StarStats)
 
 class Radio:  # simpy version of the virtual radio; interface equal to sim1.Radio
     def __init__(self):
@@ -30,6 +31,8 @@ class Radio:  # simpy version of the virtual radio; interface equal to sim1.Radi
         self.nodes = {}        # id -> Node
         self.airtime = [0]*N_CH
         self.hello_air = [0]*N_CH   # airtime of hellos (type 1) per channel
+        self.star_air = [0]*N_CH    # airtime of star rounds (type 10) per channel (4.5)
+        self.star_stats = StarStats()  # star-round measurement (4.5, scenario 6)
         self.ack_air = [0]*N_CH     # airtime of hello-acks (type 2) per channel
         self.duty = DutyLedger()
         self.wire = Wire()
@@ -57,6 +60,8 @@ class Radio:  # simpy version of the virtual radio; interface equal to sim1.Radi
         ptype = pkt[0] & 0x0F
         if ptype == 1: self.hello_air[ch] += airtime
         elif ptype == 2: self.ack_air[ch] += airtime
+        elif ptype == 10: self.star_air[ch] += airtime
+        if ptype == 10: self.star_stats.tx(self.now, node.id, ch, pkt, airtime)
         self.duty.add(node.id, ch, self.now, airtime)
         for r in self.nodes.values():
             if r is node: continue
@@ -94,6 +99,44 @@ def report(radio):
             f"hellos heard {nd.hello_rx}, missed {nd.hello_missed}, "
             f"collisions {nd.collided}"
             + (f", confirmed symmetric {sym}" if sym is not None else ""))
+
+def star_report(radio):
+    """Star-round measurements (4.5, scenario 6): per-node round counts,
+    the three areas (content stars / catalogue entries / missed requests),
+    airtime per channel and the hard-bound check."""
+    st = radio.star_stats
+    s = st.summary()
+    out("\n=== Star-round measurements (4.5) ===")
+    out(f"nodes with rounds: {s['nodes']}, rounds: {s['rounds']}, "
+        f"content stars: {s['content']}, catalogue entries: {s['catalogue']}, "
+        f"missed requests: {s['missed']}")
+    for c in range(N_CH):
+        out(f"channel {c}: star-round airtime {radio.star_air[c]/1e6:.3f} s")
+    viol = st.hard_bound_violations()
+    out(f"hard-bound violations (rounds closer than one interval): {len(viol)}")
+    for v in viol[:5]:
+        out(f"  node {v[0]:#06x}: rounds at {v[1]/1e6:.1f}s and {v[2]/1e6:.1f}s")
+
+@scenario("star-round", "2 nodes with the star round enabled: first rounds, "
+                        "own star, catalogue and heartbeat tick (4.5, 6a warm-up)")
+def star_round(mk, jitter):
+    radio = Radio()
+    a = Node(radio, 0x0100)
+    b = Node(radio, 0x0101)
+    a.core = set_jitter(mk(a), jitter); b.core = set_jitter(mk(b), jitter)
+    a.core.star_round_enable()          # the A/B switch: star round on
+    b.core.star_round_enable()
+    a.core.start()
+    radio.schedule(500_000, b.core.start)
+    radio.run(until_us=2 * 3600 * 1_000_000)      # 2 h: own-star guarantee x2
+    star_report(radio)
+    # heartbeat probe: b's view of a's star
+    present, tick, age, eff = b.core.star_state(0x0100)
+    out(f"b's view of a's star: present={present} tick={tick} "
+        f"age={age} effective_age={eff}")
+    present, tick, age, eff = a.core.star_state(0x0101)
+    out(f"a's view of b's star: present={present} tick={tick} "
+        f"age={age} effective_age={eff}")
 
 @scenario("link-test", "2 nodes: hellos, unicast A->B and B->A with ack1/ack2/ack3")
 def link_test(mk, jitter):

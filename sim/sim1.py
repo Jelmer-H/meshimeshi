@@ -152,6 +152,63 @@ def linkbudget(pa, pb):
               (30.0 - 14.0 * math.log10(1.0 + pb[2]))
     return TX_DBM - fspl - clutter
 
+class StarStats:
+    """Star-round measurement (4.5, scenario 6): per transmitted chunk the
+    content star count (p[4]), the catalogue count (p[3]) and the missed
+    entries - the three areas of the round. Aggregates per node:
+    rounds, content stars, catalogue entries, missed requests, and the
+    byte split, plus the hard-bound check (max rounds per node per
+    interval of 16 proof ticks)."""
+    INTERVAL_US = 16 * 56000000          # 15 min (4.5 starting value)
+    def __init__(self):
+        self.per_node = {}                # id -> dict of counters
+        self.air_total = 0
+    def tx(self, now, nid, ch, pkt, airtime):
+        d = self.per_node.setdefault(nid, dict(rounds=0, content=0, catalogue=0,
+                                                missed=0, content_b=0, cat_b=0,
+                                                miss_b=0, times=[]))
+        d["rounds"] += 1
+        d["times"].append(now)
+        d["content"] += pkt[4]
+        d["content_b"] += 0              # filled below from the entry walk
+        cat = pkt[3] if (pkt[0] & 0x10) else 0
+        d["catalogue"] += cat
+        d["cat_b"] += 3 * cat
+        # missed area: after header + content + catalogue
+        if pkt[0] & 0x20:
+            off = 10
+            for _ in range(pkt[4]):
+                off += 9 + 3 * pkt[off + 8]
+            off += 3 * cat
+            while off + 3 <= len(pkt):
+                nb = pkt[off] | (pkt[off+1] << 8)
+                cnt = pkt[off+2]
+                d["missed"] += cnt
+                d["miss_b"] += 3 + 2 * cnt
+                off += 3 + 2 * cnt
+        self.air_total += airtime
+    def hard_bound_violations(self):
+        """Rounds per node per interval: more than 1 in an interval
+        violates the one-chunk-per-interval bound (4.5). Returns a
+        list of (nid, t1, t2) violation tuples."""
+        out = []
+        iv = self.INTERVAL_US
+        for nid, d in self.per_node.items():
+            times = sorted(d["times"])
+            for a, b in zip(times, times[1:]):
+                if b - a < iv - 2 * 56000000:      # 2 ticks slack for jitter
+                    out.append((nid, a, b))
+        return out
+    def summary(self):
+        rounds = sum(d["rounds"] for d in self.per_node.values())
+        content = sum(d["content"] for d in self.per_node.values())
+        catalogue = sum(d["catalogue"] for d in self.per_node.values())
+        missed = sum(d["missed"] for d in self.per_node.values())
+        nodes = len(self.per_node)
+        return dict(nodes=nodes, rounds=rounds, content=content,
+                    catalogue=catalogue, missed=missed,
+                    air_total_us=self.air_total)
+
 class Radio:  # virtual radio + clock
     def __init__(self):
         self.now = 0
@@ -162,6 +219,8 @@ class Radio:  # virtual radio + clock
         self.ack_air = [0]*N_CH     # airtime of hello-acks (type 2) per channel
         self.proof_air = [0]*N_CH   # airtime of proof lists (type 3) per channel
         self.chunk_air = [0]*N_CH   # airtime of table chunks (type 4) per channel
+        self.star_air = [0]*N_CH    # airtime of star rounds (type 10) per channel (4.5)
+        self.star_stats = StarStats()  # star-round measurement (4.5, scenario 6)
         self.duty = DutyLedger()
         self.wire = Wire()
         self.seq = 0
@@ -186,6 +245,9 @@ class Radio:  # virtual radio + clock
         elif ptype == 2: self.ack_air[ch] += airtime
         elif ptype == 3: self.proof_air[ch] += airtime
         elif ptype == 4: self.chunk_air[ch] += airtime
+        elif ptype == 10:
+            self.star_air[ch] += airtime
+            self.star_stats.tx(self.now, node.id, ch, pkt, airtime)
         self.duty.add(node.id, ch, self.now, airtime)
         self.wire.begin(self.now, ch, node.id, airtime)
         for r in self.nodes.values():
@@ -348,7 +410,11 @@ class CMapNode(ctypes.Structure):
                 ("quality", ctypes.c_uint8),
                 ("arrived_tick", ctypes.c_uint16),
                 ("age_ticks", ctypes.c_uint8),
-                ("alive", ctypes.c_uint8)]
+                ("star_tick", ctypes.c_uint8),      # origin heartbeat tick (4.5)
+                ("alive", ctypes.c_uint8),
+                ("star_fwd_tick", ctypes.c_uint16), # last carried as content (4.5)
+                ("star_fwd_hash", ctypes.c_uint8),  # content hash as last carried (4.5)
+                ("star_miss_ctr", ctypes.c_uint8)]  # missed-list damping (4.5)
 
 class CLink(ctypes.Structure):
     _fields_ = [("a", ctypes.c_uint16), ("b", ctypes.c_uint16),
@@ -367,6 +433,10 @@ SWITCH_FN = ctypes.CFUNCTYPE(None, ctypes.POINTER(CNode), ctypes.c_uint8, ctypes
                              ctypes.c_void_p, ctypes.c_void_p)
 RAND_FN = ctypes.CFUNCTYPE(ctypes.c_uint32, ctypes.POINTER(CNode))
 
+class CStarMiss(ctypes.Structure):
+    _fields_ = [("nb", ctypes.c_uint16), ("star", ctypes.c_uint16),
+                ("tries", ctypes.c_uint8), ("alive", ctypes.c_uint8)]
+
 CNode._fields_ = [
     ("id", ctypes.c_uint16), ("home_ch", ctypes.c_uint8), ("local_tbl_ctr", ctypes.c_uint16),
     ("nbr", CNeighbor * MC_MAX_NEIGHBORS), ("pend", CPending * MC_MAX_PENDING),
@@ -379,6 +449,11 @@ CNode._fields_ = [
     ("chunk_nr", ctypes.c_uint8), ("dedup_seq", ctypes.c_uint16),
     ("chunk_cursor", ctypes.c_uint8), ("tail_cursor", ctypes.c_uint8), ("tbl_dirty", ctypes.c_uint8),
     ("tbl_push_sched", ctypes.c_uint8),
+    ("star_round_on", ctypes.c_uint8),        # star-round mode (4.5): the A/B switch
+    ("star_round_sched", ctypes.c_uint8),     # star-round timer running (4.5)
+    ("star_miss", CStarMiss * 12),           # missed list (4.5, MC_STAR_MISS_MAX)
+    ("star_own_ctr", ctypes.c_uint8),         # rounds since the last own-star carry (4.5)
+    ("star_tick", ctypes.c_uint8),            # own-star heartbeat tick (4.5)
     ("map", CMapNode * MC_MAP_NODES),   # 2-hop map (10.1)
     ("lnk", CLink * MC_MAX_LINKS),      # link store (4.3)
     ("tx", TX_FN), ("timer", TIMER_FN), ("switch_ch", SWITCH_FN), ("rand", RAND_FN),
@@ -429,6 +504,14 @@ def load_lib(path):
                                       ctypes.c_uint16, ctypes.c_uint16]
     lib.mimeshi_send_data.restype = ctypes.c_int
     lib.mimeshi_set_geo.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint16, ctypes.c_uint16]
+    lib.mimeshi_star_round_enable.argtypes = [ctypes.POINTER(CNode)]
+    lib.mimeshi_star_serialize.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint16,
+                                           ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint16,
+                                           ctypes.c_void_p]
+    lib.mimeshi_star_serialize.restype = ctypes.c_uint16
+    lib.mimeshi_star_content_hash.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint16,
+                                              ctypes.c_uint16]
+    lib.mimeshi_star_content_hash.restype = ctypes.c_uint8
     return lib
 
 class CCore:
@@ -447,6 +530,20 @@ class CCore:
         self.lib.mimeshi_rx(ctypes.byref(self.mn), ch, rssi, buf, len(pkt))
     def set_geo(self, lat, lon):
         self.lib.mimeshi_set_geo(ctypes.byref(self.mn), lat, lon)
+    def star_round_enable(self):
+        """4.5 A/B switch: enable the uniform star round on this node
+        (before start()). Without it the 4.3 cadence runs."""
+        self.lib.mimeshi_star_round_enable(ctypes.byref(self.mn))
+    def star_state(self, star_id):
+        """(present, star_tick, age_ticks, effective_age) of a star in the
+        map - the 4.5 liveness/age measurement probes."""
+        for m in self.mn.map:
+            if m.alive and m.id == star_id:
+                eff = m.age_ticks + (self.mn.tick - m.arrived_tick)
+                return True, m.star_tick, m.age_ticks, eff
+        return False, 0, 0, 0
+    def miss_count(self):
+        return sum(1 for e in self.mn.star_miss if e.alive)
     def map_size(self):
         return sum(1 for m in self.mn.map if m.alive)
     def link_count(self):
