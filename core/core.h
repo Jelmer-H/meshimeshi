@@ -161,6 +161,20 @@ typedef uint32_t (*mimeshi_rand_fn)(mimeshi_node *n);
  * NULL = no CAD available (stub platform): transmit as before. */
 typedef bool (*mimeshi_channel_free_fn)(mimeshi_node *n, uint8_t channel);
 
+/* Star-round missed request (4.5): a star we do not have (or whose
+ * digest fits nothing) as advertised by a neighbour. Travelled in the
+ * missed area of our own round, addressed to that neighbour. The
+ * damping (4.5): after 1-2 attempts without new content the request
+ * falls back to fresh-beats-old weighing instead of re-asking every
+ * interval. */
+#define MC_STAR_MISS_MAX 12u
+typedef struct {
+    uint16_t nb;            /* the neighbour that advertised the star */
+    uint16_t star;          /* the star id we are missing */
+    uint8_t  tries;         /* attempts so far; dropped after 2 (4.5) */
+    uint8_t  alive;
+} mimeshi_star_miss;
+
 /* ---------------- node ---------------------------------------------- */
 struct mimeshi_node {
     uint16_t id;
@@ -208,6 +222,8 @@ struct mimeshi_node {
                                          arms of simulation scenario 6
                                          differ exactly here */
     uint8_t  star_round_sched;        /* star-round timer running (4.5) */
+    mimeshi_star_miss star_miss[MC_STAR_MISS_MAX];  /* missed-list (4.5):
+                                         bounded, damped, per neighbour */
     uint8_t  star_own_ctr;            /* star rounds since the own star last
                                          traveled in full; the guaranteed
                                          own-star round fires when this

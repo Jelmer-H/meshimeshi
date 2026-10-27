@@ -67,5 +67,11 @@ target_compile_options(test_star_rx PRIVATE -UNDEBUG)
 target_link_libraries(test_star_rx mimeshi_static)
 add_test(NAME star_rx COMMAND test_star_rx)
 
+# The missed list (4.5): request loop, damping, channel filter.
+add_executable(test_star_missed tests/test_star_missed.c)
+target_compile_options(test_star_missed PRIVATE -UNDEBUG)
+target_link_libraries(test_star_missed mimeshi_static)
+add_test(NAME star_missed COMMAND test_star_missed)
+
 # ---- platform layers (stubs; per platform only the hardware interface) ----
 add_subdirectory(platform/host)

@@ -675,6 +675,7 @@ uint8_t mimeshi_star_digest(uint8_t content_hash, uint8_t tick) {
 #define MC_STAR_ROUNDS_PER_H  4u     /* 60 min / 15 min: own-star bound */
 #define PKT_STAR_ROUND        10     /* new packet type (4.5) */
 #define F_STAR_CATALOGUE 0x10       /* chunk contains catalogue entries */
+#define F_STAR_MISSED   0x20         /* chunk contains missed-star requests (4.5) */
 
 /* Star age byte (4.5 heartbeat): the tick counter of the origin.
  * The round is also the tick driver of the own star: at the
@@ -689,7 +690,7 @@ static uint8_t star_round_send(mimeshi_node *n) {
     uint16_t len = 10;
     p[0] = (uint8_t)PKT_STAR_ROUND;
     wr16(p + 1, n->id);
-    p[3] = n->chunk_nr++;
+    p[3] = 0;                             /* catalogue count, filled below */
     p[4] = 0;                                   /* content star count, filled below */
     wr16(p + 5, n->geo_lat); wr16(p + 7, n->geo_lon);
     p[9] = 1;                                   /* firmware version (4.3 header shape) */
@@ -808,7 +809,50 @@ static uint8_t star_round_send(mimeshi_node *n) {
         }
     }
     (void)cat_cnt;
+    if (cat_cnt > 255) cat_cnt = 255;
+    p[3] = (uint8_t)cat_cnt;               /* catalogue count in the header:
+                                              the receiver knows where the
+                                              catalogue ends and the missed
+                                              area begins (the chunk-nr slot
+                                              is free: star-round chunks are
+                                              self-contained, no cursor) */
     if (cat_cnt) p[0] |= F_STAR_CATALOGUE;
+
+    /* --- missed area (4.5): requests to specific neighbours ---
+     * (neighbour id, n, star ids...) at 3 B + 2 B per star; the named
+     * neighbour resets the last-carried state of those stars, so they
+     * re-enter the content queue and travel with its next round. The
+     * damping lives per entry: tries++ here, dropped after 2. */
+    {
+        uint16_t off = len;
+        uint16_t moff = off;                    /* patch the count later */
+        (void)moff;
+        uint8_t carried_miss = 0;
+        for (uint8_t i = 0; i < MC_STAR_MISS_MAX; i++) {
+            if (!n->star_miss[i].alive) continue;
+            if (n->star_miss[i].tries >= 2) {   /* damped out (4.5) */
+                n->star_miss[i].alive = 0;
+                continue;
+            }
+            if (!nbr_find(n, n->star_miss[i].nb)) {   /* neighbour gone (4.5):
+                                                          the request could never
+                                                          be answered - drop it */
+                n->star_miss[i].alive = 0;
+                continue;
+            }
+            /* group consecutive requests to the same neighbour: this
+             * simple form packs one (nb, n=1, star) triple per entry;
+             * the receiver accepts any grouping. */
+            if (off + 5 > 230) break;           /* area full */
+            wr16(p + off, n->star_miss[i].nb);
+            p[off + 2] = 1;
+            wr16(p + off + 3, n->star_miss[i].star);
+            off += 5;
+            n->star_miss[i].tries++;
+            carried_miss++;
+        }
+        if (carried_miss) { p[0] |= F_STAR_MISSED; len = off; }
+    }
 
     for (uint8_t k = 0; k < MC_N_CHANNELS; k++) {
         uint8_t c = (uint8_t)((n->home_ch + 1 + k) % MC_N_CHANNELS);
@@ -848,8 +892,45 @@ static uint8_t star_round_send(mimeshi_node *n) {
 
 static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t len);
 
+/* Missed list (4.5): a catalogue mismatch (star unknown here, or a
+ * digest that fits no tick) becomes a request to the ADVERTISER - not
+ * a pull exchange: the request rides the own round, the answer rides
+ * the neighbour's next round as ordinary content. Damped: at most 2
+ * attempts per (neighbour, star); a star that arrives meanwhile clears
+ * the entry. Bounded by MC_STAR_MISS_MAX; a full list drops the new
+ * request (fresh-beats-old and the regular rounds remain the net). */
+static void star_miss_add(mimeshi_node *n, uint16_t nb, uint16_t star) {
+    if (nb == n->id) return;
+    if (!nbr_find(n, nb)) return;              /* only direct neighbours (4.5:
+                                                  channel-filtered by design) */
+    for (uint8_t i = 0; i < MC_STAR_MISS_MAX; i++) {
+        if (n->star_miss[i].alive && n->star_miss[i].nb == nb
+            && n->star_miss[i].star == star) return;      /* already queued */
+    }
+    for (uint8_t i = 0; i < MC_STAR_MISS_MAX; i++) {
+        if (!n->star_miss[i].alive) {
+            n->star_miss[i].alive = 1;
+            n->star_miss[i].nb = nb;
+            n->star_miss[i].star = star;
+            n->star_miss[i].tries = 0;
+            return;
+        }
+    }
+    /* full: drop silently - the damping rule keeps the list short in
+     * practice; a persistent gap resurfaces via the next mismatch. */
+}
+
+/* A star we were missing arrived (content or derivable match): clear
+ * every miss entry about it (4.5 damping: no re-request after fetch). */
+static void star_miss_clear(mimeshi_node *n, uint16_t star) {
+    for (uint8_t i = 0; i < MC_STAR_MISS_MAX; i++)
+        if (n->star_miss[i].alive && n->star_miss[i].star == star)
+            n->star_miss[i].alive = 0;
+}
+
 static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t len) {
     if (len < 10) return;
+    uint16_t owner = rd16(pkt + 1);      /* the advertiser: miss requests address it */
 
     /* --- content area: chunk entry layout, processed via chunk_rx ---
      * The header (10 B) is identical to a 4.3 chunk, and the entries
@@ -865,6 +946,8 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
      * reset age_ticks to 0 - the star arrived NOW, its travelled age
      * starts here (4.4 semantics), and the tick is the liveness. */
     chunk_rx(n, rssi, pkt, len);
+    uint16_t rx_star[MC_CHUNK_MAX_ENTRIES];     /* content stars of THIS packet */
+    uint8_t rx_star_n = 0;
     {
         uint16_t off = 10;
         for (uint8_t e = 0; e < pkt[4] && off + 9 <= len; e++) {
@@ -876,7 +959,10 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
                     em->age_ticks = 0;              /* arrived NOW: travelled age starts here */
                     em->arrived_tick = n->tick;
                 }
+                star_miss_clear(n, eid);            /* a missing star arrived:
+                                                     its requests are settled (4.5) */
             }
+            if (rx_star_n < MC_CHUNK_MAX_ENTRIES) rx_star[rx_star_n++] = eid;
             off += 9 + 3 * pkt[off + 8];
         }
     }
@@ -885,18 +971,32 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
      * The number of content stars is p[4]; the entries follow the
      * chunk entry layout, so the catalogue starts after the last
      * content star. (n, digest) triples fill the rest. */
-    if (!(pkt[0] & F_STAR_CATALOGUE)) return;
     uint16_t off = 10;
     for (uint8_t e = 0; e < pkt[4] && off + 9 <= len; e++)
         off += 9 + 3 * pkt[off + 8];           /* skip content stars */
-    for (; off + 3 <= len; off += 3) {
+    if (!(pkt[0] & F_STAR_CATALOGUE)) { off = len; }
+    uint8_t cat_n = pkt[3];                    /* catalogue count (header) */
+    uint16_t cat_end = off + 3 * cat_n;
+    if (cat_end > len) { cat_end = len; }      /* malformed: clip */
+    for (; off + 3 <= cat_end; off += 3) {
         uint16_t sid = rd16(pkt + off);
         uint8_t digest = pkt[off + 2];
         if (sid == n->id) continue;              /* our own star: we are the origin */
+        int in_content = 0;                       /* this packet already carried it */
+        for (uint8_t i = 0; i < rx_star_n; i++)
+            if (rx_star[i] == sid) { in_content = 1; break; }
+        if (in_content) continue;                 /* fresh content beats the
+                                                     catalogue mismatch: no
+                                                     request (4.5) */
         mimeshi_mapnode *m = map_find(n, sid);
-        if (!m) continue;                       /* star not known: missed-list step */
+        if (!m) {
+            /* star not known here while the neighbour advertises it:
+             * a gap - onto the missed list (4.5). */
+            star_miss_add(n, owner, sid);
+            continue;
+        }
         /* our version: content hash over our canonical bytes (age
-         * excluded), tick = the age byte we last stored for it. */
+         * excluded), tick = the heartbeat as it reached us. */
         uint8_t sbuf[MC_STAR_BUF];
         uint16_t sl = mimeshi_star_serialize(n, sid, sbuf, sizeof sbuf, 0);
         if (sl == 0) continue;
@@ -908,13 +1008,44 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
         if (k >= 0) {
             /* derivable match (4.5): unchanged, origin alive. Advance
              * the tick and reset the travelled age - the knowledge is
-             * confirmed without content. */
+             * confirmed without content. A star we were missing is
+             * hereby settled: clear its miss entries. */
             m->star_tick = (uint8_t)(our_tick + (uint8_t)k);
             m->age_ticks = 0;                   /* travelled age restarts (4.4) */
             m->arrived_tick = n->tick;          /* fresh as of NOW (4.4) */
+            star_miss_clear(n, sid);
+        } else {
+            /* no tick fits: a real content change upstream (or a hash
+             * collision) - onto the missed list; the neighbour re-sends
+             * it as content in its next round (4.5). */
+            star_miss_add(n, owner, sid);
         }
-        /* k < 0: content change or gap - handled by the missed-list
-         * sub-step of 4.5 (not built yet). */
+    }
+
+    /* --- missed area (4.5): requests addressed to US ---
+     * A neighbour is missing a star (or saw a content change): reset
+     * the last-carried state so the star re-enters the content queue
+     * and travels with our next round - no exchange, no ack, the
+     * regular cadence is the answer (4.5). */
+    if (pkt[0] & F_STAR_MISSED) {
+        uint16_t moff = cat_end;                /* where the catalogue ended */
+        for (; moff + 3 <= len;) {
+            uint16_t nb = rd16(pkt + moff);
+            uint8_t cnt = pkt[moff + 2];
+            moff += 3;
+            if (moff + 2 * cnt > len) break;    /* malformed: ignore the rest */
+            if (nb == n->id) {
+                for (uint8_t i = 0; i < cnt; i++) {
+                    uint16_t star = rd16(pkt + moff + 2 * i);
+                    mimeshi_mapnode *m = map_find(n, star);
+                    if (m) {
+                        m->star_fwd_tick = 0;   /* as never carried: queued again */
+                        m->star_fwd_hash = 0;
+                    }
+                }
+            }
+            moff += 2 * cnt;
+        }
     }
 }
 

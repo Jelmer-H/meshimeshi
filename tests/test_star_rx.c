@@ -71,7 +71,8 @@ static uint16_t craft_catalogue(uint8_t *p, uint16_t owner,
     uint16_t len = 10;
     p[0] = (uint8_t)(PKT_STAR_ROUND_VALUE | F_STAR_CATALOGUE_TEST);
     p[1] = (uint8_t)(owner & 0xFF); p[2] = (uint8_t)(owner >> 8);
-    p[3] = 0; p[4] = 0;                          /* no content stars */
+    p[3] = cnt; p[4] = 0;                        /* catalogue count in the header
+                                                    (star-round format), no content */
     p[5] = 0x4B; p[6] = 0x03; p[7] = 0xE8; p[8] = 0x07; p[9] = 1;
     for (uint8_t i = 0; i < cnt; i++) {
         p[len] = (uint8_t)(ids[i] & 0xFF); p[len+1] = (uint8_t)(ids[i] >> 8);
