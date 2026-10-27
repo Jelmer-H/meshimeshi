@@ -64,8 +64,8 @@ static int chunk_has_entry(const uint8_t *p, uint16_t len, uint16_t id) {
 
 /* Build a table chunk as the wire format of 4.3 prescribes, carrying
  * one entry (id, classes, age, geo) plus its links — the same layout
- * chunk_send() produces. Used to give a receiver real map/link state
- * through the public rx path. */
+ * a star-round content area carries. Used to give a receiver real
+ * map/link state through the public rx path. */
 static void inject_chunk_1star(mimeshi_node *rx_n,
                                uint16_t owner, uint16_t owner_lat, uint16_t owner_lon,
                                uint16_t eid, uint8_t classes, uint8_t age,

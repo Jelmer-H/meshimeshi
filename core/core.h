@@ -204,24 +204,9 @@ struct mimeshi_node {
                                          (0,0) = none (yet) */
     uint32_t tick;                    /* local time base: proof ticks (~56 s)
                                          since start (4.4); starts at 1 */
-    uint8_t  chunk_nr;                /* next table chunk number (4.3) */
     uint16_t dedup_seq;               /* FIFO insertion counter of the dedup cache (14) */
-    uint8_t  chunk_cursor;             /* table position where the next chunk
-                                          continues: tables larger than one
-                                          chunk cycle through the pushes (4.3) */
-    uint8_t  tail_cursor;               /* map position where the next tail
-                                          chunk continues (4.3): the 2-hop
-                                          entries cycle through the
-                                          periodic re-shares */
-    uint8_t  tbl_dirty;               /* prefix mutation pending (4.3) */
-    uint8_t  tbl_push_sched;          /* push window/period timer running */
-    uint8_t  star_round_on;           /* star-round mode (4.5, proposal):
-                                         0 = the 4.3 cadence (default),
-                                         1 = the uniform star round. Set
-                                         before mimeshi_start(); the A/B
-                                         arms of simulation scenario 6
-                                         differ exactly here */
-    uint8_t  star_round_sched;        /* star-round timer running (4.5) */
+    uint8_t  tbl_dirty;               /* own-star content change pending (4.3) */
+    uint8_t  star_round_sched;        /* star-round timer running (4.3) */
     mimeshi_star_miss star_miss[MC_STAR_MISS_MAX];  /* missed-list (4.5):
                                          bounded, damped, per neighbour */
     uint8_t  star_own_ctr;            /* star rounds since the own star last
@@ -304,12 +289,5 @@ uint8_t mimeshi_star_digest(uint8_t content_hash, uint8_t tick);
  * tick, 1..k_max = advanced), -1 = no fit (content change or unknown). */
 int mimeshi_star_tick_match(uint8_t received, uint8_t content_hash,
                            uint8_t stored_tick, uint8_t k_max);
-
-/* Enable the uniform star round (4.5, proposal): one chunk per
- * interval (15 min starting value), content stars first (own star
- * guaranteed in full at least once per hour), catalogue in the
- * remaining space. Call before mimeshi_start(). Without it the 4.3
- * cadence runs - the A/B arms of simulation scenario 6. */
-void mimeshi_star_round_enable(mimeshi_node *n);
 
 #endif /* MCORE_H */

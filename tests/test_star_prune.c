@@ -164,7 +164,7 @@ int main(void) {
         lnk_set_local(&B, 0x0105, 0x0104, 0x55);   /* D-C */
     }
 
-    mimeshi_star_round_enable(&B);
+    mimeshi_start(&B);                        /* starts the round timer (4.3) */
     pump_until(INTERVAL_US);                  /* first round */
 
     /* 1. WITH C: F's star is carried (C lies strictly farther) */

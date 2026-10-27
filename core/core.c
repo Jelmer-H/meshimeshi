@@ -125,9 +125,7 @@ enum {
 #define F_DEST_GEO 0x20   /* destination geo present: 4 B after the fixed
                              header (6.1, 10.2) - every hop can recompute
                              the bridge node toward an unknown destination */
-#define F_TAIL     0x10   /* table chunk flag: tail chunk - 2-hop entries (4.3) */
-#define F_DELTA    0x20   /* table chunk flag: delta - one changed entry (4.3) */
-#define F_NEG      0x40   /* table chunk flag: negative delta - one entry gone (4.4) */
+
 #define F_NEG_ACK2 0x40   /* next hop could not forward (7.2) */
 
 /* little-endian reading/writing of 16-bit fields (6.1) */
@@ -463,60 +461,21 @@ static mimeshi_link *lnk_add(mimeshi_node *n, uint16_t a, uint16_t b) {
     return 0;
 }
 
-/* Table push mutation feed (4.3): the local table counter drives the
- * push-window bundling. A mutation schedules the prefix chunks after
- * the window (1 h + jitter: even the absolute worst case - a fully
- * meshed 64-hub, 31 chunks, sustained churn - stays under 1% of a
- * channel; mutations inside the window bundle automatically because
- * only the current state goes on air). */
-#define MC_TBL_WIN_US   3600000000ull /* bundling window: 1 h (4.3, to measure) */
-#define MC_CHUNK_MAX_ENTRIES 8        /* entries per chunk: 8 x (9 B + links) fits 230 B */
-#define MC_TBL_PERIOD_TICKS 384u          /* prefix re-share: ~6 h in ~56 s ticks (4.3: every chunk at least ~1x/day) */
+/* Content stars per round packet (4.3): 8 x (9 B + links) fits 230 B. */
+#define MC_CHUNK_MAX_ENTRIES 8
 
-static void tbl_push_fire(mimeshi_node *n, void *ud);
-
-/* Bundling window, adaptive to the table size (4.3): the airtime of a
- * whole-prefix round grows with the number of chunks, and only large
- * tables can approach the 1% worst-case budget. Up to
- * MC_TBL_FAST_MAX_CHUNKS the push follows after the short window
- * (fast convergence); above it the long window keeps sustained churn
- * under 1% of a channel even for a fully meshed 64-hub. */
-#define MC_TBL_WIN_FAST_US  900000000ull   /* small tables: 15 min + jitter */
-#define MC_TBL_FAST_MAX_CHUNKS 8           /* <= 8 chunks: worst case 0.77% of a channel */
-
-static uint64_t tbl_win_us(mimeshi_node *n) {
-    uint16_t sym = 0;
-    for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
-        if (n->nbr[i].alive && n->nbr[i].sym) sym++;
-    return ((sym + MC_CHUNK_MAX_ENTRIES - 1) / MC_CHUNK_MAX_ENTRIES <= MC_TBL_FAST_MAX_CHUNKS)
-           ? MC_TBL_WIN_FAST_US : MC_TBL_WIN_US;
-}
-
+/* Table mutation feed (4.3): the local table counter marks the own
+ * star as changed; the next round carries it as content. Nothing is
+ * scheduled here - the round timer is the only send path (4.3 hard
+ * bound). */
 static void tbl_mark_dirty(mimeshi_node *n) {
     n->tbl_dirty = 1;
-    if (n->star_round_on) return;      /* star round (4.5): the next round
-                                          carries the mutation as content;
-                                          no 4.3 bundling window, no delta */
-    if (!n->tbl_push_sched) {
-        n->tbl_push_sched = 1;
-        uint64_t w = tbl_win_us(n);
-        n->timer(n, w + (n->rand(n) % w), tbl_push_fire, 0);
-    }
 }
 
-static void delta_send(mimeshi_node *n, uint16_t id);
-
-/* Neighbour addition (4.3): the delta goes out immediately (one tiny
- * packet, quality-gated like every confirmation); the table round
- * follows in the normal cadence. */
+/* Neighbour addition (4.3): the new neighbour is a content change of
+ * the own star - the next round carries it. */
 static void tbl_nbr_added(mimeshi_node *n, uint16_t id) {
-    if (n->star_round_on) {             /* star round (4.5): no delta packet;
-                                           the new neighbour is a content change
-                                           of the own star - next round */
-        tbl_mark_dirty(n);
-        return;
-    }
-    delta_send(n, id);
+    (void)id;
     tbl_mark_dirty(n);
 }
 
@@ -1044,8 +1003,8 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
      * The header (10 B) is identical to a 4.3 chunk, and the entries
      * follow the same layout. chunk_rx() expects p[4] entries and
      * processes exactly that: reuse it wholesale by handing it the
-     * same packet. Its F_NEG/F_TAIL flags are not set here; the type
-     * nibble differs but chunk_rx does not look at it.
+     * same packet; the type nibble differs but chunk_rx does not
+     * look at it.
      *
      * After the pass, the star semantics differ from a plain 4.3
      * chunk in exactly one field: the age byte of a star-round entry
@@ -1157,29 +1116,16 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
     }
 }
 
-/* Round timer (4.5): per-node phase offset like the re-share; the
- * interval is the hard bound - one chunk per node per interval. */
+/* Round timer (4.3): per-node phase offset; the interval is the hard
+ * bound - one chunk per node per interval. */
 static void star_round_tick(mimeshi_node *n, void *ud) {
     (void)ud;
     n->star_round_sched = 0;
-    if (!n->star_round_on) return;
-    if (n->tbl_dirty) { n->tbl_dirty = 0; }       /* the round carries mutations (4.5) */
+    if (n->tbl_dirty) { n->tbl_dirty = 0; }       /* the round carries mutations (4.3) */
     star_round_send(n);
     n->star_round_sched = 1;
     n->timer(n, MC_STAR_ROUND_TICKS * MC_KEEPALIVE_TICK_US
              + (n->rand(n) % MC_KEEPALIVE_TICK_US), star_round_tick, 0);
-}
-
-/* Enable the star round (4.5): call before mimeshi_start(). Starts the
- * first round after a random phase so simultaneous boots do not sync. */
-void mimeshi_star_round_enable(mimeshi_node *n) {
-    n->star_round_on = 1;
-    n->star_own_ctr = 0;
-    n->star_tick = 0;
-    if (n->star_round_sched) return;
-    n->star_round_sched = 1;
-    n->timer(n, (n->rand(n) % MC_STAR_ROUND_TICKS) * MC_KEEPALIVE_TICK_US,
-             star_round_tick, 0);
 }
 
 int mimeshi_star_tick_match(uint8_t received, uint8_t content_hash,
@@ -1405,221 +1351,6 @@ static uint16_t route_bridge_node(mimeshi_node *n, uint16_t lat, uint16_t lon,
 
 
 
-/* Delta chunk (4.3): a single changed entry, for neighbour
- * additions. A new neighbour has no links in our link store yet (they
- * appear only once its own chunks arrive), so the delta is tiny: 19 B,
- * 173 ms - versus ceil(sym/8) x 869 ms for a whole-prefix round. The
- * receiver processes it like any prefix entry (self-contained chunks),
- * and the full prefix still follows in the normal cadence: the delta
- * buys speed, the rounds buy consistency. */
-static void delta_send(mimeshi_node *n, uint16_t id) {
-    mimeshi_neighbor *nb = nbr_find(n, id);
-    if (!nb || !nb->alive || !nb->sym) return;
-    uint8_t p[19 + 3 * 4];
-    wr16(p + 1, n->id);
-    p[3] = n->chunk_nr++;
-    p[4] = 1;                                     /* one entry */
-    wr16(p + 5, n->geo_lat); wr16(p + 7, n->geo_lon);
-    p[9] = 1;
-    p[10] = (uint8_t)(PKT_TABLE_CHUNK | F_DELTA);
-    wr16(p + 11, nb->id);
-    p[13] = (uint8_t)((adv_class_of(nb->quality) << 4) | adv_class_of(nb->rev_quality));
-    p[14] = 0;                                    /* direct measurement: fresh */
-    mimeshi_mapnode *m = map_find(n, nb->id);
-    if (m && m->geo_lat) { wr16(p + 15, m->geo_lat); wr16(p + 17, m->geo_lon); }
-    else { wr16(p + 15, 0); wr16(p + 17, 0); }
-    p[19] = 0;                                    /* link count: a new neighbour has none yet */
-    for (uint8_t k = 0; k < MC_N_CHANNELS; k++) {
-        uint8_t c = (uint8_t)((n->home_ch + 1 + k) % MC_N_CHANNELS);
-        bound_send(n, c, p, 20, t_data_us(20));
-        ka_called(n, c);
-    }
-}
-
-/* Negative delta (4.4): one entry gone. Same shape as the delta, but
- * the entry id names the dead neighbour; a receiver deletes the
- * link-owner -> dead node from its store (links between others stay:
- * a different source may still carry them). Expire-then-silence is the
- * normal removal (4.4: no tombstone); the negative delta only makes
- * the routing core adapt within minutes. */
-static void delta_neg_send(mimeshi_node *n, uint16_t id) {
-    uint8_t p[20];
-    p[0] = (uint8_t)(PKT_TABLE_CHUNK | F_DELTA | F_NEG);
-    wr16(p + 1, n->id);
-    p[3] = n->chunk_nr++;
-    p[4] = 1;
-    wr16(p + 5, n->geo_lat); wr16(p + 7, n->geo_lon);
-    p[9] = 1;
-    wr16(p + 10, id);
-    p[12] = 0; p[13] = 255;                        /* no classes; age 255 = expired */
-    wr16(p + 14, 0); wr16(p + 16, 0);              /* no geo */
-    p[18] = 0;                                     /* no links */
-    for (uint8_t k = 0; k < MC_N_CHANNELS; k++) {
-        uint8_t c = (uint8_t)((n->home_ch + 1 + k) % MC_N_CHANNELS);
-        bound_send(n, c, p, 19, t_data_us(19));
-        ka_called(n, c);
-    }
-}
-
-/* Tail chunk (4.3): the 2-hop map as full entries. Same format as the
- * prefix chunk, flagged with F_TAIL. Entries are map nodes that are NOT
- * direct neighbours; their links come from the link store (classes per
- * direction). The tail cycles through the periodic re-shares via
- * tail_cursor: one tail chunk per re-share keeps the airtime bounded
- * (4.3 rising cadence), a full tail thereby passes in a few days.
- * Age per entry: effective age in proof ticks (4.4), capped at 255. */
-static void tail_chunk_send(mimeshi_node *n) {
-    uint8_t p[230];
-    uint16_t len = 10;
-    uint8_t cnt = 0;
-    int start = n->tail_cursor;
-    for (int k = 0; k < MC_MAP_NODES && cnt < MC_CHUNK_MAX_ENTRIES && len + 9 <= 230; k++) {
-        int i = (start + k) % MC_MAP_NODES;
-        mimeshi_mapnode *m = &n->map[i];
-        if (!m->alive) continue;
-        if (nbr_find(n, m->id)) continue;               /* direct neighbours: prefix work */
-        wr16(p + len, m->id);
-        /* both directions in one byte, like the prefix (6.2, 4.3): the
-         * forwarded class in the high nibble - the class our source
-         * advertised for owner->entry; reverse nibble 0 = not reported
-         * by the entry itself. A class 0 only when never reported. */
-        p[len + 2] = (uint8_t)(adv_class_of(m->quality) << 4);
-        p[len + 3] = map_age_eff(n, m);
-        wr16(p + len + 4, m->geo_lat); wr16(p + len + 6, m->geo_lon);
-        uint16_t lcnt_off = len + 8;
-        len += 9;
-        uint8_t lcnt = 0;
-        for (int j = 0; j < MC_MAP_NODES && len + 3 <= 230; j++) {
-            mimeshi_mapnode *m2 = &n->map[j];
-            if (!m2->alive || m2->id == m->id) continue;
-            uint8_t cf = lnk_class(n, m->id, m2->id);
-            if (cf == 0xFF) continue;
-            uint8_t cr = lnk_class(n, m2->id, m->id);
-            wr16(p + len, m2->id);
-            p[len + 2] = (uint8_t)((cf << 4) | (cr == 0xFF ? 0 : cr));
-            len += 3; lcnt++;
-        }
-        p[lcnt_off] = lcnt;
-        cnt++;
-        n->tail_cursor = (uint8_t)((i + 1) % MC_MAP_NODES);
-    }
-    if (cnt == 0) { n->tail_cursor = 0; return; }        /* empty tail: next time from the top */
-    p[0] = (uint8_t)(PKT_TABLE_CHUNK | F_TAIL);
-    wr16(p + 1, n->id);
-    p[3] = n->chunk_nr++;
-    p[4] = cnt;
-    wr16(p + 5, n->geo_lat); wr16(p + 7, n->geo_lon);
-    p[9] = 1;
-    for (uint8_t k = 0; k < MC_N_CHANNELS; k++) {
-        uint8_t c = (uint8_t)((n->home_ch + 1 + k) % MC_N_CHANNELS);
-        bound_send(n, c, p, len, t_data_us(len));
-        ka_called(n, c);
-    }
-}
-
-static void chunk_send(mimeshi_node *n);
-
-/* Whole prefix in one push round: mutations are urgent (4.3 cadence
- * speed 1), so every chunk follows back to back. A round starts at
- * table position 0 and ends when the cursor has come fully around:
- * the number of chunks follows from what actually fits per chunk
- * (230 B packet, 9 B per entry + 3 B per inter-neighbour link), not
- * from the table size alone. A fixed ceil(sym/8) rounds off the
- * count while entries get thicker as the link store fills - every
- * round then shared the same first ~21 of 26 neighbours and never
- * the tail (measured under load: the leaf neighbours of a hub
- * vanished from its prefix forever, and the network 'forgot' them
- * at the 24 h map eviction). The guard bounds the loop; a chunk
- * with cnt 0 resets the cursor to 0, and no cursor progress also
- * ends the round. */
-static void chunk_send_all(mimeshi_node *n) {
-    uint16_t sym = 0;
-    int last = -1;
-    for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
-        if (n->nbr[i].alive && n->nbr[i].sym) { sym++; last = i; }
-    if (sym == 0) return;
-    uint8_t end = (uint8_t)((last + 1) % MC_MAX_NEIGHBORS);   /* one past the last entry */
-    n->chunk_cursor = 0;
-    for (uint16_t guard = 0; guard <= MC_MAX_NEIGHBORS; guard++) {
-        uint8_t before = n->chunk_cursor;
-        chunk_send(n);
-        if (n->chunk_cursor == 0 || n->chunk_cursor == before
-            || n->chunk_cursor == end) break;   /* round complete: cursor passed the last entry */
-    }
-}
-
-static void chunk_send(mimeshi_node *n) {
-    uint8_t p[230];
-    uint16_t len = 10;
-    uint8_t cnt = 0;
-    int start = n->chunk_cursor;                  /* continuation: the table cycles (4.3) */
-    for (int k = 0; k < MC_MAX_NEIGHBORS && cnt < MC_CHUNK_MAX_ENTRIES && len + 9 <= 230; k++) {
-        int i = (start + k) % MC_MAX_NEIGHBORS;
-        mimeshi_neighbor *nb = &n->nbr[i];
-        if (!nb->alive || !nb->sym) continue;      /* only confirmed symmetric (4.3) */
-        wr16(p + len, nb->id);
-        /* both directions in one byte (6.2, 4.3): our measured EWMA
-         * class, and the class the neighbour reported about us (its
-         * ack quality byte, rev_quality). 0 = the reverse direction is
-         * not yet known (the neighbour has not acked us recently). */
-        p[len + 2] = (uint8_t)((adv_class_of(nb->quality) << 4)
-                              | adv_class_of(nb->rev_quality));
-        p[len + 3] = 0;                            /* direct measurement: fresh */
-        mimeshi_mapnode *m = map_find(n, nb->id);
-        if (m && m->geo_lat) { wr16(p + len + 4, m->geo_lat); wr16(p + len + 6, m->geo_lon); }
-        else { wr16(p + len + 4, 0); wr16(p + len + 6, 0); }
-        uint16_t lcnt_off = len + 8;
-        len += 9;
-        uint8_t lcnt = 0;
-        for (int j = 0; j < MC_MAX_NEIGHBORS && len + 3 <= 230; j++) {
-            if (j == i) continue;
-            mimeshi_neighbor *nb2 = &n->nbr[j];
-            if (!nb2->alive || !nb2->sym) continue;
-            uint8_t cf = lnk_class(n, nb->id, nb2->id);
-            if (cf == 0xFF) continue;              /* never heard about this pair */
-            uint8_t cr = lnk_class(n, nb2->id, nb->id);
-            wr16(p + len, nb2->id);
-            p[len + 2] = (uint8_t)((cf << 4) | (cr == 0xFF ? 0 : cr));
-            len += 3; lcnt++;
-        }
-        p[lcnt_off] = lcnt;
-        cnt++;
-        n->chunk_cursor = (uint8_t)((i + 1) % MC_MAX_NEIGHBORS);   /* continue here next push */
-    }
-    if (cnt == 0) { n->chunk_cursor = 0; return; } /* nothing to share yet */
-    p[0] = PKT_TABLE_CHUNK;
-    wr16(p + 1, n->id);
-    p[3] = n->chunk_nr++;
-    p[4] = cnt;
-    wr16(p + 5, n->geo_lat); wr16(p + 7, n->geo_lon);
-    p[9] = 1;                                     /* firmware version */
-    /* All three channels, in fixed order — the same reason as the hello
-     * round (2): confirmed neighbours sit on all home channels. A chunk
-     * on the own home channel alone would reach only the same-channel
-     * third; the links between cross-channel neighbours would then never
-     * propagate and the 2-hop map would stay blind for exactly the
-     * links that Gabriel and route choice need. Cost per chunk: 3 x
-     * 869 ms air per push round; a full tower table stays far under the
-     * duty limit. The push bundling (one chunk per window) caps the
-     * rate; the pool has a slot per transmission like the hello round.
-     * The round STARTS at (home + 1) mod 3 and thereby ENDS on the own
-     * home channel: no switch left over, and the neighbours there can
-     * react (snooping, later the generalised ack, 12.16) immediately. */
-    for (uint8_t k = 0; k < MC_N_CHANNELS; k++) {
-        uint8_t c = (uint8_t)((n->home_ch + 1 + k) % MC_N_CHANNELS);
-        bound_send(n, c, p, len, t_data_us(len));
-        ka_called(n, c);                          /* own call on c (4.1) */
-    }
-}
-
-static void tbl_push_fire(mimeshi_node *n, void *ud) {
-    (void)ud;
-    n->tbl_push_sched = 0;
-    if (!n->tbl_dirty) return;
-    n->tbl_dirty = 0;
-    chunk_send_all(n);                 /* mutation: the whole prefix, back to back (4.3) */
-}
-
 /* Reception of a table chunk (4.3). Self-contained: every entry is
  * processed on its own against the own map and link store. The owner
  * naming US in an entry is reverse-direction evidence for the link
@@ -1627,16 +1358,6 @@ static void tbl_push_fire(mimeshi_node *n, void *ud) {
 static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t len) {
     if (len < 10) return;
     uint16_t owner = rd16(pkt + 1);
-    if (pkt[0] & F_NEG) {                     /* negative delta (4.4): one entry gone */
-        if (len >= 19) {
-            uint16_t dead = rd16(pkt + 10);
-            mimeshi_link *l = lnk_find(n, owner, dead);
-            if (l) l->alive = 0;              /* the owner->dead link disappears here */
-            /* the map entry itself stays: a different source may still
-             * carry the node; its own age decides whether it expires */
-        }
-        return;
-    }
     uint8_t n_ent = pkt[4];
     mimeshi_mapnode *om = map_add(n, owner);
     if (om) {
@@ -1703,26 +1424,19 @@ static void nbr_expire(mimeshi_node *n);
 
 /* Death detection (4.4): every identifying reception refreshes
  * last_seen; per proof tick it ages. At T_expire (~4 h) the neighbour
- * is dead: the entry disappears from our table (no tombstone, 4.4),
- * which means it also disappears from every chunk and proof list we
- * send - silence propagates the removal. A negative delta (F_NEG)
- * announces the removal to the neighbours immediately: the routing
- * core adapts within minutes instead of waiting for the rounds. */
+ * is dead: the entry disappears from our table, and with it from our
+ * own star - silence plus the round propagates the removal (4.4:
+ * no tombstone, no negative delta). */
 static void nbr_expire(mimeshi_node *n) {
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
         mimeshi_neighbor *nb = &n->nbr[i];
         if (!nb->alive) continue;
         if (nb->last_seen < 0xFFFF) nb->last_seen++;
         if (nb->last_seen >= MC_T_EXPIRE_TICKS) {
-            uint16_t dead_id = nb->id;
             nb->alive = 0; nb->sym = 0; nb->ack_try = 0;
             nb->quality = 0; nb->rev_quality = 0; nb->proven_age_us = 0;
-            tbl_mark_dirty(n);              /* the prefix loses the entry (4.3) */
-            if (!n->star_round_on)
-                delta_neg_send(n, dead_id); /* negative delta: link gone (4.4);
-                                              under the star round the own star
-                                              simply changes - next round (4.5) */
-            printf("[core] node %u: neighbour %u expired after ~4 h of silence\n", n->id, dead_id);
+            tbl_mark_dirty(n);              /* the own star loses the link (4.3) */
+            printf("[core] node %u: neighbour %u expired after ~4 h of silence\n", n->id, nb->id);
         }
     }
 }
@@ -1739,24 +1453,6 @@ static void proof_tick(mimeshi_node *n, void *ud) {
         if (nbr_find(n, n->map[i].id)) continue;           /* prefix work */
         if (map_age_ticks(n, &n->map[i]) >= 2 * MC_T_ACTIVE_TICKS)
             map_evict(n, &n->map[i]);
-    }
-    /* Periodic prefix re-share (4.3): without traffic there are no
-     * mutations, and a chunk missed by a neighbour (collision, away
-     * from home) would then never return. Every MC_TBL_PERIOD_TICKS
-     * (~6 h) the prefix goes out again once -- every chunk thereby
-     * comes by at least a few times per day on average, at a fraction
-     * of the airtime of the old 10-min re-share. The per-node phase
-     * offset (id mod period) spreads the moments; the random jitter
-     * in the bundling window adds the fine spreading. */
-    if ((n->tick + (n->id % MC_TBL_PERIOD_TICKS)) % MC_TBL_PERIOD_TICKS == 0) {
-        if (n->star_round_on) {
-            /* star round (4.5): the uniform round replaces the periodic
-             * re-share and the tail cursor - catalogue and content carry
-             * both; no extra chunks on top of the round. */
-        } else {
-            tbl_mark_dirty(n);
-            tail_chunk_send(n);                /* tail: one chunk per re-share (4.3) */
-        }
     }
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++)          /* evidence ages per tick (4.2) */
         if (n->nbr[i].alive && n->nbr[i].proven_age_us < MC_T_SYM_US)
@@ -2414,4 +2110,11 @@ void mimeshi_start(mimeshi_node *n) {
     n->timer(n, n->hello_interval_us + hello_jitter(n), hello_tick, 0);
     /* proof tick: time base for keepalive + symmetry flush (4.1, 4.2) */
     n->timer(n, MC_KEEPALIVE_TICK_US, proof_tick, 0);
+    /* star round (4.3): the uniform convergence cadence - the first
+     * round after a random phase so simultaneous boots do not sync. */
+    n->star_own_ctr = 0;
+    n->star_tick = 0;
+    n->star_round_sched = 1;
+    n->timer(n, (n->rand(n) % MC_STAR_ROUND_TICKS) * MC_KEEPALIVE_TICK_US,
+             star_round_tick, 0);
 }

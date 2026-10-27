@@ -124,8 +124,6 @@ def star_round(mk, jitter):
     a = Node(radio, 0x0100)
     b = Node(radio, 0x0101)
     a.core = set_jitter(mk(a), jitter); b.core = set_jitter(mk(b), jitter)
-    a.core.star_round_enable()          # the A/B switch: star round on
-    b.core.star_round_enable()
     a.core.start()
     radio.schedule(500_000, b.core.start)
     radio.run(until_us=2 * 3600 * 1_000_000)      # 2 h: own-star guarantee x2
@@ -199,7 +197,6 @@ def star_line(mk, jitter):
     # the line has exactly N-1 bidirectional edges.
 
     for i, kn in enumerate(nodes):
-        kn.core.star_round_enable()          # the A/B switch: star round on
         radio.schedule(i * 250_000, kn.core.start)   # never start synchronously
     radio.run(until_us=duration_us)
 

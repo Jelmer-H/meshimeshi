@@ -151,7 +151,7 @@ int main(void) {
     printf("5. no duplicate: ok\n");
 
     /* 2. B's round carries the request in the missed area. */
-    mimeshi_star_round_enable(&B);
+    mimeshi_start(&B);                        /* starts the round timer (4.3) */
     pump_until(INTERVAL_US);                   /* B's first round fires */
     assert(cap_len[1] > 0);
     {
@@ -172,8 +172,8 @@ int main(void) {
     /* 3. A receives the request and re-queues the star; its next
      * round carries it as CONTENT. */
     deliver(1, &A);                            /* B's captured round -> A */
-    mimeshi_star_round_enable(&A);
-    pump_until(now + INTERVAL_US);             /* A's first round after enable */
+    mimeshi_start(&A);                         /* starts the round timer (4.3) */
+    pump_until(now + INTERVAL_US);             /* A's next round */
     assert(cap_len[0] > 0);
     {
         uint8_t *p = cap_pkt[0];

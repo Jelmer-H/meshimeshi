@@ -239,7 +239,7 @@ The solution is the **proof list**: a small packet with the node IDs of neighbou
 
 ### 4.3 Star rounds: table sharing as a uniform cadence
 
-**Status: decided in design (Oct 2026), replacing the chunk-push cadence of the old 4.3/4.4. The core implementation is complete and tested at unit level; the replacement is measured in simulation scenario 6 against the current main (two builds, fixed seeds) before it is merged. The old 4.3/4.4 text moves to section 15.**
+**Status: decided in design (Oct 2026), replacing the chunk-push cadance of the old 4.3/4.4. The core implementation is complete and tested at unit level; the old chunk-push path is fully removed from the code (delta chunks, bundling windows, periodic prefix re-share, tail cursor, F_NEG — the star round is the only cadence, started by `mimeshi_start`). The replacement is measured in simulation scenario 6 against the current main (two builds, fixed seeds) before it is merged. The old 4.3/4.4 text moves to section 15.**
 
 **The star (unit of sharing).** The star of node X is the unit of sharing: one node entry (node ID, quality class per direction, tick byte, geo — the 9 B entry layout that a chunk receiver already understands) plus every link that X owns, each 3 B (peer ID, class byte per direction), **sorted by peer ID**. Every link stands under exactly one endpoint, so every link travels inside exactly one star; the known graph is the union of all known stars. The sorted order makes the star a canonical byte sequence, independent of internal table order.
 

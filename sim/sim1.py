@@ -452,11 +452,9 @@ CNode._fields_ = [
     ("proof_wait", ctypes.c_uint8 * 3),  # flush countdown per channel (4.2)
     ("geo_lat", ctypes.c_uint16), ("geo_lon", ctypes.c_uint16),  # own geo grid (5)
     ("tick", ctypes.c_uint32),          # local time base in proof ticks (4.4)
-    ("chunk_nr", ctypes.c_uint8), ("dedup_seq", ctypes.c_uint16),
-    ("chunk_cursor", ctypes.c_uint8), ("tail_cursor", ctypes.c_uint8), ("tbl_dirty", ctypes.c_uint8),
-    ("tbl_push_sched", ctypes.c_uint8),
-    ("star_round_on", ctypes.c_uint8),        # star-round mode (4.5): the A/B switch
-    ("star_round_sched", ctypes.c_uint8),     # star-round timer running (4.5)
+    ("dedup_seq", ctypes.c_uint16),
+    ("tbl_dirty", ctypes.c_uint8),             # own-star content change pending (4.3)
+    ("star_round_sched", ctypes.c_uint8),     # star-round timer running (4.3)
     ("star_miss", CStarMiss * 12),           # missed list (4.5, MC_STAR_MISS_MAX)
     ("star_own_ctr", ctypes.c_uint8),         # rounds since the last own-star carry (4.5)
     ("star_tick", ctypes.c_uint8),            # own-star heartbeat tick (4.5)
@@ -510,7 +508,6 @@ def load_lib(path):
                                       ctypes.c_uint16, ctypes.c_uint16]
     lib.mimeshi_send_data.restype = ctypes.c_int
     lib.mimeshi_set_geo.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint16, ctypes.c_uint16]
-    lib.mimeshi_star_round_enable.argtypes = [ctypes.POINTER(CNode)]
     lib.mimeshi_star_serialize.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint16,
                                            ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint16,
                                            ctypes.c_void_p]
@@ -553,10 +550,6 @@ class CCore:
         self.lib.mimeshi_rx(ctypes.byref(self.mn), ch, rssi, buf, len(pkt))
     def set_geo(self, lat, lon):
         self.lib.mimeshi_set_geo(ctypes.byref(self.mn), lat, lon)
-    def star_round_enable(self):
-        """4.5 A/B switch: enable the uniform star round on this node
-        (before start()). Without it the 4.3 cadence runs."""
-        self.lib.mimeshi_star_round_enable(ctypes.byref(self.mn))
     def star_state(self, star_id):
         """(present, star_tick, age_ticks, effective_age) of a star in the
         map - the 4.5 liveness/age measurement probes."""

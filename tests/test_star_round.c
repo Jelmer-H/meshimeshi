@@ -117,9 +117,6 @@ int main(void) {
         mimeshi_rx(&B, 0, -60, p, len);
     }
 
-    /* the round is enabled ONLY on B (sender-side step): the other two
-     * nodes run the ordinary 4.3 cadence. */
-    mimeshi_star_round_enable(&B);
     mimeshi_start(&A); mimeshi_start(&B); mimeshi_start(&C);
 
     /* run two hours: 8 rounds expected (hard bound: no more). */
