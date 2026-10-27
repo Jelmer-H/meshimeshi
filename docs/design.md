@@ -330,7 +330,7 @@ The earlier formulation of this section ("digest without the age byte, so restin
 
 **Open points.**
 
-1. Interval length and its scaling: fixed 15 min for all nodes, or growing with the number of direct neighbours n (as the tail pause does today)? Sensitivity to measure on utrecht40: convergence time vs. interval vs. channel occupancy in a dense cluster.
+1. Interval length and its scaling: fixed 15 min for all nodes, or growing with the number of direct neighbours n (as the tail pause does today)? Sensitivity to measure on utrecht40: convergence time vs. interval vs. channel occupancy in a dense cluster. Content packing has no entry cap (Oct 2026): stars fill the chunk until they do not fit — the byte budget is the bound, and a backlog drains over subsequent rounds, bounded by the one-chunk-per-interval rule; the drain time of a dense hub's backlog is the parameter to measure in 6f.
 2. Cold-start backlog: a full ~30-chunk table takes ~7.5 h at one chunk per 15 min. Acceptable for map material? Does the queue order need an aging term (a long-waiting tail star overtakes a freshly mutated prefix star) to prevent tail starvation under sustained prefix churn?
 3. Digest width: 1 byte (3 B per catalogue entry) vs. 2 bytes (4 B, half the catalogue density). Starting value: 1 byte, collisions fall to fresh-beats-old.
 4. Heartbeat parameters: tick period (1 h starting value, tied to the guaranteed own-star round) vs. wrap horizon (256 ticks at 1 h ≈ 10.7 days; 2-4 h period stretches this); the tick-lag window k (starting value 8); and the receiver-side weighing rule for a lagging tick (when a far star counts as stale, versus the existing 2 x T_active map eviction of 4.4).

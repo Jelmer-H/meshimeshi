@@ -723,9 +723,18 @@ static uint8_t star_round_send(mimeshi_node *n) {
      * does NOT re-send it - the catalogue entry below is the cheap
      * confirmation. star_fwd_tick uses the same 16-bit time base as
      * arrived_tick, so wrap arithmetic is exact and no heuristic
-     * guard is needed. */
-    for (int pass = 0; pass < 2 && carried < MC_CHUNK_MAX_ENTRIES; pass++) {
-        for (int i = 0; i < MC_MAP_NODES && carried < MC_CHUNK_MAX_ENTRIES; i++) {
+     * guard is needed.
+     *
+     * No entry cap: stars pack until they do not fit the chunk - the
+     * byte budget of the packet is the bound (4.5), not an entry
+     * count inherited from the 4.3 chunk format. Thin stars pack many
+     * per round (fast convergence where the air allows it), thick
+     * stars few. What was carried is remembered per star
+     * (star_fwd_tick + star_fwd_hash), so the next round simply
+     * continues with what did not fit: a backlog drains over rounds,
+     * bounded by the hard one-chunk-per-interval rule. */
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < MC_MAP_NODES; i++) {
             mimeshi_mapnode *m = &n->map[i];
             if (!m->alive || m->id == n->id) continue;
             int is_prefix = nbr_find(n, m->id) != 0;
