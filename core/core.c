@@ -993,6 +993,26 @@ static uint8_t star_round_send(mimeshi_node *n) {
             }
         }
     }
+    /* Catalogue prioritisation (4.3, from the scenario-6 rest
+     * measurement: the resting round carried ~40 triples of which most
+     * confirmed knowledge that was fresh anyway). The limited space
+     * goes to what is actually needed first; untriggered stars ride
+     * only in the leftover space, in the old prefix-then-map order.
+     * The selection re-runs every round: an entry that was skipped
+     * keeps aging locally and enters a trigger band by itself, so
+     * nothing is ever silently dropped.
+     *
+     * Trigger bands (checked per star, highest first):
+     *  1. heartbeat due - the confirmation is older than one
+     *     rotation cycle (3 intervals): the receiver's derivable
+     *     match must keep arriving or the k-window drifts toward
+     *     miss-requests; liveness detection depends on this.
+     *  2. staleness - the effective age is above a third of the
+     *     map-eviction bound: the age maintenance has to confirm it
+     *     before the 24 h eviction (or route de-weighting) bites.
+     *  3. fresh arrival - recently received as content, likely not
+     *     yet confirmed by the neighbours' derivable matches: one
+     *     catalogue triple settles the whole neighbourhood. */
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < MC_MAP_NODES && len + 3 <= 230; i++) {
             mimeshi_mapnode *m = &n->map[i];
@@ -1008,7 +1028,7 @@ static uint8_t star_round_send(mimeshi_node *n) {
              * as the low bits of arrived_tick are local - the tick
              * itself rides in the age byte of the star content, which
              * the digest derivation adds. Use the star's own age byte:
-             * the serialised age IS the tick (4.5). */
+             * the serialised age IS the tick (4.3). */
             uint8_t tick = sbuf[3];
             wr16(p + len, m->id);
             p[len + 2] = mimeshi_star_digest(h, tick);
