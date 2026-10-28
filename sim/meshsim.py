@@ -760,6 +760,125 @@ def traffic(mk, jitter):
         f"top 5 {[f'{u/1e6:.1f}' for u in top]} s, "
         f"above limit: {sum(1 for u in usage.values() if u > 360_000_000)}")
 
+@scenario("star-quiet", "scenario 6e (4.3): quiet-hour acceleration - a backlog "
+                          "drains at up to 3x speed in quiet hours, day/night profile")
+def star_quiet(mk, jitter):
+    """Design 4.3 scenario 6e. Day/night traffic profile on utrecht40:
+      - day (traffic on): a unicast every --interval s keeps the
+        channels busy - the acceleration gate must stay closed;
+      - night (quiet): no unicast; just before the night starts, a
+        wave of geo mutations (--rate x a burst factor) creates a
+        real content backlog;
+      - the measurement: how much of the backlog drains during the
+        quiet hours, at which round rate (the rounds per hour per
+        node - the acceleration shows as up to 3 rounds/h instead of
+        4/h... at 15-min interval 4/h, at the 5-min floor 12/h), and
+        the airtime: quiet-hour convergence must stay bounded (the
+        duty share criterion).
+    The star_stats rounds counter gives the round rate; the
+    convergence measure is the time until all nodes see the mutated
+    stars' new form (tick advanced, hash changed, map fresh)."""
+    nodes_list = load_nodes_csv(_ARGS.nodes)
+    duration_h = _ARGS.duration if getattr(_ARGS, 'duration', None) else 12
+    duration_us = duration_h * 3_600_000_000
+    interval_us = _ARGS.interval * 1_000_000
+    radio = Radio()
+    radio.wire.open = False
+    lat0 = sum(n['lat'] for n in nodes_list) / len(nodes_list)
+    lon0 = sum(n['lon'] for n in nodes_list) / len(nodes_list)
+    pos = {n['id']: (*project(n['lat'], n['lon'], lat0, lon0), n['h']) for n in nodes_list}
+    nodes = []
+    for i, nd in enumerate(nodes_list):
+        kn = Node(radio, nd['id'])
+        kn.core = set_jitter(mk(kn), jitter)
+        kn.core.set_geo(*grid_geo(nd['lat'], nd['lon']))
+        nodes.append(kn)
+        radio.schedule(i * 250_000, kn.core.start)
+    ids = [n['id'] for n in nodes_list]
+    for a in ids:
+        for b in ids:
+            if a == b: continue
+            raw = linkbudget(pos[a], pos[b])
+            if raw is None: continue
+            fade = ((a * 31 + b * 17) % 11) - 5
+            r = raw + fade
+            if r >= RX_MIN_DBM:
+                radio.wire.links[(a, b)] = max(-128, min(120, round(r)))
+    # day = first half (unicast on), night = second half (quiet)
+    night_start_us = duration_us // 2
+    out(f"{len(nodes_list)} nodes, {duration_h} h: day 0-{duration_h//2} h "
+        f"(unicast every {_ARGS.interval} s), night {duration_h//2}-{duration_h} h (quiet)")
+
+    # day traffic
+    node_geo = {n['id']: grid_geo(n['lat'], n['lon']) for n in nodes_list}
+    rng = random.Random(2026)
+    payload = b'x' * 20
+    attempted = [0]
+    def gen():
+        if radio.now < night_start_us:
+            kn = rng.choice(nodes)
+            dst = rng.choice(ids)
+            if dst != kn.id and kn.core.send_data(dst, payload, ack3=False,
+                                                  geo=node_geo[dst]) == 0:
+                attempted[0] += 1
+            radio.schedule(interval_us, gen)
+    radio.schedule(interval_us, gen)
+
+    # the backlog wave: just before the night, move a third of the nodes
+    n_mut = max(1, len(nodes) // 3)
+    mut_ids = rng.sample([kn.id for kn in nodes], n_mut)
+    t_wave = night_start_us - 10 * 60_000_000   # 10 min before the night
+    def wave():
+        for nid in mut_ids:
+            for kn in nodes:
+                if kn.id == nid:
+                    kn.core.set_geo((kn.core.mn.geo_lat + 37) % 65536,
+                                    (kn.core.mn.geo_lon + 41) % 65536)
+        out(f"[wave] t={radio.now/3.6e9:.2f} h: {n_mut} nodes moved "
+            f"(content backlog created)")
+    radio.schedule(t_wave, wave)
+
+    # convergence probe: a mutated star is CONVERGED at an observer
+    # when the observer's map entry carries the post-wave geo (the
+    # mutation IS a geo move - the sharpest possible criterion)
+    post_geo = {}     # nid -> (lat, lon) after the wave
+    def probe():
+        conv = 0; total = 0
+        for nid in mut_ids:
+            gl, go = post_geo[nid]
+            for kn in nodes:
+                if kn.id == nid: continue
+                m = next((m for m in kn.core.mn.map if m.alive and m.id == nid), None)
+                if m is None: continue
+                total += 1
+                if m.geo_lat == gl and m.geo_lon == go:
+                    conv += 1
+        out(f"[probe t={radio.now/3.6e9:.2f} h] post-wave geo visible: "
+            f"{conv}/{total} ({100*conv/max(total,1):.1f}%)")
+        if radio.now + 30*60_000_000 < duration_us:
+            radio.schedule(30 * 60_000_000, probe)
+    # capture the post-wave geos right after the wave fires
+    def wave_probe():
+        for nid in mut_ids:
+            for kn in nodes:
+                if kn.id == nid:
+                    post_geo[nid] = (kn.core.mn.geo_lat, kn.core.mn.geo_lon)
+        probe()
+    radio.schedule(night_start_us, wave_probe)
+
+    radio.run(until_us=duration_us)
+    out(f"\n=== Quiet-hour scenario 6e ({duration_h} h) ===")
+    out(f"day unicast attempts: {attempted[0]}")
+    st = radio.star_stats.summary()
+    out(f"rounds total: {st['rounds']}, per node/h: "
+        f"{st['rounds']/len(nodes)/duration_h:.1f}")
+    usage = {(kn.id, c): radio.duty.usage(kn.id, c, radio.now)
+             for kn in nodes for c in range(N_CH)}
+    top = sorted(usage.values(), reverse=True)[:5]
+    out(f"duty (sliding hour, limit 360 s): max {top[0]/1e6:.1f} s, "
+        f"above limit: {sum(1 for u in usage.values() if u > 360_000_000)}")
+    star_report(radio)
+
 @scenario("star-churn", "scenario 6d (4.3/4.4): churn - geo mutations, nodes "
                            "joining and leaving, reboot/reincarnation, delivery under churn")
 def star_churn(mk, jitter):

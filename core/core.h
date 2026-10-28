@@ -241,6 +241,11 @@ struct mimeshi_node {
     uint16_t dedup_seq;               /* FIFO insertion counter of the dedup cache (14) */
     uint8_t  tbl_dirty;               /* own-star content change pending (4.3) */
     uint8_t  star_round_sched;        /* star-round timer running (4.3) */
+    uint8_t  star_backlog;           /* 6e: content work remained after the last
+                                        round (stars queued or not fully carried) -
+                                        the quiet-hour acceleration halves the
+                                        interval while this is set and the
+                                        channels are quiet; cleared at rest */
     uint8_t  star_rot_ctr;           /* rotation counter (4.3): the round
                                         transmits on channel
                                         (home + ctr) mod 3 at rest, and

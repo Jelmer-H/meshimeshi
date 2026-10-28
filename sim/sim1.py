@@ -459,6 +459,7 @@ CNode._fields_ = [
     ("dedup_seq", ctypes.c_uint16),
     ("tbl_dirty", ctypes.c_uint8),             # own-star content change pending (4.3)
     ("star_round_sched", ctypes.c_uint8),     # star-round timer running (4.3)
+    ("star_backlog", ctypes.c_uint8),         # content work remained (6e acceleration)
     ("star_rot_ctr", ctypes.c_uint8),         # rotation counter (4.3)
     ("star_miss", CStarMiss * 12),           # missed list (4.3, MC_STAR_MISS_MAX)
     ("star_own_ctr", ctypes.c_uint8),         # home rounds since the last own-star carry (4.3)

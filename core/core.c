@@ -753,6 +753,13 @@ uint8_t mimeshi_star_digest(uint8_t content_hash, uint8_t tick) {
  * star travels in full at least once per hour regardless of its
  * queue position (4.5): the guaranteed own-star round. */
 #define MC_STAR_ROUND_TICKS   16u    /* 15 min interval in proof ticks */
+#define MC_STAR_FLOOR_TICKS    5u     /* quiet-hour floor: 5 min (6e) - the interval
+                                       may shorten to this when there is work and
+                                       the channels are quiet */
+#define MC_STAR_QUIET_TICKS    4u     /* a channel is quiet for the acceleration
+                                       gate when its ka_idle counter stands at
+                                       4+ proof ticks (~4 min without any own
+                                       identifying reception, 6e) */
 #define MC_STAR_ROUNDS_PER_H  4u     /* 60 min / 15 min: own-star bound */
 #define MC_STAR_CAT_RESERVE   30u     /* catalogue bytes reserved per round (4.5):
                                         content may fill the chunk, but the last
@@ -1113,6 +1120,9 @@ static uint8_t star_round_send(mimeshi_node *n) {
             if (m->star_fwd_tick == n->tick) m->star_fwd_bits |= mask;
         }
         n->star_rot_ctr++;
+        /* 6e: work remained when packed stars still await channels or the
+         * queue did not fit - the quiet-hour acceleration reads this */
+        n->star_backlog = (uint8_t)(queued_left > 0 || carried >= 8);
     }
     return carried;
 }
@@ -1332,14 +1342,31 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
 }
 
 /* Round timer (4.3): per-node phase offset; the interval is the hard
- * bound - one chunk per node per interval. */
+ * bound - one chunk per node per interval.
+ *
+ * Quiet-hour acceleration (6e): when the last round left content work
+ * (star_backlog) AND every channel has been quiet for MC_STAR_QUIET_TICKS
+ * (no identifying reception - the ka_idle counters carry the CAD-free
+ * occupancy measure), the next interval halves, down to the 5-min floor.
+ * The convergence of a residual backlog then runs at up to 3x speed in
+ * quiet periods without spending any airtime in busy ones: at occupancy
+ * the full interval stands, and the acceleration self-clears at rest
+ * (no backlog, no shortening). The hard bound is untouched - the round
+ * still sends at most one chunk, just sooner. */
 static void star_round_tick(mimeshi_node *n, void *ud) {
     (void)ud;
     n->star_round_sched = 0;
     if (n->tbl_dirty) { n->tbl_dirty = 0; }       /* the round carries mutations (4.3) */
     star_round_send(n);
     n->star_round_sched = 1;
-    n->timer(n, MC_STAR_ROUND_TICKS * MC_KEEPALIVE_TICK_US
+    uint32_t iv = MC_STAR_ROUND_TICKS;
+    if (n->star_backlog) {
+        uint8_t quiet = 1;
+        for (uint8_t c = 0; c < MC_N_CHANNELS; c++)
+            if (n->ka_idle[c] < MC_STAR_QUIET_TICKS) { quiet = 0; break; }
+        if (quiet && iv / 2 >= MC_STAR_FLOOR_TICKS) iv /= 2;
+    }
+    n->timer(n, iv * MC_KEEPALIVE_TICK_US
              + (n->rand(n) % MC_KEEPALIVE_TICK_US), star_round_tick, 0);
 }
 
