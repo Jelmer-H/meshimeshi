@@ -294,7 +294,7 @@ The solution is the **proof list**: a small packet with the node IDs of neighbou
 
 ### 4.4 Ageing and death
 
-**Status: decided in design (Oct 2026), replacing the old 4.4. Implementation partially done (local ageing, last_seen); the tick-liveness axis below is the piece that replaces travelled age on air and remote blind ageing.**
+**Status: decided in design (Oct 2026), replacing the old 4.4. Fully implemented and measured (scenario 6c, Oct 2026): local ageing, last_seen for direct neighbours, and the tick-liveness axis below (star_tick_seen, de-weight at half the threshold, eviction at ~6 h of tick stall). Measured utrecht40 48 h with one node silenced at t=24 h: the tick stalls everywhere at the silencing moment, the de-weight starts at ~4.8 h, and the dead origin's star is gone from ALL 39 nodes by ~6 h after silence (0/39 present at t=30 h) - versus the old 4.4 arm which kept the dead node in 37/39 maps after 24 h of silence, and the pre-liveness star arm which showed it falsely fresh (eff age ~2 ticks) forever through echo matches. Freshness and liveness are now truly independent axes.**
 
 **The principle: age is local, confirmation resets it.** Under the star round, no age travels on air (the tick byte is liveness, not age). Freshness is purely local: every confirmation — content received, or a derivable catalogue match — sets `arrived_tick = now`. Effective age = `tick − arrived_tick`, in proof ticks (~56 s). This is cleaner than the old sum of travelled age plus local ticks (one clock, not two), and it removes any dependence on senders counting honestly.
 
@@ -304,7 +304,7 @@ The solution is the **proof list**: a small packet with the node IDs of neighbou
 
 2. **Eviction axis (memory, hard).** A map entry (foreign star) whose effective age reaches ~24 h (2 × T_active, the existing bound) is evicted; the pool recycles least-fresh-first, as now. Direct neighbours are never evicted — they live in the neighbor table.
 
-3. **Liveness axis (new: remote death detection).** A dead origin stops ticking, but its last star keeps circulating: forwarders advertise it in their catalogues with the old tick, every receiver matches derivably (k small) and resets the age. Without an extra rule a dead origin would look fresh forever. Therefore: per map entry, `star_tick_seen` (16-bit local tick of when the entry's tick last advanced). A star whose tick has not advanced for N tick periods (starting value: 6 hours) is treated as "origin or chain dead": first de-weighted in routing (same multiplier as old age), then evicted — regardless of how fresh its age looks through echoes. Freshness and liveness are independent axes: confirmation is trust, tick advance is life.
+3. **Liveness axis (implemented, measured Oct 2026: remote death detection).** A dead origin stops ticking, but its last star keeps circulating: forwarders advertise it in their catalogues with the old tick, every receiver matches derivably (k small) and resets the age. Without an extra rule a dead origin would look fresh forever. Therefore: per map entry, `star_tick_seen` (16-bit local tick of when the entry's tick last advanced). A star whose tick has not advanced for N tick periods (starting value: 6 hours) is treated as "origin or chain dead": first de-weighted in routing (same multiplier as old age), then evicted — regardless of how fresh its age looks through echoes. Freshness and liveness are independent axes: confirmation is trust, tick advance is life.
 
 **Death detection per object.**
 

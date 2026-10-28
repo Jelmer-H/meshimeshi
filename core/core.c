@@ -424,6 +424,10 @@ static mimeshi_mapnode *map_add(mimeshi_node *n, uint16_t id) {
     for (int i = 0; i < MC_MAP_NODES; i++)
         if (!n->map[i].alive) {
             n->map[i].alive = 1; n->map[i].id = id;
+            n->map[i].star_tick_seen = n->tick;   /* liveness starts now (4.4):
+                                                     no tick known yet, the first
+                                                     advance (or the threshold)
+                                                     decides from here */
             n->map[i].geo_lat = 0; n->map[i].geo_lon = 0;
             n->map[i].quality = 0; n->map[i].age_ticks = 255;
             n->map[i].arrived_tick = n->tick;
@@ -1139,7 +1143,11 @@ static uint8_t star_round_send(mimeshi_node *n) {
  * our canonical serialisation (age excluded) plus the tick we last
  * saw riding in the star's age byte - stored per map entry.
  */
-#define MC_STAR_K_MAX 8u        /* tick-lag window (4.5, starting value) */
+#define MC_STAR_K_MAX 8u        /* tick-lag window (4.3, starting value) */
+#define MC_STAR_DEAD_TICKS 385u  /* liveness threshold (4.4): a star whose origin
+                                   tick has not advanced for ~6 h of proof ticks
+                                   is dead - de-weighted at half, evicted at the
+                                   threshold, whatever the forwarded copies say */
 
 static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
                           uint16_t len, int star_mode);
@@ -1219,6 +1227,8 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
                     int16_t d = (int16_t)((int16_t)em->star_tick - (int16_t)pkt[off + 3]);
                     if (!(em->adv_q
                           && (d > (int16_t)MC_STAR_K_MAX || d < -(int16_t)MC_STAR_K_MAX))) {
+                        if ((int16_t)pkt[off + 3] != (int16_t)em->star_tick)
+                            em->star_tick_seen = n->tick;   /* liveness: the origin tick advanced (4.4) */
                         em->star_tick = pkt[off + 3];  /* the tick as it traveled (4.3) */
                         em->age_ticks = 0;              /* arrived NOW: travelled age starts here */
                         em->arrived_tick = n->tick;
@@ -1276,8 +1286,10 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
              * advertisement (k > 16: a slower route) confirms the same
              * content: only the age refreshes, the newer stored tick
              * stands (the origin has already reached it). */
-            if (k > 0 && k <= (int)MC_STAR_K_MAX)
+            if (k > 0 && k <= (int)MC_STAR_K_MAX) {
                 m->star_tick = (uint8_t)(our_tick + (uint8_t)k);
+                m->star_tick_seen = n->tick;   /* liveness: the origin tick advanced (4.4) */
+            }
             m->age_ticks = 0;                   /* travelled age restarts (4.4) */
             m->arrived_tick = n->tick;          /* fresh as of NOW (4.4) */
             star_miss_clear(n, sid);
@@ -1381,6 +1393,16 @@ static uint16_t route_age_mult(uint32_t age) {
     return 0;
 }
 
+/* Liveness de-weight (4.4): a star whose origin tick has stalled for
+ * more than half the liveness threshold costs like a half-stale entry
+ * - the routes move away from possibly-dead knowledge before the
+ * eviction takes it out entirely. */
+static uint16_t route_live_mult(mimeshi_node *n, mimeshi_mapnode *m) {
+    if (m->id == n->id) return 0;               /* the own star is alive by definition */
+    if (n->tick - m->star_tick_seen < MC_STAR_DEAD_TICKS / 2) return 0;
+    return 2;
+}
+
 static uint32_t mult_apply(uint32_t c, uint16_t m) {
     if (m == 3) return c * 3;
     if (m == 2) return c * 3 / 2;
@@ -1395,7 +1417,11 @@ static uint32_t route_edge_own(mimeshi_node *n, mimeshi_neighbor *nb) {
     uint8_t cls = adv_class_of(nb->quality);
     uint32_t c = (cls < 8 && mc_etx_class[cls]) ? mc_etx_class[cls] : MC_ROUTE_SCALE;
     mimeshi_mapnode *m = map_find(n, nb->id);
-    if (m) c = mult_apply(c, route_age_mult(map_age_ticks(n, m)));
+    if (m) {
+        c = mult_apply(c, route_age_mult(map_age_ticks(n, m)));
+        {   uint16_t lm = route_live_mult(n, m);
+            if (lm) c = mult_apply(c, lm); }
+    }
     return c;
 }
 
@@ -1460,6 +1486,9 @@ static uint16_t route_next_hop_ex(mimeshi_node *n, uint16_t dst,
         if (u < 0 || u == di) break;              /* nothing left, or target settled */
         r_done[u] = 1;
         uint16_t mult_u = route_age_mult(map_age_ticks(n, &n->map[u]));
+    {   uint16_t lm = route_live_mult(n, &n->map[u]);
+        if (lm) mult_u = (uint16_t)(mult_u ? (mult_u * lm) / 2 * 2 : lm); }
+
         for (int j = 0; j < MC_MAX_LINKS; j++) {           /* relax the edges of map[u] */
             mimeshi_link *l = &n->lnk[j];
             if (!l->alive) continue;
@@ -1474,6 +1503,8 @@ static uint16_t route_next_hop_ex(mimeshi_node *n, uint16_t dst,
             int oi = r_idx(n, o);
             if (oi < 0 || r_done[oi]) continue;
             c = mult_apply(c, route_age_mult(map_age_ticks(n, &n->map[oi])));
+            {   uint16_t lm = route_live_mult(n, &n->map[oi]);
+                if (lm) c = mult_apply(c, lm); }
             if (r_dist[u] + c < r_dist[oi]) { r_dist[oi] = r_dist[u] + c; r_prev[oi] = (uint16_t)u; }
         }
     }
@@ -1737,7 +1768,18 @@ static void proof_tick(mimeshi_node *n, void *ud) {
      * cadence and only takes pool space from fresher knowledge. */
     for (int i = 0; i < MC_MAP_NODES; i++) {
         if (!n->map[i].alive) continue;
+        if (n->map[i].id == n->id) continue;   /* the own entry: alive by definition */
         if (nbr_find(n, n->map[i].id)) continue;           /* prefix work */
+        /* liveness axis (4.4): a star whose origin tick has not advanced
+         * for the threshold is dead, whatever the freshness of the
+         * forwarded copies - the echo cannot fake a tick. Direct
+         * neighbours live in the neighbor table (last_seen, 4.4). */
+        if (n->tick - n->map[i].star_tick_seen >= MC_STAR_DEAD_TICKS) {
+            printf("[core] node %u: star %u dead (tick stalled %lu ticks)\n",
+                   n->id, n->map[i].id, (unsigned long)(n->tick - n->map[i].star_tick_seen));
+            map_evict(n, &n->map[i]);
+            continue;
+        }
         if (map_age_ticks(n, &n->map[i]) >= 2 * MC_T_ACTIVE_TICKS)
             map_evict(n, &n->map[i]);
     }

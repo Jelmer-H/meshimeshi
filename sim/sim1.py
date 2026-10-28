@@ -423,7 +423,8 @@ class CMapNode(ctypes.Structure):
                 ("star_fwd_hash", ctypes.c_uint8),  # content hash as last carried (4.3)
                 ("star_fwd_bits", ctypes.c_uint8),  # carried-on-channel bits (4.3 rotation)
                 ("star_miss_ctr", ctypes.c_uint8),  # missed-list damping (4.3)
-                ("star_wanted", ctypes.c_uint16)]   # tick of the last explicit ask (4.3)
+                ("star_wanted", ctypes.c_uint16),    # tick of the last explicit ask (4.3)
+                ("star_tick_seen", ctypes.c_uint16)]  # local tick of the last origin-tick advance (4.4 liveness)
 
 class CLink(ctypes.Structure):
     _fields_ = [("a", ctypes.c_uint16), ("b", ctypes.c_uint16),

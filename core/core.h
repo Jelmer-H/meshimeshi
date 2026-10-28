@@ -150,6 +150,17 @@ typedef struct {
                                 pruning for a few intervals (the missed
                                 list is the net for what the gradient
                                 check gets wrong) */
+    uint16_t star_tick_seen; /* liveness axis (4.4): local tick when this
+                                star's origin heartbeat tick last ADVANCED
+                                - content or a derivable match. Freshness
+                                and liveness are independent: an echo keeps
+                                the age fresh but cannot advance the tick;
+                                a star whose tick stalls for
+                                MC_STAR_DEAD_TICKS is first de-weighted in
+                                routing (the age multiplier), then evicted
+                                - a dead origin's star disappears everywhere
+                                within the threshold, whatever the forwarded
+                                copies claim */
 } mimeshi_mapnode;
 
 /* A link between two map nodes with the advertised quality class (3
