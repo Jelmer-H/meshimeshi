@@ -760,6 +760,122 @@ def traffic(mk, jitter):
         f"top 5 {[f'{u/1e6:.1f}' for u in top]} s, "
         f"above limit: {sum(1 for u in usage.values() if u > 360_000_000)}")
 
+@scenario("star-dense", "scenario 6f (4.3): dense-cluster stress - 64 fully meshed "
+                          "nodes on one home channel, the shared-channel bound")
+def star_dense(mk, jitter):
+    """Design 4.3 scenario 6f. The per-node hard bound (one chunk per
+    interval) is NOT a per-channel bound: a dense single-channel
+    cluster measures the AGGREGATE channel occupancy. 64 nodes, all
+    mutually in range (a fully meshed tower cluster), all at home on
+    the same channel (ids chosen so id mod 3 is equal), so:
+      - every round of every node lands on the same channel;
+      - every receiver processes 63 neighbours' stars + catalogues;
+      - the stars are thick (each node owns ~half of its 63 links).
+    Measures: aggregate occupancy per channel against the 10% duty
+    budget, convergence of a mutation wave at this density, the
+    map/link/miss bookkeeping at 64x the per-node information, ghost
+    integrity, hard bound. If the budget breaks, open point 1
+    (interval scaling with density) gets its measurement here."""
+    N = _ARGS.nodes_n if hasattr(_ARGS, 'nodes_n') and _ARGS.nodes_n else 64
+    duration_h = _ARGS.duration if getattr(_ARGS, 'duration', None) else 12
+    duration_us = duration_h * 3_600_000_000
+    radio = Radio()
+    radio.wire.open = False
+    # one cluster: everyone within ~2 km of a centre, 30 m masts - all
+    # pairs audible; ids all with the same home channel (mod 3 == 0)
+    lat0, lon0 = 52.09, 5.07
+    nodes = []
+    ids = []
+    for i in range(N):
+        nid = 0x0300 + 3*i          # id mod 3 == 0 for all: one home channel
+        ids.append(nid)
+    pos = {}
+    import math as _math
+    for i, nid in enumerate(ids):
+        ang = 2 * _math.pi * i / N
+        r = 400 + (i % 7) * 100     # 400-1000 m ring
+        lat = lat0 + r * _math.cos(ang) / 111000
+        lon = lon0 + r * _math.sin(ang) / (111000 * _math.cos(_math.radians(lat0)))
+        pos[nid] = (r * _math.cos(ang), r * _math.sin(ang), 30.0)
+    for i, nid in enumerate(ids):
+        kn = Node(radio, nid)
+        kn.core = set_jitter(mk(kn), jitter)
+        gl, go = grid_geo(lat0 + pos[nid][1] / 111000,
+                          lon0 + pos[nid][0] / (111000 * _math.cos(_math.radians(lat0))))
+        kn.core.set_geo(gl, go)
+        nodes.append(kn)
+        radio.schedule(i * 250_000, kn.core.start)
+    for a in ids:
+        for b in ids:
+            if a == b: continue
+            raw = linkbudget(pos[a], pos[b])
+            if raw is None: continue
+            fade = ((a * 31 + b * 17) % 11) - 5
+            r = raw + fade
+            if r >= RX_MIN_DBM:
+                radio.wire.links[(a, b)] = max(-128, min(120, round(r)))
+    deg = {i: 0 for i in ids}
+    for (a, b) in radio.wire.links:
+        deg[a] += 1
+    out(f"{N} nodes, fully meshed cluster, all home on channel {ids[0] % 3}, "
+        f"duration {duration_h} h")
+    out(f"topology: {len(radio.wire.links)} directed links, "
+        f"degree min {min(deg.values())}, max {max(deg.values())}")
+
+    # a mutation wave at half time: a quarter of the nodes moves
+    rng = random.Random(2026)
+    mut_ids = rng.sample(ids, max(1, N // 4))
+    post_geo = {}
+    def wave():
+        for nid in mut_ids:
+            for kn in nodes:
+                if kn.id == nid:
+                    kn.core.set_geo((kn.core.mn.geo_lat + 37) % 65536,
+                                    (kn.core.mn.geo_lon + 41) % 65536)
+        for nid in mut_ids:
+            for kn in nodes:
+                if kn.id == nid:
+                    post_geo[nid] = (kn.core.mn.geo_lat, kn.core.mn.geo_lon)
+        out(f"[wave] t={radio.now/3.6e9:.2f} h: {len(mut_ids)} nodes moved")
+        radio.schedule(30 * 60_000_000, probe)
+    def probe():
+        conv = 0; total = 0
+        for nid in mut_ids:
+            gl, go = post_geo[nid]
+            for kn in nodes:
+                if kn.id == nid: continue
+                m = next((m for m in kn.core.mn.map if m.alive and m.id == nid), None)
+                if m is None: continue
+                total += 1
+                if m.geo_lat == gl and m.geo_lon == go:
+                    conv += 1
+        out(f"[probe t={radio.now/3.6e9:.2f} h] post-wave geo visible: "
+            f"{conv}/{total} ({100*conv/max(total,1):.1f}%)")
+        if radio.now + 30*60_000_000 < duration_us:
+            radio.schedule(30 * 60_000_000, probe)
+    radio.schedule(duration_us // 2, wave)
+
+    radio.run(until_us=duration_us)
+    out(f"\n=== Dense-cluster scenario 6f ({N} nodes, {duration_h} h) ===")
+    st = radio.star_stats.summary()
+    out(f"rounds: {st['rounds']}, per node/h: {st['rounds']/N/duration_h:.1f}")
+    for c in range(N_CH):
+        frac = radio.airtime[c] / duration_us * 100 if duration_us else 0
+        out(f"channel {c}: airtime {radio.airtime[c]/1e6:.1f} s = {frac:.2f}% of the run")
+    usage = {(kn.id, c): radio.duty.usage(kn.id, c, radio.now)
+             for kn in nodes for c in range(N_CH)}
+    top = sorted(usage.values(), reverse=True)[:5]
+    out(f"duty (sliding hour, limit 360 s): max {top[0]/1e6:.1f} s, "
+        f"above limit: {sum(1 for u in usage.values() if u > 360_000_000)}")
+    # map and link load + ghost integrity
+    maps = [kn.core.map_size() for kn in nodes]
+    links = [kn.core.link_count() for kn in nodes]
+    ghosts = sum(1 for kn in nodes for m in kn.core.mn.map
+                 if m.alive and m.id not in set(ids))
+    out(f"map: avg {sum(maps)/len(maps):.1f} (min {min(maps)}, max {max(maps)}), "
+        f"links avg {sum(links)/len(links):.1f}, ghost entries: {ghosts}")
+    star_report(radio)
+
 @scenario("star-quiet", "scenario 6e (4.3): quiet-hour acceleration - a backlog "
                           "drains at up to 3x speed in quiet hours, day/night profile")
 def star_quiet(mk, jitter):
@@ -1232,6 +1348,8 @@ def main():
                     help='unicast payload size in bytes (traffic/newcomer-traffic, default 20)')
     ap.add_argument('--warmup', type=int, default=24, metavar='HOURS',
                     help='convergence warmup before the load phase (load, default 24)')
+    ap.add_argument('--nodes-n', type=int, default=64, metavar='COUNT',
+                    help="scenario 6f: the dense-cluster size (default 64)")
     ap.add_argument('--churn', type=float, default=0.0, metavar='PCT_DAY',
                     help="scenario 6d: percent of the nodes per day that leave and later return")
     ap.add_argument('--interval', type=int, default=10, metavar='SECONDS',
