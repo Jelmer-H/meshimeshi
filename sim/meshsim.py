@@ -1124,7 +1124,7 @@ def star_scale(mk, jitter):
     out(f"map pool: avg {sum(pools)/len(pools):.1f}/256, p50 {pools[len(pools)//2]}, "
         f"max {pools[-1]}, at the 256 cap: {at_cap}/{len(nodes)}")
     out(f"refused (destination not in the graph yet / no slot): {refused[0]} "
-        f"({100*refused[0]/max(att+refused[0],1):.1f}% of offers)")
+        f"({100*refused[0]/max(ai+ao+refused[0],1):.1f}% of offers)")
     # LOCAL occupancy: the channel is shared per receiver (a packet
     # occupies only where it is audible) - the global counter reads as
     # if the whole world shared one cell. Report per-node local busy
