@@ -486,6 +486,8 @@ CNode._fields_ = [
     ("star_round_sched", ctypes.c_uint8),     # star-round timer running (4.3)
     ("star_backlog", ctypes.c_uint8),         # content work remained (6e acceleration)
     ("star_rot_ctr", ctypes.c_uint8),         # rotation counter (4.3)
+    ("ev_taboo", ctypes.c_uint16 * 256),      # eviction taboo (4.3): judged-and-rejected set
+    ("ev_taboo_idx", ctypes.c_uint8),         # taboo ring write position
     ("star_miss", CStarMiss * 12),           # missed list (4.3, MC_STAR_MISS_MAX)
     ("star_own_ctr", ctypes.c_uint8),         # home rounds since the last own-star carry (4.3)
     ("star_tick", ctypes.c_uint8),            # own-star heartbeat tick (4.3)
