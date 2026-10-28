@@ -121,7 +121,7 @@ static uint16_t chunk_build(uint8_t *ck, uint16_t owner,
                             uint16_t e2, uint8_t cls2, uint8_t age2,
                             uint8_t link_cls) {
     (void)e1; (void)e2; (void)cls2; (void)age2;
-    uint16_t peers[1]; uint8_t lcls[1]; uint8_t nlinks = 0;
+    uint16_t peers[1] = {0}; uint8_t lcls[1] = {0}; uint8_t nlinks = 0;
     if (link_cls && t_owner(owner, e2) == owner) {
         peers[0] = e2;
         lcls[0] = (uint8_t)((link_cls << 4) | link_cls);
