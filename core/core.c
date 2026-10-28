@@ -418,6 +418,80 @@ static mimeshi_mapnode *map_find(mimeshi_node *n, uint16_t id) {
     return 0;
 }
 
+static int r_idx(mimeshi_node *n, uint16_t id);
+static uint32_t geo_dist2(uint16_t lat1, uint16_t lon1, uint16_t lat2, uint16_t lon2);
+
+/* Pool recycle at the cap (4.4, decided Oct 2026): the victim is
+ * chosen by ROUTING VALUE, not freshness. Two axes:
+ *  - hop distance from us to the star (closer stays: cheaper to
+ *    re-confirm, more likely on real routes);
+ *  - the star's total link length: the sum of the squared geo
+ *    distances (geo_dist2) of every stored link the star takes part
+ *    in - HIGHER is better (removing a hub fragments the map more
+ *    than removing a leaf); the LOWEST total goes first.
+ * Tie order: hop distance, then link length, then slot index. */
+static uint8_t ev_hop[MC_MAP_NODES];       /* hop distance from the own node */
+
+static void evict_hop_fill(mimeshi_node *n) {
+    /* BFS from the OWN node over the own confirmed edges plus the link
+     * store (hop reach, same relaxation as the forward pruning). */
+    static uint16_t qbuf[MC_MAP_NODES];
+    for (int i = 0; i < MC_MAP_NODES; i++) ev_hop[i] = 0xFF;
+    uint16_t qh = 0, qt = 0;
+    /* virtual start: our confirmed neighbours enter at distance 1 */
+    for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
+        mimeshi_neighbor *nb = &n->nbr[i];
+        if (!nb->alive || !nb->sym) continue;
+        int bi = r_idx(n, nb->id);
+        if (bi < 0) continue;
+        if (ev_hop[bi] != 0xFF) continue;
+        ev_hop[bi] = 1;
+        qbuf[qt++] = (uint16_t)bi;
+    }
+    int own_i = r_idx(n, n->id);
+    if (own_i >= 0) { ev_hop[own_i] = 0; qbuf[qt++] = (uint16_t)own_i; }
+    while (qh < qt) {
+        uint16_t u = qbuf[qh++];
+        uint16_t uid = n->map[u].id;
+        for (int j = 0; j < MC_MAX_LINKS; j++) {
+            if (!n->lnk[j].alive) continue;
+            uint16_t o;
+            if (n->lnk[j].a == uid) o = n->lnk[j].b;
+            else if (n->lnk[j].b == uid) o = n->lnk[j].a;
+            else continue;
+            uint8_t cf = (uint8_t)((n->lnk[j].q >> 4) & 0x0F);
+            uint8_t cr = (uint8_t)(n->lnk[j].q & 0x0F);
+            if (!cf && !cr) continue;
+            int oi = r_idx(n, o);
+            if (oi < 0 || ev_hop[oi] != 0xFF) continue;
+            ev_hop[oi] = (uint8_t)(ev_hop[u] + 1);
+            qbuf[qt++] = (uint16_t)oi;
+        }
+    }
+}
+
+/* Total link length the star takes part in: the sum of geo_dist2 over
+ * every alive stored link with this star as one endpoint (links whose
+ * other endpoint has a geo; geo-less links count 0). */
+static uint32_t evict_link_len(mimeshi_node *n, uint16_t id) {
+    int mi = r_idx(n, id);
+    uint16_t gl = 0, go = 0;
+    if (mi >= 0) { gl = n->map[mi].geo_lat; go = n->map[mi].geo_lon; }
+    uint32_t total = 0;
+    for (int j = 0; j < MC_MAX_LINKS; j++) {
+        if (!n->lnk[j].alive) continue;
+        uint16_t o;
+        if (n->lnk[j].a == id) o = n->lnk[j].b;
+        else if (n->lnk[j].b == id) o = n->lnk[j].a;
+        else continue;
+        int oi = r_idx(n, o);
+        if (oi < 0) continue;
+        if (!n->map[oi].geo_lat || !gl) continue;   /* no geo: not computable */
+        total += geo_dist2(gl, go, n->map[oi].geo_lat, n->map[oi].geo_lon);
+    }
+    return total;
+}
+
 static mimeshi_mapnode *map_add(mimeshi_node *n, uint16_t id) {
     mimeshi_mapnode *m = map_find(n, id);
     if (m) return m;
@@ -433,15 +507,24 @@ static mimeshi_mapnode *map_add(mimeshi_node *n, uint16_t id) {
             n->map[i].arrived_tick = n->tick;
             return &n->map[i];
         }
-    /* pool full (4.4): recycle the LEAST FRESH entry - never the
-     * newest; the freshest knowledge is the routing capital. */
-    int victim = -1; uint32_t worst = 0;
+    /* pool full (4.4, decided Oct 2026): recycle by ROUTING VALUE -
+     * hop distance first (far goes first), the star's total link
+     * length second (low goes first: a hub stays, a leaf goes).
+     * Freshness is the EXPIRY trigger (24 h), never the recycle
+     * choice: at a full pool freshness is a rotation-timing lottery. */
+    evict_hop_fill(n);
+    int victim = -1;
+    uint8_t v_hop = 0; uint32_t v_len = 0;
     for (int i = 0; i < MC_MAP_NODES; i++) {
         if (!n->map[i].alive) continue;
         /* direct neighbours never: they live in the prefix */
         if (nbr_find(n, n->map[i].id)) continue;
-        uint32_t a = map_age_ticks(n, &n->map[i]);
-        if (a > worst) { worst = a; victim = i; }
+        uint8_t h = ev_hop[i];
+        if (h == 0xFF) h = 250;            /* unreachable: maximal distance */
+        uint32_t l = evict_link_len(n, n->map[i].id);
+        if (victim < 0 || h > v_hop || (h == v_hop && l < v_len)) {
+            victim = i; v_hop = h; v_len = l;
+        }
     }
     if (victim < 0) {                            /* only direct neighbours in the map */
         printf("[core] node %u: map full, entry %u dropped\n", n->id, id);
