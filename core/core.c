@@ -1833,10 +1833,23 @@ static uint32_t route_cost_to(mimeshi_node *n, uint16_t dst,
  * 1.3225, so the margin is +32.25% on d2. */
 static uint16_t route_bridge_node(mimeshi_node *n, uint16_t lat, uint16_t lon,
                                   const uint16_t *excl, uint8_t excl_cnt) {
+    /* The own entry is NEVER a bridge candidate (10.2, the scale
+     * finding): the own node has a geo, and once the 15% distance band
+     * admits it (which happens structurally toward far destinations:
+     * the band is 15% of a large distance, and the forwarder itself
+     * is often the closest-known geo simply by having advanced toward
+     * the destination), the route-cost pass picks it at cost 0 - no
+     * real neighbour can beat distance-to-self. The result was a
+     * self-loop that burned the attempt schedule (measured: 258
+     * 'schedule exhausted' failures on the 480-node run, the
+     * majority this exact pattern: FORWARD via self, schedule failed
+     * toward self). A bridge is by definition a NEIGHBOUR we send to;
+     * without one the honest answer is 0 (cannot route). */
     uint32_t best_d = 0;
     int have = 0;
     for (int i = 0; i < MC_MAP_NODES; i++) {
         if (!n->map[i].alive || !n->map[i].geo_lat) continue;   /* no geo: no candidate (5) */
+        if (n->map[i].id == n->id) continue;     /* never the own entry (10.2) */
         uint32_t d = geo_dist2(n->map[i].geo_lat, n->map[i].geo_lon, lat, lon);
         if (!have || d < best_d) { best_d = d; have = 1; }
     }
@@ -1850,6 +1863,7 @@ static uint16_t route_bridge_node(mimeshi_node *n, uint16_t lat, uint16_t lon,
     uint32_t pick_cost = MC_DIST_INF;
     for (int i = 0; i < MC_MAP_NODES; i++) {
         if (!n->map[i].alive || !n->map[i].geo_lat) continue;
+        if (n->map[i].id == n->id) continue;     /* never the own entry (10.2) */
         uint32_t d = geo_dist2(n->map[i].geo_lat, n->map[i].geo_lon, lat, lon);
         if (d > margin) continue;              /* outside the 15% band (10.2) */
         uint32_t c = route_cost_to(n, n->map[i].id, excl, excl_cnt);
