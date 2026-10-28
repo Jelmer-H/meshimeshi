@@ -917,6 +917,78 @@ def star_islands(mk, jitter):
     # position tells the story)
     star_report(radio)
 
+@scenario("star-recover", "recovery test: pool pressure, then a mass death frees the "
+                          "pool - do the tabooed stars come back in?")
+def star_recover(mk, jitter):
+    """The free-slot taboo policy (4.3), the recovery measurement: two
+    25-node islands with MC_MAP_NODES small enough for permanent pool
+    pressure (the --so build decides), all B-island stars tabooed at
+    island A. At half time, HALF of island B dies (links cut): the
+    liveness axis evicts them network-wide within ~6 h... for this
+    test the probe is short, so we die-and-shrink the pool faster:
+    the death frees pool slots at A (the dead stars' entries leave
+    the pool within the liveness threshold). Once >= 4 slots free,
+    the taboo flushes and A re-learns the SURVIVING B stars. The
+    probes measure: A's knowledge of the surviving B nodes before,
+    right after the death (pool still draining), and after recovery."""
+    N_PER = 25
+    duration_h = _ARGS.duration if getattr(_ARGS, 'duration', None) else 10
+    duration_us = duration_h * 3_600_000_000
+    radio = Radio()
+    radio.wire.open = False
+    def mk_positions(cx_m, cy_m, base_id):
+        out = []
+        for i in range(N_PER):
+            out.append((base_id + i, cx_m + (i % 5) * 900, cy_m + (i // 5) * 900, 20.0))
+        return out
+    A = mk_positions(0, 0, 0x0100)
+    B = mk_positions(15000, 0, 0x0200)
+    ids_a = [p[0] for p in A]; ids_b = [p[0] for p in B]
+    ids = ids_a + ids_b
+    lat0, lon0 = 52.09, 5.07
+    def geo_of(x_m, y_m):
+        return grid_geo(lat0 + y_m/111000, lon0 + x_m/(111000*0.615))
+    nodes = []
+    posm = {p[0]: (p[1], p[2], p[3]) for p in A + B}
+    for (nid, x, y, h) in A + B:
+        kn = Node(radio, nid)
+        kn.core = set_jitter(mk(kn), jitter)
+        kn.core.set_geo(*geo_of(x, y))
+        nodes.append(kn)
+        radio.schedule((nid & 0xFF) * 250_000, kn.core.start)
+    for a in ids:
+        for b in ids:
+            if a == b: continue
+            raw = linkbudget(posm[a], posm[b])
+            if raw is None: continue
+            fade = ((a * 31 + b * 17) % 11) - 5
+            r = raw + fade
+            if r >= RX_MIN_DBM:
+                radio.wire.links[(a, b)] = max(-128, min(120, round(r)))
+    out(f"two islands x{N_PER}, {duration_h} h run")
+
+    survivors_b = ids_b[:12]          # the first 12 of B survive
+    doomed = [i for i in ids_b if i not in survivors_b]
+    def probe_fn(label):
+        out(f"[probe {label}] A-nodes with a surviving B star in the map: "
+            f"{sum(1 for kn in nodes if kn.id in ids_a and any(m.alive and m.id in set(survivors_b) for m in kn.core.mn.map))}/{len(ids_a)}")
+    # schedule the probes via the helper
+    for (t, lbl) in [(3*3_600_000_000, "t=3h (pressure)"),
+                    (5*3_600_000_000, "t=5h (after death)"),
+                    (8*3_600_000_000, "t=8h (recovery)"),
+                    (duration_us - 60_000_000, "end")]:
+        radio.schedule(t, (lambda l=lbl: (lambda: probe_fn(l)))())
+    def kill():
+        for k in list(radio.wire.links):
+            if k[0] in doomed or k[1] in doomed:
+                del radio.wire.links[k]
+        out(f"[death] t={radio.now/3.6e9:.1f} h: {len(doomed)} of B's nodes silenced")
+    radio.schedule(4 * 3_600_000_000, kill)
+
+    radio.run(until_us=duration_us)
+    out(f"\n=== Recovery test ({duration_h} h) ===")
+    star_report(radio)
+
 @scenario("star-scale", "scale test: 480 nodes (4x3 tiles of utrecht40) - rest "
                         "convergence and long-distance delivery")
 def star_scale(mk, jitter):

@@ -427,6 +427,37 @@ static void ev_taboo_remember(mimeshi_node *n, uint16_t id) {
     }
 }
 static int ev_taboo_check(mimeshi_node *n, uint16_t id) {
+    /* The taboo is a memory of the admission competition, and the
+     * competition runs at pool pressure (4.4/4.3): at a NON-full pool
+     * the rejections are stale - the pressure that justified them is
+     * gone. The free-slot policy (decided, Oct 2026):
+     *  - 0 free slots: the taboo is active (the measured cycle
+     *    protection, 50,893 blocked re-asks on the islands test);
+     *  - 1-3 free slots: the taboo is TREATED AS EMPTY at the
+     *    request gates (rejected stars may ask again - the answers
+     *    fill the free slots; the physical list stands, so when the
+     *    pool refills, the old judgments apply again without a new
+     *    judgment cycle). Temporary suboptimal admissions at the rim
+     *    of our area are corrected by the complete forms that ride
+     *    the origin's guaranteed rounds;
+     *  - >= 4 free slots: the taboo is FLUSHED entirely - the pressure
+     *    is gone, everyone competes fresh; new judgments come with
+     *    the next full pool.
+     * Implemented here so every call site (both miss gates) shares
+     * the same view. */
+    int free = 0;
+    for (int i = 0; i < MC_MAP_NODES; i++) {
+        if (!n->map[i].alive) {
+            free++;
+            if (free >= 4) {
+                for (int j = 0; j < (int)(sizeof n->ev_taboo / sizeof n->ev_taboo[0]); j++)
+                    n->ev_taboo[j] = 0;
+                n->ev_taboo_idx = 0;
+                return 0;
+            }
+        }
+    }
+    if (free > 0) return 0;               /* 1-3 free: treated as empty, kept */
     for (int i = 0; i < (int)(sizeof n->ev_taboo / sizeof n->ev_taboo[0]); i++)
         if (n->ev_taboo[i] == id) return 1;
     return 0;
