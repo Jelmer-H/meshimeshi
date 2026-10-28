@@ -125,9 +125,7 @@ enum {
 #define F_DEST_GEO 0x20   /* destination geo present: 4 B after the fixed
                              header (6.1, 10.2) - every hop can recompute
                              the bridge node toward an unknown destination */
-#define F_TAIL     0x10   /* table chunk flag: tail chunk - 2-hop entries (4.3) */
-#define F_DELTA    0x20   /* table chunk flag: delta - one changed entry (4.3) */
-#define F_NEG      0x40   /* table chunk flag: negative delta - one entry gone (4.4) */
+
 #define F_NEG_ACK2 0x40   /* next hop could not forward (7.2) */
 
 /* little-endian reading/writing of 16-bit fields (6.1) */
@@ -174,6 +172,22 @@ static bool quality_ok(uint8_t q) { return q >= MC_SYM_QUALITY_MIN; }
 /* Advertised quality class (4.3): the upper bits of the long-term
  * average, 3 bits (8 levels) in the prefix chunks. */
 static uint8_t adv_class_of(uint8_t q) { return (uint8_t)(q >> 3); }   /* 0..7 */
+
+/* Hysteresis on the advertised link byte of the own star (4.3): each
+ * direction nibble moves only when the fresh class is >= 2 steps from
+ * the last published one - sub-threshold EWMA movement leaves the
+ * advertised form untouched, so the content hash of the own star
+ * stays stable while measurements drift. First publication takes the
+ * fresh value. */
+static uint8_t adv_byte_hyst(uint8_t published, uint8_t fresh) {
+    uint8_t ph = (uint8_t)((published >> 4) & 0x07), pl = published & 0x07;
+    uint8_t fh = (uint8_t)((fresh >> 4) & 0x07), fl = fresh & 0x07;
+    if (ph) { int d = (int)fh - (int)ph; if (d < -1 || d > 1) ph = fh; }
+    else ph = fh;
+    if (pl) { int d = (int)fl - (int)pl; if (d < -1 || d > 1) pl = fl; }
+    else pl = fl;
+    return (uint8_t)((ph << 4) | pl);
+}
 
 /* Quality byte back from an advertised class (receiver side): the
  * middle of the class, so route comparisons stay monotone. */
@@ -387,11 +401,6 @@ static uint32_t map_age_ticks(mimeshi_node *n, mimeshi_mapnode *m) {
     return (uint32_t)m->age_ticks + (n->tick - m->arrived_tick);
 }
 
-/* Age byte for the air: capped at 255 (~4 h = expired, 4.4). */
-static uint8_t map_age_eff(mimeshi_node *n, mimeshi_mapnode *m) {
-    uint32_t a = map_age_ticks(n, m);
-    return (uint8_t)(a > 255 ? 255 : a);
-}
 
 /* Eviction of a map entry (4.4): the entry goes, and with it every
  * stored link that touches it - the link store stays consistent with
@@ -415,6 +424,10 @@ static mimeshi_mapnode *map_add(mimeshi_node *n, uint16_t id) {
     for (int i = 0; i < MC_MAP_NODES; i++)
         if (!n->map[i].alive) {
             n->map[i].alive = 1; n->map[i].id = id;
+            n->map[i].star_tick_seen = n->tick;   /* liveness starts now (4.4):
+                                                     no tick known yet, the first
+                                                     advance (or the threshold)
+                                                     decides from here */
             n->map[i].geo_lat = 0; n->map[i].geo_lon = 0;
             n->map[i].quality = 0; n->map[i].age_ticks = 255;
             n->map[i].arrived_tick = n->tick;
@@ -463,52 +476,36 @@ static mimeshi_link *lnk_add(mimeshi_node *n, uint16_t a, uint16_t b) {
     return 0;
 }
 
-/* Table push mutation feed (4.3): the local table counter drives the
- * push-window bundling. A mutation schedules the prefix chunks after
- * the window (1 h + jitter: even the absolute worst case - a fully
- * meshed 64-hub, 31 chunks, sustained churn - stays under 1% of a
- * channel; mutations inside the window bundle automatically because
- * only the current state goes on air). */
-#define MC_TBL_WIN_US   3600000000ull /* bundling window: 1 h (4.3, to measure) */
-#define MC_CHUNK_MAX_ENTRIES 8        /* entries per chunk: 8 x (9 B + links) fits 230 B */
-#define MC_TBL_PERIOD_TICKS 384u          /* prefix re-share: ~6 h in ~56 s ticks (4.3: every chunk at least ~1x/day) */
+/* Content stars per round packet (4.3): 8 x (9 B + links) fits 230 B. */
+#define MC_CHUNK_MAX_ENTRIES 8
 
-static void tbl_push_fire(mimeshi_node *n, void *ud);
-
-/* Bundling window, adaptive to the table size (4.3): the airtime of a
- * whole-prefix round grows with the number of chunks, and only large
- * tables can approach the 1% worst-case budget. Up to
- * MC_TBL_FAST_MAX_CHUNKS the push follows after the short window
- * (fast convergence); above it the long window keeps sustained churn
- * under 1% of a channel even for a fully meshed 64-hub. */
-#define MC_TBL_WIN_FAST_US  900000000ull   /* small tables: 15 min + jitter */
-#define MC_TBL_FAST_MAX_CHUNKS 8           /* <= 8 chunks: worst case 0.77% of a channel */
-
-static uint64_t tbl_win_us(mimeshi_node *n) {
-    uint16_t sym = 0;
-    for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
-        if (n->nbr[i].alive && n->nbr[i].sym) sym++;
-    return ((sym + MC_CHUNK_MAX_ENTRIES - 1) / MC_CHUNK_MAX_ENTRIES <= MC_TBL_FAST_MAX_CHUNKS)
-           ? MC_TBL_WIN_FAST_US : MC_TBL_WIN_US;
-}
-
+/* Table mutation feed (4.3): the local table counter marks the own
+ * star as changed; the next round carries it as content. Nothing is
+ * scheduled here - the round timer is the only send path (4.3 hard
+ * bound). */
 static void tbl_mark_dirty(mimeshi_node *n) {
     n->tbl_dirty = 1;
-    if (!n->tbl_push_sched) {
-        n->tbl_push_sched = 1;
-        uint64_t w = tbl_win_us(n);
-        n->timer(n, w + (n->rand(n) % w), tbl_push_fire, 0);
-    }
 }
 
-static void delta_send(mimeshi_node *n, uint16_t id);
-
-/* Neighbour addition (4.3): the delta goes out immediately (one tiny
- * packet, quality-gated like every confirmation); the table round
- * follows in the normal cadence. */
+/* Neighbour addition (4.3): the new neighbour is a content change of
+ * the own star - the next round carries it. */
+/* Neighbour confirmation (4.3): the own star gains the link - and the
+ * newcomer acceleration (4.3) turns the queue for it: the forward
+ * state of all prefix stars resets, so the stars of the direct
+ * neighbours re-enter the content queue and travel with the coming
+ * rounds. The old cadence answered a newcomer with a delta plus a
+ * full prefix; the star-round translation is the queue reset - zero
+ * extra bytes, the same stars that round anyway, only prioritised. */
 static void tbl_nbr_added(mimeshi_node *n, uint16_t id) {
-    delta_send(n, id);
+    (void)id;
     tbl_mark_dirty(n);
+    for (int i = 0; i < MC_MAP_NODES; i++) {
+        mimeshi_mapnode *m = &n->map[i];
+        if (!m->alive || m->id == n->id) continue;
+        if (!nbr_find(n, m->id)) continue;         /* prefix stars only */
+        m->star_fwd_tick = 0;                      /* as never carried */
+        m->star_fwd_hash = 0;
+    }
 }
 
 /* ---------------- table chunks (4.3) ----------------
@@ -544,6 +541,860 @@ static void lnk_set_class(mimeshi_node *n, uint16_t from, uint16_t to, uint8_t c
     else           l->q = (uint8_t)((l->q & 0xF0) | cls);
 }
 
+/* ---- star canonicalisation (4.3) --------------------------------------- */
+/* The star is the unit of sharing in the star-round concept: one node
+ * entry plus the links it OWNS. Canonical form (4.3): links sorted by
+ * neighbour id, so the star has a deterministic byte representation
+ * independent of the internal table order - the basis for content
+ * digests and the derivable heartbeat match. The entry layout follows
+ * the chunk entry of 4.3 exactly (id, quality byte, age, geo), so a
+ * star serialises to bytes a chunk receiver already understands. */
+#define MC_STAR_MAX_LINKS 64
+#define MC_STAR_MAX_BYTES (9 + 3 * MC_STAR_MAX_LINKS)
+
+/* Link ownership (4.3): one bit of a CRC-8 over the normalised pair.
+ * The owner of {A,B}: normalise a=min, b=max, hash the 4 bytes, bit 0
+ * decides - set: a owns, else b. Both endpoints (and every receiver,
+ * whatever the hop distance) compute the same owner from the pair
+ * alone; the normalisation makes the rule symmetric by construction:
+ * both sides hash the very same bytes, so no AB-vs-BA comparison and
+ * no tie-break can arise. Measured fair split (~50/50), so each node
+ * owns about half its links and star sizes even out across a
+ * neighbourhood. Ownership is permanent (IDs and the hash are fixed):
+ * a link's advertised form stays bound to exactly one star. */
+static uint8_t lnk_pair_bit(uint16_t x, uint16_t y) {
+    uint16_t a = x < y ? x : y, b = x < y ? y : x;
+    uint8_t bytes[4];
+    wr16(bytes, a); wr16(bytes + 2, b);
+    uint8_t crc = 0;
+    for (int i = 0; i < 4; i++) {
+        crc ^= bytes[i];
+        for (int k = 0; k < 8; k++)
+            crc = (uint8_t)((crc & 0x80) ? (crc << 1) ^ 0x07 : crc << 1);
+    }
+    return (uint8_t)(crc & 1);
+}
+static uint16_t lnk_owner(uint16_t x, uint16_t y) {
+    uint16_t a = x < y ? x : y, b = x < y ? y : x;
+    return lnk_pair_bit(x, y) ? a : b;
+}
+
+/* Serialise the star of node `center` as known by n - storage as
+ * received (4.3): the entry (id, both quality classes, tick, geo) and
+ * every link OWNED by center, reproduced exactly as the origin
+ * advertised them. For the OWN star (center == n->id) the classes of
+ * the direct-neighbour links come from the neighbor table (the own
+ * measurement and the peer's reported reverse quality, 4.2); for a
+ * foreign star the entry class byte is adv_q as received and the
+ * link bytes come from the link store as received - the form the
+ * origin put on air, so the content hash is a property of the
+ * origin, not of the observer (the 6a finding, resolved in design).
+ * age_out receives the age byte position in buf (the heartbeat tick
+ * lives there, 4.3); the age byte itself is written but excluded from
+ * the content hash (mimeshi_star_content_hash). Returns the total
+ * length, or 0 if the star does not exist or does not fit maxlen. */
+uint16_t mimeshi_star_serialize(const mimeshi_node *n, uint16_t center,
+                               uint8_t *buf, uint16_t maxlen,
+                               uint16_t *age_off_out) {
+    mimeshi_mapnode *m = map_find((mimeshi_node *)n, center);
+    if (!m) return 0;
+    if (maxlen < 9) return 0;
+
+    wr16(buf, center);
+    if (center == n->id) {
+        /* the OWN entry: the origin publishes itself. The entry byte
+         * is the own link picture toward the strongest confirmed
+         * neighbour (own measured class | the class that neighbour
+         * reported about us, 4.2) - a stable, self-computed value.
+         * Self-publication (4.3 storage-as-received): the form is
+         * stored in the own adv_q, so the own catalogue digest is
+         * computed over exactly the bytes the neighbours hold. */
+        uint8_t q = 0;
+        int best = -1;
+        for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
+            const mimeshi_neighbor *nb = &n->nbr[i];
+            if (!nb->alive || !nb->sym) continue;
+            if (best < 0 || nb->quality > n->nbr[best].quality) best = i;
+        }
+        if (best >= 0) {
+            const mimeshi_neighbor *nb = &n->nbr[best];
+            q = (uint8_t)((adv_class_of(nb->quality) << 4)
+                          | adv_class_of(nb->rev_quality));
+        }
+        m->adv_q = adv_byte_hyst(m->adv_q, q);   /* hysteresis (4.3) */
+        buf[2] = m->adv_q;
+    } else if (m->adv_q) {
+        buf[2] = m->adv_q;              /* entry classes exactly as the
+                                           origin advertised them (4.3) */
+    } else {
+        /* never received the star itself, only map material: the local
+           measurement of the node's signal as the known class */
+        buf[2] = (uint8_t)((adv_class_of(m->quality) << 4) | 0);
+    }
+    buf[3] = m->star_tick;              /* heartbeat tick in the age byte (4.3):
+                                           the origin's liveness, not the
+                                           travelled age - travelled age is
+                                           local (4.4) and never travels in
+                                           the canonical star form */
+    wr16(buf + 4, m->geo_lat);
+    wr16(buf + 6, m->geo_lon);
+    if (age_off_out) *age_off_out = 3;
+
+    /* links of the star, sorted by peer id (canonical form, 4.3).
+     * OWNED share only (4.3): the link {center, peer} travels in
+     * exactly one star - the owner's. The owner bit is derived from
+     * the pair itself, so every observer packs the same share. */
+    uint16_t ids[MC_STAR_MAX_LINKS];
+    uint8_t qc[MC_STAR_MAX_LINKS];
+    uint16_t cnt = 0;
+    if (center == n->id) {
+        /* the OWN star: the origin's own links come from the NEIGHBOR
+         * TABLE, not the link store (4.3) - the origin is the source
+         * of its own star, and at startup the store is still empty
+         * (bootstrap: no star received yet, no link stored yet). Every
+         * confirmed symmetric neighbour with the ownership bit on our
+         * side travels, with the own measured class and the peer's
+         * reported reverse class (4.2), published under hysteresis
+         * (4.3): a >= 2-step class move re-publishes, sub-threshold
+         * EWMA movement does not. */
+        for (int i = 0; i < MC_MAX_NEIGHBORS && cnt < MC_STAR_MAX_LINKS; i++) {
+            mimeshi_neighbor *pnb = &((mimeshi_node *)n)->nbr[i];
+            if (!pnb->alive || !pnb->sym) continue;
+            if (lnk_owner(n->id, pnb->id) != n->id) continue;   /* owned share */
+            uint8_t fresh = (uint8_t)((adv_class_of(pnb->quality) << 4)
+                                      | adv_class_of(pnb->rev_quality));
+            pnb->adv_class = adv_byte_hyst(pnb->adv_class, fresh);
+            ids[cnt] = pnb->id;
+            qc[cnt] = pnb->adv_class;
+            cnt++;
+        }
+        for (uint16_t i = 1; i < cnt; i++) {         /* insertion sort by peer id */
+            uint16_t id = ids[i]; uint8_t q = qc[i];
+            uint16_t j = i;
+            while (j > 0 && ids[j-1] > id) { ids[j] = ids[j-1]; qc[j] = qc[j-1]; j--; }
+            ids[j] = id; qc[j] = q;
+        }
+        if (9 + 3 * cnt > maxlen) return 0;          /* does not fit */
+        buf[8] = (uint8_t)cnt;                       /* link count, chunk entry layout (4.3) */
+        for (uint16_t i = 0; i < cnt; i++) {
+            wr16(buf + 9 + 3 * i, ids[i]);
+            buf[9 + 3 * i + 2] = qc[i];
+        }
+        return (uint16_t)(9 + 3 * cnt);
+    }
+    for (int i = 0; i < MC_MAX_LINKS && cnt < MC_STAR_MAX_LINKS; i++) {
+        if (!n->lnk[i].alive) continue;
+        uint16_t peer = 0;
+        if (n->lnk[i].a == center)      peer = n->lnk[i].b;
+        else if (n->lnk[i].b == center) peer = n->lnk[i].a;
+        else continue;
+        if (lnk_owner(center, peer) != center) continue;   /* owned share (4.3) */
+        if (map_find((mimeshi_node *)n, peer) == 0) continue;  /* link endpoints are map nodes */
+        uint8_t cf = lnk_class((mimeshi_node *)n, center, peer);
+        if (cf == 0xFF) continue;
+        uint8_t cr = lnk_class((mimeshi_node *)n, peer, center);
+        ids[cnt] = peer;
+        qc[cnt] = (uint8_t)((cf << 4) | (cr == 0xFF ? 0 : cr));
+        cnt++;
+    }
+    for (uint16_t i = 1; i < cnt; i++) {         /* insertion sort by peer id */
+        uint16_t id = ids[i]; uint8_t q = qc[i];
+        uint16_t j = i;
+        while (j > 0 && ids[j-1] > id) { ids[j] = ids[j-1]; qc[j] = qc[j-1]; j--; }
+        ids[j] = id; qc[j] = q;
+    }
+    if (9 + 3 * cnt > maxlen) return 0;          /* does not fit */
+    buf[8] = (uint8_t)cnt;                       /* link count, chunk entry layout (4.3) */
+    for (uint16_t i = 0; i < cnt; i++) {
+        wr16(buf + 9 + 3 * i, ids[i]);
+        buf[9 + 3 * i + 2] = qc[i];
+    }
+    return (uint16_t)(9 + 3 * cnt);
+}
+
+/* 1-byte content hash over the canonical star bytes EXCLUDING the age
+ * byte (4.5): the digest covers what is advertised (identity, links,
+ * quality classes), not how old the advertisement is - silent EWMA
+ * movement under the hysteresis does not change it, and the heartbeat
+ * tick (added separately in the digest) can change freely. CRC-8/ATM
+ * (poly 0x07, init 0): cheap, fixed table-free, good avalanche for the
+ * small fixed-size input. */
+uint8_t mimeshi_star_content_hash(const uint8_t *star, uint16_t len,
+                                  uint16_t age_off) {
+    uint8_t crc = 0;
+    for (uint16_t i = 0; i < len; i++) {
+        if (i == age_off) continue;              /* age excluded (4.5) */
+        crc ^= star[i];
+        for (int b = 0; b < 8; b++)
+            crc = (uint8_t)((crc & 0x80) ? (crc << 1) ^ 0x07 : crc << 1);
+    }
+    return crc;
+}
+
+/* Digest of a star as carried in the catalogue (4.5):
+ * digest = (content_hash + tick) mod 256 - derivable: a receiver that
+ * has the star can compute the expected digest for tick + k for small
+ * k, which is the heartbeat match. */
+uint8_t mimeshi_star_digest(uint8_t content_hash, uint8_t tick) {
+    return (uint8_t)(content_hash + tick);
+}
+
+/* Heartbeat match (4.5): does `received` fit content_hash at
+ * stored_tick + k for some k in 0..k_max? Returns the matched tick
+ * advance (1..k_max), 0 for an exact same-tick match, or -1 when no
+ * k fits (real content change, or a star we do not have). */
+/* ---- star round (4.5, proposal): the uniform convergence cadence --- */
+/* One chunk per interval (starting value 15 min = 16 proof ticks of
+ * ~56 s), all three channels like the re-share round. Content first
+ * (stars that changed since they were last forwarded, nearest hops
+ * first, the own star at the front), catalogue in the remaining space
+ * ((node id, digest) at 3 B per star). Hard bound: never more than
+ * one chunk per node per interval, whatever happens (4.5). The own
+ * star travels in full at least once per hour regardless of its
+ * queue position (4.5): the guaranteed own-star round. */
+#define MC_STAR_ROUND_TICKS   16u    /* 15 min interval in proof ticks */
+#define MC_STAR_FLOOR_TICKS    5u     /* quiet-hour floor: 5 min (6e) - the interval
+                                       may shorten to this when there is work and
+                                       the channels are quiet */
+#define MC_STAR_QUIET_TICKS    4u     /* a channel is quiet for the acceleration
+                                       gate when its ka_idle counter stands at
+                                       4+ proof ticks (~4 min without any own
+                                       identifying reception, 6e) */
+#define MC_STAR_ROUNDS_PER_H  4u     /* 60 min / 15 min: own-star bound */
+#define MC_STAR_CAT_RESERVE   30u     /* catalogue bytes reserved per round (4.5):
+                                        content may fill the chunk, but the last
+                                        30 B are for catalogue entries - the age
+                                        maintenance that keeps the resting map
+                                        alive must not be starved by a content
+                                        backlog; 4 rounds/h x 30 B = 40 entries/h
+                                        minimum on air */
+#define PKT_STAR_ROUND        10     /* new packet type (4.5) */
+#define F_STAR_CATALOGUE 0x10       /* chunk contains catalogue entries */
+#define F_STAR_MISSED   0x20         /* chunk contains missed-star requests (4.5) */
+
+/* Star age byte (4.5 heartbeat): the tick counter of the origin.
+ * The round is also the tick driver of the own star: at the
+ * guaranteed own-star round the tick advances and rides in the age
+ * byte; neighbours derive the new digest without content. */
+static uint8_t star_own_tick(mimeshi_node *n) { return n->star_tick; }
+
+static int r_idx(mimeshi_node *n, uint16_t id);
+
+/* Star-forward usefulness (4.5, graph check): does forwarding the star
+ * of `center` reach any neighbour that lies strictly FARTHER from the
+ * center than we do? Hop distances over the known graph (map + link
+ * store + our own edges), the same material routing uses - but pure
+ * hop counting, no ETX: the question is reach, not cost.
+ *
+ * A BFS from the center over the routing-reachable edges gives the
+ * distance of every known node. Our own distance: the minimum over
+ * our neighbours (we are the virtual start edge, as in route_next_hop).
+ * If no known neighbour lies strictly farther, the forwarding is an
+ * echo back into the gradient: everyone we could reach got the star
+ * from the same side we did. Unknown neighbours (no map slot, no
+ * edges) count as FARTHER - absence of knowledge never silences the
+ * forward (never prune on missing information, 4.5).
+ *
+ * Return 1 = useful (forward), 0 = useless (skip). */
+static uint8_t star_dist[MC_MAP_NODES];     /* BFS distances, 0xFF = unreached */
+static uint8_t star_fwd_useful(mimeshi_node *n, uint16_t center) {
+    int ci = r_idx(n, center);
+    if (ci < 0) return 1;                     /* center unknown to us: forward */
+    for (int i = 0; i < MC_MAP_NODES; i++) star_dist[i] = 0xFF;
+
+    /* BFS from the center. Edges: the symmetric threshold links of the
+     * link store (both directions usable when the class is known) -
+     * hop reach, not route cost, so undirected relaxation over both
+     * nibbles with a non-zero class. */
+    static uint16_t qbuf[MC_MAP_NODES];       /* BFS queue of map indices */
+    uint16_t qh = 0, qt = 0;
+    star_dist[ci] = 0;
+    qbuf[qt++] = (uint16_t)ci;
+    while (qh < qt) {
+        uint16_t u = qbuf[qh++];
+        if (star_dist[u] >= 0xFE) continue;
+        uint16_t uid = n->map[u].id;
+        for (int j = 0; j < MC_MAX_LINKS; j++) {
+            if (!n->lnk[j].alive) continue;
+            uint16_t o;
+            if (n->lnk[j].a == uid) o = n->lnk[j].b;
+            else if (n->lnk[j].b == uid) o = n->lnk[j].a;
+            else continue;
+            /* either direction known with a class = a hop for reach */
+            uint8_t cf = (uint8_t)((n->lnk[j].q >> 4) & 0x0F);
+            uint8_t cr = (uint8_t)(n->lnk[j].q & 0x0F);
+            if (!cf && !cr) continue;         /* no measured direction: no hop */
+            int oi = r_idx(n, o);
+            if (oi < 0 || star_dist[oi] != 0xFF) continue;
+            star_dist[oi] = (uint8_t)(star_dist[u] + 1);
+            qbuf[qt++] = (uint16_t)oi;
+        }
+    }
+
+    /* our distance: the best hop over our own edges (virtual start);
+     * plus the trivial case: the center IS a direct neighbour (dist 1) */
+    int my_dist = 0x7FFFFFFF;
+    if (nbr_find(n, center) && nbr_find(n, center)->sym) my_dist = 1;
+    for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
+        mimeshi_neighbor *nb = &n->nbr[i];
+        if (!nb->alive || !nb->sym) continue;
+        int bi = r_idx(n, nb->id);
+        if (bi < 0) continue;
+        if (star_dist[bi] == 0xFF) continue;
+        int d = star_dist[bi] + 1;
+        if (d < my_dist) my_dist = d;
+    }
+    if (my_dist == 0x7FFFFFFF) return 1;       /* we are not on the graph of the
+                                                  star: our buren are unknown
+                                                  territory - forward */
+
+    /* useful iff at least one neighbour lies STRICTLY farther */
+    for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
+        mimeshi_neighbor *nb = &n->nbr[i];
+        if (!nb->alive || !nb->sym) continue;
+        int bi = r_idx(n, nb->id);
+        if (bi < 0) return 1;                 /* unknown neighbour: forward */
+        if (star_dist[bi] == 0xFF) return 1;  /* not reached by the star's graph:
+                                                 forward */
+        if (star_dist[bi] > my_dist) return 1;/* strictly farther: reach to gain */
+    }
+    return 0;                                 /* everyone is closer or equal: echo */
+}
+
+/* Build and send one star-round chunk (4.5). Return value: number of
+ * content stars carried (0 = the chunk still went out, catalogue-only). */
+static uint8_t star_round_send(mimeshi_node *n) {
+    uint8_t p[230];
+    uint16_t len = 10;
+    p[0] = (uint8_t)PKT_STAR_ROUND;
+    wr16(p + 1, n->id);
+    p[3] = 0;                             /* catalogue count, filled below */
+    p[4] = 0;                                   /* content star count, filled below */
+    wr16(p + 5, n->geo_lat); wr16(p + 7, n->geo_lon);
+    p[9] = 1;                                   /* firmware version (4.3 header shape) */
+
+    /* --- content area: own star first, then nearest-first queue ---
+     * The own star: the entry of n itself with its confirmed links,
+     * serialised through the same canonical form. It is always a
+     * candidate; with the own-star guarantee it goes in as soon as
+     * the hour bound is reached, and its tick advances then. Under
+     * the rotation (4.3) the guaranteed own-star round fires when the
+     * rotation lands on the OWN HOME channel: the tick stays coupled
+     * to the home channel, ~1x per hour at the 15-min starting value. */
+    uint8_t carried = 0;
+    uint8_t queued_left = 0;                /* stars packed but not yet fully carried */
+    uint8_t rot_ch = (uint8_t)((n->home_ch + n->star_rot_ctr) % MC_N_CHANNELS);
+    int home_round = (rot_ch == n->home_ch);
+    /* guaranteed own-star round: every time the rotation lands on the
+     * own home channel (~1x per 3 intervals = ~45 min at the 15-min
+     * starting value - the once-per-hour bound of 4.3 stays honoured
+     * as a lower bound). star_own_ctr counts home rounds since the
+     * last guaranteed carry. */
+    int own_due = home_round
+                  && (uint8_t)(n->star_own_ctr + 1) >= (MC_STAR_ROUNDS_PER_H + 2) / 3;
+    int own_star_changed = n->tbl_dirty;         /* prefix mutation pending = own star changed */
+    if (own_due || own_star_changed) {
+        /* The own star in the chunk entry layout: id, both classes,
+         * tick, geo, links - via the canonical serialiser over the
+         * own map entry. */
+        uint8_t sbuf[MC_STAR_BUF]; uint16_t age_off;
+        /* ensure the own map entry exists (geo, presence) */
+        mimeshi_mapnode *om = map_find(n, n->id);
+        if (!om) { om = map_add(n, n->id); }
+        if (om) {
+            om->geo_lat = n->geo_lat; om->geo_lon = n->geo_lon;
+            uint16_t sl = mimeshi_star_serialize(n, n->id, sbuf, sizeof sbuf, &age_off);
+            if (sl > 0 && len + sl <= 230) {
+                if (own_due) { n->star_own_ctr = 0; n->star_tick++; }
+                else n->star_own_ctr++;
+                sbuf[age_off] = star_own_tick(n);   /* heartbeat tick in the age byte (4.5) */
+                memcpy(p + len, sbuf, sl);
+                len = (uint16_t)(len + sl);
+                carried++;
+            }
+        }
+    } else {
+        n->star_own_ctr++;
+    }
+
+    /* queue: stars whose CONTENT changed since they were last
+     * carried, nearest hops first - prefix stars (direct neighbours)
+     * before tail stars, in map order. The queue decision is the
+     * content hash (4.5): a star goes back on the queue only when its
+     * advertised content differs from the hash of its last carried
+     * form; a mere age/refresh touch or sub-hysteresis EWMA movement
+     * does NOT re-send it - the catalogue entry below is the cheap
+     * confirmation. star_fwd_tick uses the same 16-bit time base as
+     * arrived_tick, so wrap arithmetic is exact and no heuristic
+     * guard is needed.
+     *
+     * No entry cap: stars pack until they do not fit the chunk - the
+     * byte budget of the packet is the bound (4.5), not an entry
+     * count inherited from the 4.3 chunk format. Thin stars pack many
+     * per round (fast convergence where the air allows it), thick
+     * stars few. What was carried is remembered per star
+     * (star_fwd_tick + star_fwd_hash), so the next round simply
+     * continues with what did not fit: a backlog drains over rounds,
+     * bounded by the hard one-chunk-per-interval rule.
+     *
+     * One exception (4.5): the last MC_STAR_CAT_RESERVE bytes stay free
+     * for catalogue entries. The catalogue is the heartbeat of the
+     * resting network - without a guaranteed trickle of digests the
+     * ages would run dry during a sustained content backlog and the
+     * maintenance side of the round would starve. A star that does
+     * not fit in the reserved space simply waits a round - the queue
+     * drains, a round slower under pressure. */
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < MC_MAP_NODES; i++) {
+            mimeshi_mapnode *m = &n->map[i];
+            if (!m->alive || m->id == n->id) continue;
+            int is_prefix = nbr_find(n, m->id) != 0;
+            if ((pass == 0) != (is_prefix != 0)) continue;   /* pass 0: prefix first */
+            /* graph pruning (4.5): skip the star when every known
+             * neighbour lies closer to (or level with) its center than
+             * we do - the forward would be an echo back into the
+             * gradient. Unknown neighbours never silence: no pruning
+             * on missing information. The star stays in the map and
+             * keeps its queue state; the missed list of a neighbour
+             * that nevertheless wants it re-queues it explicitly. */
+            /* pruning - unless a neighbour explicitly asked (4.3): a
+             * fresh star_wanted overrides the gradient check for a few
+             * intervals; the answer rides the next rounds. */
+            int wanted = m->star_wanted != 0
+                        && (uint32_t)(n->tick - m->star_wanted) < 2u * MC_STAR_ROUND_TICKS;
+            if (!wanted && !star_fwd_useful(n, m->id)) continue;
+            uint8_t sbuf[MC_STAR_BUF];
+            uint16_t sl = mimeshi_star_serialize(n, m->id, sbuf, sizeof sbuf, 0);
+            if (sl == 0 || len + sl > 230 - MC_STAR_CAT_RESERVE) continue;  /* full
+                                          or would eat the catalogue reserve (4.3):
+                                          stays queued for the next round */
+            uint8_t h = mimeshi_star_content_hash(sbuf, sl, 3);
+            if (m->star_fwd_tick != 0) {
+                if (h == m->star_fwd_hash && (m->star_fwd_bits & 7) == 7)
+                    continue;   /* unchanged and fully carried: done (4.3) */
+                if (h != m->star_fwd_hash)
+                    m->star_fwd_bits = 0;   /* content change: all channels again */
+            }
+            memcpy(p + len, sbuf, sl);
+            len = (uint16_t)(len + sl);
+            carried++;
+            m->star_fwd_tick = n->tick;
+            m->star_fwd_hash = h;
+            queued_left++;                /* may stay queued: other channels pending */
+        }
+    }
+    p[4] = carried;
+
+    /* --- catalogue area: (node id, digest) in the remaining space ---
+     * 3 B per star: what we have, in which version - the receiver
+     * resets ages on a derivable match and prunes its own queue (4.5).
+     * Own entry first (content hash of the own star + tick), then the
+     * map, nearest first again. */
+    uint16_t cat_cnt = 0;
+    if (len + 3 <= 230) {
+        uint8_t sbuf[MC_STAR_BUF];
+        mimeshi_mapnode *om = map_find(n, n->id);
+        if (om) {
+            uint16_t sl = mimeshi_star_serialize(n, n->id, sbuf, sizeof sbuf, 0);
+            if (sl > 0) {
+                uint8_t h = mimeshi_star_content_hash(sbuf, sl, 3);
+                wr16(p + len, n->id);
+                p[len + 2] = mimeshi_star_digest(h, star_own_tick(n));
+                len += 3; cat_cnt++;
+            }
+        }
+    }
+    /* Catalogue prioritisation (4.3, from the scenario-6 rest
+     * measurement: the resting round carried ~40 triples of which most
+     * confirmed knowledge that was fresh anyway). The limited space
+     * goes to what is actually needed first; untriggered stars ride
+     * only in the leftover space, in the old prefix-then-map order.
+     * The selection re-runs every round: an entry that was skipped
+     * keeps aging locally and enters a trigger band by itself, so
+     * nothing is ever silently dropped.
+     *
+     * Trigger bands (checked per star, highest first):
+     *  1. heartbeat due - the confirmation is older than one
+     *     rotation cycle (3 intervals): the receiver's derivable
+     *     match must keep arriving or the k-window drifts toward
+     *     miss-requests; liveness detection depends on this.
+     *  2. staleness - the effective age is above a third of the
+     *     map-eviction bound: the age maintenance has to confirm it
+     *     before the 24 h eviction (or route de-weighting) bites.
+     *  3. fresh arrival - recently received as content, likely not
+     *     yet confirmed by the neighbours' derivable matches: one
+     *     catalogue triple settles the whole neighbourhood. */
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < MC_MAP_NODES && len + 3 <= 230; i++) {
+            mimeshi_mapnode *m = &n->map[i];
+            if (!m->alive || m->id == n->id) continue;
+            int is_prefix = nbr_find(n, m->id) != 0;
+            if ((pass == 0) != (is_prefix != 0)) continue;
+            uint8_t sbuf[MC_STAR_BUF];
+            uint16_t sl = mimeshi_star_serialize(n, m->id, sbuf, sizeof sbuf, 0);
+            if (sl == 0) continue;
+            uint8_t h = mimeshi_star_content_hash(sbuf, sl, 3);
+            /* tick of a foreign star: its forwarded age byte at arrival
+             * (the origin's tick as it reached us); stored per map entry
+             * as the low bits of arrived_tick are local - the tick
+             * itself rides in the age byte of the star content, which
+             * the digest derivation adds. Use the star's own age byte:
+             * the serialised age IS the tick (4.3). */
+            uint8_t tick = sbuf[3];
+            wr16(p + len, m->id);
+            p[len + 2] = mimeshi_star_digest(h, tick);
+            len += 3; cat_cnt++;
+        }
+    }
+    (void)cat_cnt;
+    if (cat_cnt > 255) cat_cnt = 255;
+    p[3] = (uint8_t)cat_cnt;               /* catalogue count in the header:
+                                              the receiver knows where the
+                                              catalogue ends and the missed
+                                              area begins (the chunk-nr slot
+                                              is free: star-round chunks are
+                                              self-contained, no cursor) */
+    if (cat_cnt) p[0] |= F_STAR_CATALOGUE;
+
+    /* --- missed area (4.5): requests to specific neighbours ---
+     * (neighbour id, n, star ids...) at 3 B + 2 B per star; the named
+     * neighbour resets the last-carried state of those stars, so they
+     * re-enter the content queue and travel with its next round. The
+     * damping lives per entry: tries++ here, dropped after 2. */
+    {
+        uint16_t off = len;
+        uint16_t moff = off;                    /* patch the count later */
+        (void)moff;
+        uint8_t carried_miss = 0;
+        for (uint8_t i = 0; i < MC_STAR_MISS_MAX; i++) {
+            if (!n->star_miss[i].alive) continue;
+            if (n->star_miss[i].tries >= 2) {   /* damped out (4.5) */
+                n->star_miss[i].alive = 0;
+                continue;
+            }
+            if (!nbr_find(n, n->star_miss[i].nb)) {   /* neighbour gone (4.5):
+                                                          the request could never
+                                                          be answered - drop it */
+                n->star_miss[i].alive = 0;
+                continue;
+            }
+            /* group consecutive requests to the same neighbour: this
+             * simple form packs one (nb, n=1, star) triple per entry;
+             * the receiver accepts any grouping. */
+            if (off + 5 > 230) break;           /* area full */
+            wr16(p + off, n->star_miss[i].nb);
+            p[off + 2] = 1;
+            wr16(p + off + 3, n->star_miss[i].star);
+            off += 5;
+            n->star_miss[i].tries++;
+            carried_miss++;
+        }
+        if (carried_miss) { p[0] |= F_STAR_MISSED; len = off; }
+    }
+
+    /* --- channel rotation with the backlog override (4.3) ---
+     * At rest (no backlog: everything packed fits, nothing stays
+     * queued) the round goes out on ONE channel: the rotation channel
+     * (home + round counter) mod 3. The resting overhead is paid once
+     * per interval instead of three times, the node is away from its
+     * home channel at most one interval in three, and per channel only
+     * the third of the nodes whose rotation it is transmits.
+     * Under backlog (packed stars still await other channels, or the
+     * queue did not fit) the round goes out on ALL THREE channels -
+     * a backlog drains at full speed, exactly the old cadence: under
+     * backlog every channel's throughput counts, and the full-spread
+     * round sets all three carried bits in one blow. */
+    {
+        int backlog = (queued_left > 0) || (carried >= 8);
+        uint8_t mask = backlog ? 7u : (uint8_t)(1u << rot_ch);
+        for (uint8_t c = 0; c < MC_N_CHANNELS; c++) {
+            if (!(mask & (1u << c))) continue;
+            bound_send(n, c, p, len, t_data_us(len));
+            ka_called(n, c);
+        }
+        /* carried-on-channel bits (4.3): a star leaves the queue only
+         * when all three bits stand (or a content change resets them) */
+        for (int i = 0; i < MC_MAP_NODES; i++) {
+            mimeshi_mapnode *m = &n->map[i];
+            if (!m->alive || m->id == n->id) continue;
+            if (m->star_fwd_tick == n->tick) m->star_fwd_bits |= mask;
+        }
+        n->star_rot_ctr++;
+        /* 6e: work remained when packed stars still await channels or the
+         * queue did not fit - the quiet-hour acceleration reads this */
+        n->star_backlog = (uint8_t)(queued_left > 0 || carried >= 8);
+    }
+    return carried;
+}
+
+/* Reception of a star-round chunk (4.5, receiver step).
+ *
+ * The CONTENT area carries stars in exactly the chunk entry layout of
+ * 4.3 (id, classes, age, geo, links) - so the content processing goes
+ * through the ordinary chunk entry path: a receiver that only
+ * understands chunks still gets the full benefit of the content, and
+ * the symmetry evidence (an owner naming us) keeps working (4.3).
+ *
+ * The CATALOGUE area carries (node id, digest) at 3 B: what the
+ * sender has, in which version. For each entry about a star we know:
+ *  - derivable match (digest = content_hash + tick + k, k <= window):
+ *    the star is unchanged and its origin is alive; we advance the
+ *    tick and RESET the travelled age of that star as received from
+ *    this source (4.5): fresh-beats-old keeps working without a
+ *    single content byte.
+ *  - no fit: a real content change or a gap - the missed-list step
+ *    (later sub-step of 4.5) takes this from here.
+ *
+ * We cannot see the sender's own star tick directly: the catalogue
+ * entry for the sender's own star carries its digest, and a match
+ * there also confirms the sender's liveness.
+ *
+ * The digest of a foreign star in OUR store: the content hash over
+ * our canonical serialisation (age excluded) plus the tick we last
+ * saw riding in the star's age byte - stored per map entry.
+ */
+#define MC_STAR_K_MAX 8u        /* tick-lag window (4.3, starting value) */
+#define MC_STAR_DEAD_TICKS 385u  /* liveness threshold (4.4): a star whose origin
+                                   tick has not advanced for ~6 h of proof ticks
+                                   is dead - de-weighted at half, evicted at the
+                                   threshold, whatever the forwarded copies say */
+
+static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
+                          uint16_t len, int star_mode);
+static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t len);
+
+/* Missed list (4.5): a catalogue mismatch (star unknown here, or a
+ * digest that fits no tick) becomes a request to the ADVERTISER - not
+ * a pull exchange: the request rides the own round, the answer rides
+ * the neighbour's next round as ordinary content. Damped: at most 2
+ * attempts per (neighbour, star); a star that arrives meanwhile clears
+ * the entry. Bounded by MC_STAR_MISS_MAX; a full list drops the new
+ * request (fresh-beats-old and the regular rounds remain the net). */
+static void star_miss_add(mimeshi_node *n, uint16_t nb, uint16_t star) {
+    if (nb == n->id) return;
+    if (!nbr_find(n, nb)) return;              /* only direct neighbours (4.5:
+                                                  channel-filtered by design) */
+    for (uint8_t i = 0; i < MC_STAR_MISS_MAX; i++) {
+        if (n->star_miss[i].alive && n->star_miss[i].nb == nb
+            && n->star_miss[i].star == star) return;      /* already queued */
+    }
+    for (uint8_t i = 0; i < MC_STAR_MISS_MAX; i++) {
+        if (!n->star_miss[i].alive) {
+            n->star_miss[i].alive = 1;
+            n->star_miss[i].nb = nb;
+            n->star_miss[i].star = star;
+            n->star_miss[i].tries = 0;
+            return;
+        }
+    }
+    /* full: drop silently - the damping rule keeps the list short in
+     * practice; a persistent gap resurfaces via the next mismatch. */
+}
+
+/* A star we were missing arrived (content or derivable match): clear
+ * every miss entry about it (4.5 damping: no re-request after fetch). */
+static void star_miss_clear(mimeshi_node *n, uint16_t star) {
+    for (uint8_t i = 0; i < MC_STAR_MISS_MAX; i++)
+        if (n->star_miss[i].alive && n->star_miss[i].star == star)
+            n->star_miss[i].alive = 0;
+}
+
+static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t len) {
+    if (len < 10) return;
+    uint16_t owner = rd16(pkt + 1);      /* the advertiser: miss requests address it */
+
+    /* --- content area: chunk entry layout, processed via chunk_rx ---
+     * The header (10 B) is identical to a 4.3 chunk, and the entries
+     * follow the same layout. chunk_rx() expects p[4] entries and
+     * processes exactly that: reuse it wholesale by handing it the
+     * same packet; the type nibble differs but chunk_rx does not
+     * look at it.
+     *
+     * After the pass, the star semantics differ from a plain 4.3
+     * chunk in exactly one field: the age byte of a star-round entry
+     * carries the ORIGIN HEARTBEAT TICK (4.5), not the travelled age.
+     * chunk_rx stored it into age_ticks; we move it to star_tick and
+     * reset age_ticks to 0 - the star arrived NOW, its travelled age
+     * starts here (4.4 semantics), and the tick is the liveness. */
+    uint16_t cend = 10;                      /* end of the content area */
+    for (uint8_t e = 0; e < pkt[4] && cend + 9 <= len; e++)
+        cend = (uint16_t)(cend + 9 + 3 * pkt[cend + 8]);   /* walk the content stars */
+    chunk_rx_mode(n, rssi, pkt, cend, 1);   /* entries only: the catalogue and
+                                               missed bytes are not entries */
+    uint16_t rx_star[MC_CHUNK_MAX_ENTRIES];     /* content stars of THIS packet */
+    uint8_t rx_star_n = 0;
+    {
+        uint16_t off = 10;
+        for (uint8_t e = 0; e < pkt[4] && off + 9 <= cend; e++) {
+            uint16_t eid = rd16(pkt + off);
+            if (eid != n->id) {                    /* our own star is not in the map */
+                mimeshi_mapnode *em = map_find(n, eid);
+                if (em) {
+                    /* fresh beats old (4.3): a form that lags more than
+                     * the k-window behind the stored tick is a stale
+                     * re-send - the newer knowledge stands, only the
+                     * request is settled. */
+                    int16_t d = (int16_t)((int16_t)em->star_tick - (int16_t)pkt[off + 3]);
+                    if (!(em->adv_q
+                          && (d > (int16_t)MC_STAR_K_MAX || d < -(int16_t)MC_STAR_K_MAX))) {
+                        if ((int16_t)pkt[off + 3] != (int16_t)em->star_tick)
+                            em->star_tick_seen = n->tick;   /* liveness: the origin tick advanced (4.4) */
+                        em->star_tick = pkt[off + 3];  /* the tick as it traveled (4.3) */
+                        em->age_ticks = 0;              /* arrived NOW: travelled age starts here */
+                        em->arrived_tick = n->tick;
+                    }
+                }
+                star_miss_clear(n, eid);            /* a missing star arrived:
+                                                     its requests are settled (4.3) */
+            }
+            if (rx_star_n < MC_CHUNK_MAX_ENTRIES) rx_star[rx_star_n++] = eid;
+            off += 9 + 3 * pkt[off + 8];
+        }
+    }
+
+    /* --- catalogue area: after the content stars (4.5) ---
+     * The number of content stars is p[4]; the entries follow the
+     * chunk entry layout, so the catalogue starts after the last
+     * content star. (n, digest) triples fill the rest. */
+    uint16_t off = cend;                       /* the content walk ended here */
+    if (!(pkt[0] & F_STAR_CATALOGUE)) { off = len; }
+    uint8_t cat_n = pkt[3];                    /* catalogue count (header) */
+    uint16_t cat_end = off + 3 * cat_n;
+    if (cat_end > len) { cat_end = len; }      /* malformed: clip */
+    for (; off + 3 <= cat_end; off += 3) {
+        uint16_t sid = rd16(pkt + off);
+        uint8_t digest = pkt[off + 2];
+        if (sid == n->id) continue;              /* our own star: we are the origin */
+        int in_content = 0;                       /* this packet already carried it */
+        for (uint8_t i = 0; i < rx_star_n; i++)
+            if (rx_star[i] == sid) { in_content = 1; break; }
+        if (in_content) continue;                 /* fresh content beats the
+                                                     catalogue mismatch: no
+                                                     request (4.5) */
+        mimeshi_mapnode *m = map_find(n, sid);
+        if (!m) {
+            /* star not known here while the neighbour advertises it:
+             * a gap - onto the missed list (4.5). */
+            star_miss_add(n, owner, sid);
+            continue;
+        }
+        /* our version: content hash over our canonical bytes (age
+         * excluded), tick = the heartbeat as it reached us. */
+        uint8_t sbuf[MC_STAR_BUF];
+        uint16_t sl = mimeshi_star_serialize(n, sid, sbuf, sizeof sbuf, 0);
+        if (sl == 0) continue;
+        uint8_t h = mimeshi_star_content_hash(sbuf, sl, 3);
+        uint8_t our_tick = m->star_tick;        /* origin heartbeat tick (4.5):
+                                                   separate from age_ticks, which
+                                                   keeps its 4.4 meaning */
+        int k = mimeshi_star_tick_match(digest, h, our_tick, MC_STAR_K_MAX);
+        if (k != -1) {
+            /* derivable match (4.3): unchanged, origin alive. Advance
+             * the tick and reset the travelled age - the knowledge is
+             * confirmed without content. A star we were missing is
+             * hereby settled: clear its miss entries. A lagging
+             * advertisement (k > 16: a slower route) confirms the same
+             * content: only the age refreshes, the newer stored tick
+             * stands (the origin has already reached it). */
+            if (k > 0 && k <= (int)MC_STAR_K_MAX) {
+                m->star_tick = (uint8_t)(our_tick + (uint8_t)k);
+                m->star_tick_seen = n->tick;   /* liveness: the origin tick advanced (4.4) */
+            }
+            m->age_ticks = 0;                   /* travelled age restarts (4.4) */
+            m->arrived_tick = n->tick;          /* fresh as of NOW (4.4) */
+            star_miss_clear(n, sid);
+        } else {
+            /* no tick fits: a real content change upstream (or a hash
+             * collision) - onto the missed list; the neighbour re-sends
+             * it as content in its next round (4.5). */
+            star_miss_add(n, owner, sid);
+        }
+    }
+
+    /* --- missed area (4.5): requests addressed to US ---
+     * A neighbour is missing a star (or saw a content change): reset
+     * the last-carried state so the star re-enters the content queue
+     * and travels with our next round - no exchange, no ack, the
+     * regular cadence is the answer (4.5). */
+    if (pkt[0] & F_STAR_MISSED) {
+        uint16_t moff = cat_end;                /* where the catalogue ended */
+        for (; moff + 3 <= len;) {
+            uint16_t nb = rd16(pkt + moff);
+            uint8_t cnt = pkt[moff + 2];
+            moff += 3;
+            if (moff + 2 * cnt > len) break;    /* malformed: ignore the rest */
+            if (nb == n->id) {
+                for (uint8_t i = 0; i < cnt; i++) {
+                    uint16_t star = rd16(pkt + moff + 2 * i);
+                    mimeshi_mapnode *m = map_find(n, star);
+                    if (m) {
+                        m->star_fwd_tick = 0;   /* as never carried: queued again */
+                        m->star_fwd_hash = 0;
+                        m->star_wanted = n->tick;   /* explicit ask: the
+                                        pruning yields for a few
+                                        intervals (4.3) */
+                    }
+                }
+            }
+            moff += 2 * cnt;
+        }
+    }
+}
+
+/* Round timer (4.3): per-node phase offset; the interval is the hard
+ * bound - one chunk per node per interval.
+ *
+ * Quiet-hour acceleration (6e): when the last round left content work
+ * (star_backlog) AND every channel has been quiet for MC_STAR_QUIET_TICKS
+ * (no identifying reception - the ka_idle counters carry the CAD-free
+ * occupancy measure), the next interval halves, down to the 5-min floor.
+ * The convergence of a residual backlog then runs at up to 3x speed in
+ * quiet periods without spending any airtime in busy ones: at occupancy
+ * the full interval stands, and the acceleration self-clears at rest
+ * (no backlog, no shortening). The hard bound is untouched - the round
+ * still sends at most one chunk, just sooner. */
+static void star_round_tick(mimeshi_node *n, void *ud) {
+    (void)ud;
+    n->star_round_sched = 0;
+    if (n->tbl_dirty) { n->tbl_dirty = 0; }       /* the round carries mutations (4.3) */
+    star_round_send(n);
+    n->star_round_sched = 1;
+    uint32_t iv = MC_STAR_ROUND_TICKS;
+    if (n->star_backlog) {
+        uint8_t quiet = 1;
+        for (uint8_t c = 0; c < MC_N_CHANNELS; c++)
+            if (n->ka_idle[c] < MC_STAR_QUIET_TICKS) { quiet = 0; break; }
+        if (quiet && iv / 2 >= MC_STAR_FLOOR_TICKS) iv /= 2;
+    }
+    n->timer(n, iv * MC_KEEPALIVE_TICK_US
+             + (n->rand(n) % MC_KEEPALIVE_TICK_US), star_round_tick, 0);
+}
+
+/* Heartbeat tick match (4.3): the received digest fits when it was
+ * computed from the same content hash at stored_tick + k, for small
+ * k. The window is SYMMETRIC: a catalogue may lag behind our stored
+ * tick (a slower route carried the newer tick here first, 4.3) - an
+ * older advertisement with the same content hash still confirms the
+ * content. Return convention: 0 = exact, 1..k_max = the advertisement
+ * is AHEAD (advance the stored tick by k), 17..16+k_max = the
+ * advertisement LAGS by (r - 16) (keep the stored tick, only the age
+ * refreshes), -1 = no fit (a real content change, or an unknown
+ * star). The two windows cannot collide with the sentinel. */
+#define MC_TICK_LAG_BASE 16
+int mimeshi_star_tick_match(uint8_t received, uint8_t content_hash,
+                           uint8_t stored_tick, uint8_t k_max) {
+    if (received == mimeshi_star_digest(content_hash, stored_tick)) return 0;
+    for (uint8_t k = 1; k <= k_max; k++) {
+        if (received == mimeshi_star_digest(content_hash,
+                                            (uint8_t)(stored_tick + k)))
+            return (int)k;
+        if (received == mimeshi_star_digest(content_hash,
+                                            (uint8_t)(stored_tick - k)))
+            return (int)k + MC_TICK_LAG_BASE;
+    }
+    return -1;
+}
+
 /* ---------------- route computation (10.2, building block 2) ------
  * Stateless per message: no path in the header, every hop computes its
  * own first step on the own known graph. Cost model (decided, Oct
@@ -569,6 +1420,16 @@ static uint16_t route_age_mult(uint32_t age) {
     return 0;
 }
 
+/* Liveness de-weight (4.4): a star whose origin tick has stalled for
+ * more than half the liveness threshold costs like a half-stale entry
+ * - the routes move away from possibly-dead knowledge before the
+ * eviction takes it out entirely. */
+static uint16_t route_live_mult(mimeshi_node *n, mimeshi_mapnode *m) {
+    if (m->id == n->id) return 0;               /* the own star is alive by definition */
+    if (n->tick - m->star_tick_seen < MC_STAR_DEAD_TICKS / 2) return 0;
+    return 2;
+}
+
 static uint32_t mult_apply(uint32_t c, uint16_t m) {
     if (m == 3) return c * 3;
     if (m == 2) return c * 3 / 2;
@@ -583,7 +1444,11 @@ static uint32_t route_edge_own(mimeshi_node *n, mimeshi_neighbor *nb) {
     uint8_t cls = adv_class_of(nb->quality);
     uint32_t c = (cls < 8 && mc_etx_class[cls]) ? mc_etx_class[cls] : MC_ROUTE_SCALE;
     mimeshi_mapnode *m = map_find(n, nb->id);
-    if (m) c = mult_apply(c, route_age_mult(map_age_ticks(n, m)));
+    if (m) {
+        c = mult_apply(c, route_age_mult(map_age_ticks(n, m)));
+        {   uint16_t lm = route_live_mult(n, m);
+            if (lm) c = mult_apply(c, lm); }
+    }
     return c;
 }
 
@@ -648,6 +1513,9 @@ static uint16_t route_next_hop_ex(mimeshi_node *n, uint16_t dst,
         if (u < 0 || u == di) break;              /* nothing left, or target settled */
         r_done[u] = 1;
         uint16_t mult_u = route_age_mult(map_age_ticks(n, &n->map[u]));
+    {   uint16_t lm = route_live_mult(n, &n->map[u]);
+        if (lm) mult_u = (uint16_t)(mult_u ? (mult_u * lm) / 2 * 2 : lm); }
+
         for (int j = 0; j < MC_MAX_LINKS; j++) {           /* relax the edges of map[u] */
             mimeshi_link *l = &n->lnk[j];
             if (!l->alive) continue;
@@ -662,6 +1530,8 @@ static uint16_t route_next_hop_ex(mimeshi_node *n, uint16_t dst,
             int oi = r_idx(n, o);
             if (oi < 0 || r_done[oi]) continue;
             c = mult_apply(c, route_age_mult(map_age_ticks(n, &n->map[oi])));
+            {   uint16_t lm = route_live_mult(n, &n->map[oi]);
+                if (lm) c = mult_apply(c, lm); }
             if (r_dist[u] + c < r_dist[oi]) { r_dist[oi] = r_dist[u] + c; r_prev[oi] = (uint16_t)u; }
         }
     }
@@ -757,238 +1627,17 @@ static uint16_t route_bridge_node(mimeshi_node *n, uint16_t lat, uint16_t lon,
 
 
 
-/* Delta chunk (4.3): a single changed entry, for neighbour
- * additions. A new neighbour has no links in our link store yet (they
- * appear only once its own chunks arrive), so the delta is tiny: 19 B,
- * 173 ms - versus ceil(sym/8) x 869 ms for a whole-prefix round. The
- * receiver processes it like any prefix entry (self-contained chunks),
- * and the full prefix still follows in the normal cadence: the delta
- * buys speed, the rounds buy consistency. */
-static void delta_send(mimeshi_node *n, uint16_t id) {
-    mimeshi_neighbor *nb = nbr_find(n, id);
-    if (!nb || !nb->alive || !nb->sym) return;
-    uint8_t p[19 + 3 * 4];
-    wr16(p + 1, n->id);
-    p[3] = n->chunk_nr++;
-    p[4] = 1;                                     /* one entry */
-    wr16(p + 5, n->geo_lat); wr16(p + 7, n->geo_lon);
-    p[9] = 1;
-    p[10] = (uint8_t)(PKT_TABLE_CHUNK | F_DELTA);
-    wr16(p + 11, nb->id);
-    p[13] = (uint8_t)((adv_class_of(nb->quality) << 4) | adv_class_of(nb->rev_quality));
-    p[14] = 0;                                    /* direct measurement: fresh */
-    mimeshi_mapnode *m = map_find(n, nb->id);
-    if (m && m->geo_lat) { wr16(p + 15, m->geo_lat); wr16(p + 17, m->geo_lon); }
-    else { wr16(p + 15, 0); wr16(p + 17, 0); }
-    p[19] = 0;                                    /* link count: a new neighbour has none yet */
-    for (uint8_t k = 0; k < MC_N_CHANNELS; k++) {
-        uint8_t c = (uint8_t)((n->home_ch + 1 + k) % MC_N_CHANNELS);
-        bound_send(n, c, p, 20, t_data_us(20));
-        ka_called(n, c);
-    }
-}
-
-/* Negative delta (4.4): one entry gone. Same shape as the delta, but
- * the entry id names the dead neighbour; a receiver deletes the
- * link-owner -> dead node from its store (links between others stay:
- * a different source may still carry them). Expire-then-silence is the
- * normal removal (4.4: no tombstone); the negative delta only makes
- * the routing core adapt within minutes. */
-static void delta_neg_send(mimeshi_node *n, uint16_t id) {
-    uint8_t p[20];
-    p[0] = (uint8_t)(PKT_TABLE_CHUNK | F_DELTA | F_NEG);
-    wr16(p + 1, n->id);
-    p[3] = n->chunk_nr++;
-    p[4] = 1;
-    wr16(p + 5, n->geo_lat); wr16(p + 7, n->geo_lon);
-    p[9] = 1;
-    wr16(p + 10, id);
-    p[12] = 0; p[13] = 255;                        /* no classes; age 255 = expired */
-    wr16(p + 14, 0); wr16(p + 16, 0);              /* no geo */
-    p[18] = 0;                                     /* no links */
-    for (uint8_t k = 0; k < MC_N_CHANNELS; k++) {
-        uint8_t c = (uint8_t)((n->home_ch + 1 + k) % MC_N_CHANNELS);
-        bound_send(n, c, p, 19, t_data_us(19));
-        ka_called(n, c);
-    }
-}
-
-/* Tail chunk (4.3): the 2-hop map as full entries. Same format as the
- * prefix chunk, flagged with F_TAIL. Entries are map nodes that are NOT
- * direct neighbours; their links come from the link store (classes per
- * direction). The tail cycles through the periodic re-shares via
- * tail_cursor: one tail chunk per re-share keeps the airtime bounded
- * (4.3 rising cadence), a full tail thereby passes in a few days.
- * Age per entry: effective age in proof ticks (4.4), capped at 255. */
-static void tail_chunk_send(mimeshi_node *n) {
-    uint8_t p[230];
-    uint16_t len = 10;
-    uint8_t cnt = 0;
-    int start = n->tail_cursor;
-    for (int k = 0; k < MC_MAP_NODES && cnt < MC_CHUNK_MAX_ENTRIES && len + 9 <= 230; k++) {
-        int i = (start + k) % MC_MAP_NODES;
-        mimeshi_mapnode *m = &n->map[i];
-        if (!m->alive) continue;
-        if (nbr_find(n, m->id)) continue;               /* direct neighbours: prefix work */
-        wr16(p + len, m->id);
-        /* both directions in one byte, like the prefix (6.2, 4.3): the
-         * forwarded class in the high nibble - the class our source
-         * advertised for owner->entry; reverse nibble 0 = not reported
-         * by the entry itself. A class 0 only when never reported. */
-        p[len + 2] = (uint8_t)(adv_class_of(m->quality) << 4);
-        p[len + 3] = map_age_eff(n, m);
-        wr16(p + len + 4, m->geo_lat); wr16(p + len + 6, m->geo_lon);
-        uint16_t lcnt_off = len + 8;
-        len += 9;
-        uint8_t lcnt = 0;
-        for (int j = 0; j < MC_MAP_NODES && len + 3 <= 230; j++) {
-            mimeshi_mapnode *m2 = &n->map[j];
-            if (!m2->alive || m2->id == m->id) continue;
-            uint8_t cf = lnk_class(n, m->id, m2->id);
-            if (cf == 0xFF) continue;
-            uint8_t cr = lnk_class(n, m2->id, m->id);
-            wr16(p + len, m2->id);
-            p[len + 2] = (uint8_t)((cf << 4) | (cr == 0xFF ? 0 : cr));
-            len += 3; lcnt++;
-        }
-        p[lcnt_off] = lcnt;
-        cnt++;
-        n->tail_cursor = (uint8_t)((i + 1) % MC_MAP_NODES);
-    }
-    if (cnt == 0) { n->tail_cursor = 0; return; }        /* empty tail: next time from the top */
-    p[0] = (uint8_t)(PKT_TABLE_CHUNK | F_TAIL);
-    wr16(p + 1, n->id);
-    p[3] = n->chunk_nr++;
-    p[4] = cnt;
-    wr16(p + 5, n->geo_lat); wr16(p + 7, n->geo_lon);
-    p[9] = 1;
-    for (uint8_t k = 0; k < MC_N_CHANNELS; k++) {
-        uint8_t c = (uint8_t)((n->home_ch + 1 + k) % MC_N_CHANNELS);
-        bound_send(n, c, p, len, t_data_us(len));
-        ka_called(n, c);
-    }
-}
-
-static void chunk_send(mimeshi_node *n);
-
-/* Whole prefix in one push round: mutations are urgent (4.3 cadence
- * speed 1), so every chunk follows back to back. A round starts at
- * table position 0 and ends when the cursor has come fully around:
- * the number of chunks follows from what actually fits per chunk
- * (230 B packet, 9 B per entry + 3 B per inter-neighbour link), not
- * from the table size alone. A fixed ceil(sym/8) rounds off the
- * count while entries get thicker as the link store fills - every
- * round then shared the same first ~21 of 26 neighbours and never
- * the tail (measured under load: the leaf neighbours of a hub
- * vanished from its prefix forever, and the network 'forgot' them
- * at the 24 h map eviction). The guard bounds the loop; a chunk
- * with cnt 0 resets the cursor to 0, and no cursor progress also
- * ends the round. */
-static void chunk_send_all(mimeshi_node *n) {
-    uint16_t sym = 0;
-    int last = -1;
-    for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
-        if (n->nbr[i].alive && n->nbr[i].sym) { sym++; last = i; }
-    if (sym == 0) return;
-    uint8_t end = (uint8_t)((last + 1) % MC_MAX_NEIGHBORS);   /* one past the last entry */
-    n->chunk_cursor = 0;
-    for (uint16_t guard = 0; guard <= MC_MAX_NEIGHBORS; guard++) {
-        uint8_t before = n->chunk_cursor;
-        chunk_send(n);
-        if (n->chunk_cursor == 0 || n->chunk_cursor == before
-            || n->chunk_cursor == end) break;   /* round complete: cursor passed the last entry */
-    }
-}
-
-static void chunk_send(mimeshi_node *n) {
-    uint8_t p[230];
-    uint16_t len = 10;
-    uint8_t cnt = 0;
-    int start = n->chunk_cursor;                  /* continuation: the table cycles (4.3) */
-    for (int k = 0; k < MC_MAX_NEIGHBORS && cnt < MC_CHUNK_MAX_ENTRIES && len + 9 <= 230; k++) {
-        int i = (start + k) % MC_MAX_NEIGHBORS;
-        mimeshi_neighbor *nb = &n->nbr[i];
-        if (!nb->alive || !nb->sym) continue;      /* only confirmed symmetric (4.3) */
-        wr16(p + len, nb->id);
-        /* both directions in one byte (6.2, 4.3): our measured EWMA
-         * class, and the class the neighbour reported about us (its
-         * ack quality byte, rev_quality). 0 = the reverse direction is
-         * not yet known (the neighbour has not acked us recently). */
-        p[len + 2] = (uint8_t)((adv_class_of(nb->quality) << 4)
-                              | adv_class_of(nb->rev_quality));
-        p[len + 3] = 0;                            /* direct measurement: fresh */
-        mimeshi_mapnode *m = map_find(n, nb->id);
-        if (m && m->geo_lat) { wr16(p + len + 4, m->geo_lat); wr16(p + len + 6, m->geo_lon); }
-        else { wr16(p + len + 4, 0); wr16(p + len + 6, 0); }
-        uint16_t lcnt_off = len + 8;
-        len += 9;
-        uint8_t lcnt = 0;
-        for (int j = 0; j < MC_MAX_NEIGHBORS && len + 3 <= 230; j++) {
-            if (j == i) continue;
-            mimeshi_neighbor *nb2 = &n->nbr[j];
-            if (!nb2->alive || !nb2->sym) continue;
-            uint8_t cf = lnk_class(n, nb->id, nb2->id);
-            if (cf == 0xFF) continue;              /* never heard about this pair */
-            uint8_t cr = lnk_class(n, nb2->id, nb->id);
-            wr16(p + len, nb2->id);
-            p[len + 2] = (uint8_t)((cf << 4) | (cr == 0xFF ? 0 : cr));
-            len += 3; lcnt++;
-        }
-        p[lcnt_off] = lcnt;
-        cnt++;
-        n->chunk_cursor = (uint8_t)((i + 1) % MC_MAX_NEIGHBORS);   /* continue here next push */
-    }
-    if (cnt == 0) { n->chunk_cursor = 0; return; } /* nothing to share yet */
-    p[0] = PKT_TABLE_CHUNK;
-    wr16(p + 1, n->id);
-    p[3] = n->chunk_nr++;
-    p[4] = cnt;
-    wr16(p + 5, n->geo_lat); wr16(p + 7, n->geo_lon);
-    p[9] = 1;                                     /* firmware version */
-    /* All three channels, in fixed order — the same reason as the hello
-     * round (2): confirmed neighbours sit on all home channels. A chunk
-     * on the own home channel alone would reach only the same-channel
-     * third; the links between cross-channel neighbours would then never
-     * propagate and the 2-hop map would stay blind for exactly the
-     * links that Gabriel and route choice need. Cost per chunk: 3 x
-     * 869 ms air per push round; a full tower table stays far under the
-     * duty limit. The push bundling (one chunk per window) caps the
-     * rate; the pool has a slot per transmission like the hello round.
-     * The round STARTS at (home + 1) mod 3 and thereby ENDS on the own
-     * home channel: no switch left over, and the neighbours there can
-     * react (snooping, later the generalised ack, 12.16) immediately. */
-    for (uint8_t k = 0; k < MC_N_CHANNELS; k++) {
-        uint8_t c = (uint8_t)((n->home_ch + 1 + k) % MC_N_CHANNELS);
-        bound_send(n, c, p, len, t_data_us(len));
-        ka_called(n, c);                          /* own call on c (4.1) */
-    }
-}
-
-static void tbl_push_fire(mimeshi_node *n, void *ud) {
-    (void)ud;
-    n->tbl_push_sched = 0;
-    if (!n->tbl_dirty) return;
-    n->tbl_dirty = 0;
-    chunk_send_all(n);                 /* mutation: the whole prefix, back to back (4.3) */
-}
-
 /* Reception of a table chunk (4.3). Self-contained: every entry is
  * processed on its own against the own map and link store. The owner
  * naming US in an entry is reverse-direction evidence for the link
  * owner->us (10.1) — gated on quality like every confirmation. */
 static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t len) {
+    chunk_rx_mode(n, rssi, pkt, len, 0);
+}
+static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
+                          uint16_t len, int star_mode) {
     if (len < 10) return;
     uint16_t owner = rd16(pkt + 1);
-    if (pkt[0] & F_NEG) {                     /* negative delta (4.4): one entry gone */
-        if (len >= 19) {
-            uint16_t dead = rd16(pkt + 10);
-            mimeshi_link *l = lnk_find(n, owner, dead);
-            if (l) l->alive = 0;              /* the owner->dead link disappears here */
-            /* the map entry itself stays: a different source may still
-             * carry the node; its own age decides whether it expires */
-        }
-        return;
-    }
     uint8_t n_ent = pkt[4];
     mimeshi_mapnode *om = map_add(n, owner);
     if (om) {
@@ -1003,18 +1652,17 @@ static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t 
     for (uint8_t e = 0; e < n_ent && off + 9 <= len; e++) {
         uint16_t eid = rd16(pkt + off);
         uint8_t qbyte = pkt[off + 2];
-        uint8_t cls = qbyte >> 4;              /* owner->entry class (4.3) */
-        uint8_t rcls = qbyte & 0x07;           /* entry->owner class (its reported rev quality) */
+        uint8_t cls = qbyte >> 4;              /* origin->entry class (4.3) */
         uint8_t age = pkt[off + 3];
         uint16_t gl = rd16(pkt + off + 4), go = rd16(pkt + off + 6);
         uint8_t lcnt = pkt[off + 8];
         off += 9;
-        if (eid == n->id) {                    /* owner names us: reverse evidence (10.1) */
+        if (eid == n->id) {                    /* the origin's own entry naming US: reverse evidence (10.1) */
             if (nb) {
                 nb->proven_age_us = 0;
-                /* the owner's entry class for us IS its measurement of
+                /* the origin's entry class for us IS its measurement of
                  * our signal: our reverse quality, refreshed with every
-                 * chunk that names us (6.2) — no extra airtime */
+                 * star that names us (6.2) — no extra airtime */
                 uint8_t oq = quality_from_class(cls);
                 nb->rev_quality = quality_ewma(nb->rev_quality ? nb->rev_quality : oq, oq);
                 if (quality_ok(nb->quality)) {
@@ -1022,31 +1670,97 @@ static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t 
                     nb->sym = 1; nb->ack_try = 0;
                 }
             }
+            /* our entry in the origin's star carries the origin's links,
+             * ours included: consume them like every entry's links and
+             * store them as received (the owner's advertised form of OUR
+             * link is routing material, 4.3) - the link loop below runs
+             * for this entry too. */
+            for (uint8_t k = 0; k < lcnt && off + 3 <= len; k++) {
+                uint16_t peer = rd16(pkt + off);
+                uint8_t lb = pkt[off + 2];
+                off += 3;
+                if (peer == n->id || peer == owner) continue;  /* our own entry in
+                    the origin's star names only us; a self-link does not exist */
+                mimeshi_mapnode *pm = map_add(n, peer);  /* named by the link (10.1) */
+                if (pm) { pm->age_ticks = age; pm->arrived_tick = n->tick; }
+                lnk_set_class(n, eid, peer, (uint8_t)(lb >> 4));
+                lnk_set_class(n, peer, eid, (uint8_t)(lb & 0x0F));
+            }
         } else {
             mimeshi_mapnode *em = map_add(n, eid);
-            if (em) {
-                if (gl) { em->geo_lat = gl; em->geo_lon = go; }   /* (0,0) = none (5) */
-                uint8_t travelled = age;
-                if (cls && (!em->quality || travelled < map_age_eff(n, em))) {
-                    /* forwarded non-zero class beats old (4.3); a class 0
-                     * never overwrites a stored quality (the geo above
-                     * still refreshes; the age belongs to the quality
-                     * evidence): no source ever reported it */
-                    em->quality = quality_from_class(cls);
-                    em->age_ticks = travelled; em->arrived_tick = n->tick;
-                }
+            int stale = 0;
+            if (em && star_mode) {
+                /* fresh beats old on CONTENT (4.3): a form whose
+                 * advertised entry byte differs from the stored one is
+                 * only accepted when its heartbeat tick is AHEAD of
+                 * the stored tick - a differing form at an equal or
+                 * older tick is a stale copy racing a newer one (a
+                 * slow route, a missed-list answer) and must not roll
+                 * the newer knowledge back. Identical content is
+                 * always fine (an echo refreshes nothing but the
+                 * age). Geo and presence still refresh - map
+                 * material is never wasted. */
+                int16_t ahead = (int16_t)((int16_t)age - (int16_t)em->star_tick);
+                if (em->adv_q && qbyte != em->adv_q && ahead <= 0)
+                    stale = 1;
             }
-            lnk_set_class(n, owner, eid, cls); /* owner -> entry */
-            if (rcls) lnk_set_class(n, eid, owner, rcls);  /* entry -> owner, if reported */
-        }
-        for (uint8_t k = 0; k < lcnt && off + 3 <= len; k++) {
-            uint16_t peer = rd16(pkt + off);
-            uint8_t lb = pkt[off + 2];
-            off += 3;
-            if (peer == n->id) continue;       /* link to us: covered by our own entry */
-            map_add(n, peer);                 /* presence in the 2-hop set (10.1) */
-            lnk_set_class(n, eid, peer, (uint8_t)(lb >> 4));
-            lnk_set_class(n, peer, eid, (uint8_t)(lb & 0x0F));
+            if (em && !stale) {
+                if (gl) { em->geo_lat = gl; em->geo_lon = go; }   /* (0,0) = none (5) */
+                /* storage as received (4.3): the entry class byte is
+                 * stored exactly as the origin advertised it - reproduced
+                 * unchanged on every hop, hashed by the content hash.
+                 * The local quality (our own measurement of the node's
+                 * signal, refreshed below on any identifying reception)
+                 * stays separate: routing material, never forwarded. */
+                em->adv_q = qbyte;
+                em->age_ticks = age; em->arrived_tick = n->tick;
+            }
+            /* the star's links: claims of the ORIGIN (eid), stored as
+             * received (4.3) - the link store is the forwarded picture,
+             * the advertised forms of the owning stars. Skipped for a
+             * stale form: its link claims belong to the older copy. */
+            if (!stale) {
+                for (uint8_t k = 0; k < lcnt && off + 3 <= len; k++) {
+                    uint16_t peer = rd16(pkt + off);
+                    uint8_t lb = pkt[off + 2];
+                    off += 3;
+                    if (peer == n->id) {
+                        /* the origin's (eid's) link to US: reverse-direction
+                         * evidence (10.1) - the high nibble is the origin's
+                         * measurement of our signal, the low nibble our class
+                         * as it reported it. Only meaningful when the origin
+                         * is a direct neighbour of ours (the claim reaches us
+                         * possibly via a forwarder, 4.3). The link itself is
+                         * stored as received like every other claim (4.3):
+                         * the owner's advertised form of OUR link is routing
+                         * material - the old cadence covered it in our own
+                         * entry, the star round carries it only here. */
+                        lnk_set_class(n, eid, peer, (uint8_t)(lb >> 4));
+                        lnk_set_class(n, peer, eid, (uint8_t)(lb & 0x0F));
+                        mimeshi_neighbor *enb = nbr_find(n, eid);
+                        if (enb) {
+                            enb->proven_age_us = 0;
+                            uint8_t oq = quality_from_class((uint8_t)(lb >> 4));
+                            enb->rev_quality = quality_ewma(enb->rev_quality ? enb->rev_quality : oq, oq);
+                            if (quality_ok(enb->quality)) {
+                                if (!enb->sym) tbl_nbr_added(n, eid);
+                                enb->sym = 1; enb->ack_try = 0;
+                            }
+                        }
+                        continue;
+                    }
+                    mimeshi_mapnode *pm = map_add(n, peer);  /* named by the link (10.1) */
+                    if (pm) {
+                        /* the peer is exactly as fresh as the star that named
+                         * it: the origin just advertised knowledge of it. */
+                        pm->age_ticks = age; pm->arrived_tick = n->tick;
+                    }
+                    lnk_set_class(n, eid, peer, (uint8_t)(lb >> 4));
+                    lnk_set_class(n, peer, eid, (uint8_t)(lb & 0x0F));
+                }
+            } else {
+                off += 3 * lcnt;                /* skip the stale form's links */
+            }
         }
     }
 }
@@ -1055,23 +1769,19 @@ static void nbr_expire(mimeshi_node *n);
 
 /* Death detection (4.4): every identifying reception refreshes
  * last_seen; per proof tick it ages. At T_expire (~4 h) the neighbour
- * is dead: the entry disappears from our table (no tombstone, 4.4),
- * which means it also disappears from every chunk and proof list we
- * send - silence propagates the removal. A negative delta (F_NEG)
- * announces the removal to the neighbours immediately: the routing
- * core adapts within minutes instead of waiting for the rounds. */
+ * is dead: the entry disappears from our table, and with it from our
+ * own star - silence plus the round propagates the removal (4.4:
+ * no tombstone, no negative delta). */
 static void nbr_expire(mimeshi_node *n) {
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
         mimeshi_neighbor *nb = &n->nbr[i];
         if (!nb->alive) continue;
         if (nb->last_seen < 0xFFFF) nb->last_seen++;
         if (nb->last_seen >= MC_T_EXPIRE_TICKS) {
-            uint16_t dead_id = nb->id;
             nb->alive = 0; nb->sym = 0; nb->ack_try = 0;
             nb->quality = 0; nb->rev_quality = 0; nb->proven_age_us = 0;
-            tbl_mark_dirty(n);              /* the prefix loses the entry (4.3) */
-            delta_neg_send(n, dead_id);     /* negative delta: link gone (4.4) */
-            printf("[core] node %u: neighbour %u expired after ~4 h of silence\n", n->id, dead_id);
+            tbl_mark_dirty(n);              /* the own star loses the link (4.3) */
+            printf("[core] node %u: neighbour %u expired after ~4 h of silence\n", n->id, nb->id);
         }
     }
 }
@@ -1085,21 +1795,20 @@ static void proof_tick(mimeshi_node *n, void *ud) {
      * cadence and only takes pool space from fresher knowledge. */
     for (int i = 0; i < MC_MAP_NODES; i++) {
         if (!n->map[i].alive) continue;
+        if (n->map[i].id == n->id) continue;   /* the own entry: alive by definition */
         if (nbr_find(n, n->map[i].id)) continue;           /* prefix work */
+        /* liveness axis (4.4): a star whose origin tick has not advanced
+         * for the threshold is dead, whatever the freshness of the
+         * forwarded copies - the echo cannot fake a tick. Direct
+         * neighbours live in the neighbor table (last_seen, 4.4). */
+        if (n->tick - n->map[i].star_tick_seen >= MC_STAR_DEAD_TICKS) {
+            printf("[core] node %u: star %u dead (tick stalled %lu ticks)\n",
+                   n->id, n->map[i].id, (unsigned long)(n->tick - n->map[i].star_tick_seen));
+            map_evict(n, &n->map[i]);
+            continue;
+        }
         if (map_age_ticks(n, &n->map[i]) >= 2 * MC_T_ACTIVE_TICKS)
             map_evict(n, &n->map[i]);
-    }
-    /* Periodic prefix re-share (4.3): without traffic there are no
-     * mutations, and a chunk missed by a neighbour (collision, away
-     * from home) would then never return. Every MC_TBL_PERIOD_TICKS
-     * (~6 h) the prefix goes out again once -- every chunk thereby
-     * comes by at least a few times per day on average, at a fraction
-     * of the airtime of the old 10-min re-share. The per-node phase
-     * offset (id mod period) spreads the moments; the random jitter
-     * in the bundling window adds the fine spreading. */
-    if ((n->tick + (n->id % MC_TBL_PERIOD_TICKS)) % MC_TBL_PERIOD_TICKS == 0) {
-        tbl_mark_dirty(n);
-        tail_chunk_send(n);                    /* tail: one chunk per re-share (4.3) */
     }
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++)          /* evidence ages per tick (4.2) */
         if (n->nbr[i].alive && n->nbr[i].proven_age_us < MC_T_SYM_US)
@@ -1621,6 +2330,10 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         chunk_rx(n, rssi, pkt, len);
         break;
     }
+    case PKT_STAR_ROUND: {
+        star_round_rx(n, rssi, pkt, len);
+        break;
+    }
     case PKT_DATA: {
         uint16_t msg_id = rd16(pkt + 1), src = rd16(pkt + 3), dst = rd16(pkt + 5), prev = rd16(pkt + 7);
         /* next-hop addressing (6.1): only the hop the sender chose
@@ -1753,4 +2466,11 @@ void mimeshi_start(mimeshi_node *n) {
     n->timer(n, n->hello_interval_us + hello_jitter(n), hello_tick, 0);
     /* proof tick: time base for keepalive + symmetry flush (4.1, 4.2) */
     n->timer(n, MC_KEEPALIVE_TICK_US, proof_tick, 0);
+    /* star round (4.3): the uniform convergence cadence - the first
+     * round after a random phase so simultaneous boots do not sync. */
+    n->star_own_ctr = 0;
+    n->star_tick = 0;
+    n->star_round_sched = 1;
+    n->timer(n, (n->rand(n) % MC_STAR_ROUND_TICKS) * MC_KEEPALIVE_TICK_US,
+             star_round_tick, 0);
 }

@@ -75,27 +75,59 @@ static void confirm_sym(mimeshi_node *hsender, uint16_t responder, int8_t rssi) 
     mimeshi_rx(hsender, (uint8_t)(hsender->id % MC_N_CHANNELS), rssi, ha, 6);
 }
 
-/* Build a prefix chunk (4.3 format): owner with two entries e1 and e2
- * (class in both nibbles, given age), plus a mutual link e1<->e2 of
- * the given class if link_cls > 0. Returns the length. */
+/* Build a star-round content packet in the 4.3 wire form: the star of
+ * `origin` - its entry (classes in both nibbles) plus the links the
+ * origin OWNS. Ownership follows the 4.3 rule (one bit of a CRC-8
+ * over the normalised pair); the helper mirrors the core so the test
+ * injects exactly what the owner's star carries on air. A wanted link
+ * toward `peer` (class both nibbles) is included when the origin owns
+ * it; the caller passes the owner-side node as `origin`. */
+static uint8_t t_pair_bit(uint16_t x, uint16_t y) {
+    uint16_t a = x < y ? x : y, b = x < y ? y : x;
+    uint8_t bytes[4] = { (uint8_t)a, (uint8_t)(a >> 8), (uint8_t)b, (uint8_t)(b >> 8) };
+    uint8_t crc = 0;
+    for (int i = 0; i < 4; i++) {
+        crc ^= bytes[i];
+        for (int k = 0; k < 8; k++)
+            crc = (uint8_t)((crc & 0x80) ? (crc << 1) ^ 0x07 : crc << 1);
+    }
+    return (uint8_t)(crc & 1);
+}
+static uint16_t t_owner(uint16_t x, uint16_t y) {
+    uint16_t a = x < y ? x : y, b = x < y ? y : x;
+    return t_pair_bit(x, y) ? a : b;
+}
+static uint16_t star_build(uint8_t *ck, uint16_t origin,
+                            uint8_t cls, uint8_t age,
+                            const uint16_t *peers, const uint8_t *lcls,
+                            uint8_t nlinks) {
+    uint16_t len = 10;
+    ck[0] = 4; r16w(ck + 1, origin); ck[3] = 0; ck[4] = 1;
+    r16w(ck + 5, 100); r16w(ck + 7, 200); ck[9] = 1;
+    r16w(ck + len, origin); ck[len + 2] = (uint8_t)((cls << 4) | cls);
+    ck[len + 3] = age; r16w(ck + len + 4, 0); r16w(ck + len + 6, 0);
+    ck[len + 8] = nlinks; len += 9;
+    for (uint8_t i = 0; i < nlinks; i++) {
+        r16w(ck + len, peers[i]); ck[len + 2] = lcls[i];
+        len += 3;
+    }
+    return len;
+}
+/* the OLD helper name, kept for the few one-entry injection sites:
+ * one star of `owner` (entry e1, classes cls1) that owns the link
+ * toward e2 with the given class - the 4.3 claim "owner knows e2". */
 static uint16_t chunk_build(uint8_t *ck, uint16_t owner,
                             uint16_t e1, uint8_t cls1, uint8_t age1,
                             uint16_t e2, uint8_t cls2, uint8_t age2,
                             uint8_t link_cls) {
-    uint16_t len = 10;
-    ck[0] = 4; r16w(ck + 1, owner); ck[3] = 0; ck[4] = 2;
-    r16w(ck + 5, 100); r16w(ck + 7, 200); ck[9] = 1;
-    r16w(ck + len, e1); ck[len + 2] = (uint8_t)((cls1 << 4) | cls1);
-    ck[len + 3] = age1; r16w(ck + len + 4, 0); r16w(ck + len + 6, 0);
-    ck[len + 8] = link_cls ? 1 : 0; len += 9;
-    r16w(ck + len, e2); ck[len + 2] = (uint8_t)((cls2 << 4) | cls2);
-    ck[len + 3] = age2; r16w(ck + len + 4, 0); r16w(ck + len + 6, 0);
-    ck[len + 8] = 0; len += 9;
-    if (link_cls) {
-        r16w(ck + len, e2); ck[len + 2] = (uint8_t)((link_cls << 4) | link_cls);
-        len += 3;
+    (void)e1; (void)e2; (void)cls2; (void)age2;
+    uint16_t peers[1]; uint8_t lcls[1]; uint8_t nlinks = 0;
+    if (link_cls && t_owner(owner, e2) == owner) {
+        peers[0] = e2;
+        lcls[0] = (uint8_t)((link_cls << 4) | link_cls);
+        nlinks = 1;
     }
-    return len;
+    return star_build(ck, owner, cls1, age1, peers, lcls, nlinks);
 }
 
 /* --- chain radio: four wired nodes, switch rule applied --------- */
@@ -244,13 +276,23 @@ int main(void) {
         assert(symB == 1 && symC == 1 && symD == 1);
     }
 
-    /* The graph: C and D each share a chunk naming B with a good class,
-     * so A knows the paths C->B (class 7) and D->B (class 6). */
+    /* The graph: A learns the paths C->B (class 7) and D->B (class 6)
+     * from the stars of the link OWNERS (4.3): C owns {C,B}, so C's
+     * star carries the link; {D,B} is owned by B, so B's star carries
+     * it. Injected at A as star-round content packets. */
     uint8_t ck[64];
-    uint16_t len = chunk_build(ck, idC, A.id, 7, 0, idB, 7, 0, 0);
-    mimeshi_rx(&A, (uint8_t)(idC % MC_N_CHANNELS), -60, ck, len);
-    len = chunk_build(ck, idD, A.id, 7, 0, idB, 6, 0, 0);
-    mimeshi_rx(&A, (uint8_t)(idD % MC_N_CHANNELS), -70, ck, len);
+    {
+        uint16_t peers[1] = { idB };
+        uint8_t lcls[1] = { 0x77 };
+        uint16_t len = star_build(ck, idC, 7, 0, peers, lcls, 1);
+        mimeshi_rx(&A, (uint8_t)(idC % MC_N_CHANNELS), -60, ck, len);
+    }
+    {
+        uint16_t peers[1] = { idD };
+        uint8_t lcls[1] = { 0x66 };
+        uint16_t len = star_build(ck, idB, 7, 0, peers, lcls, 1);
+        mimeshi_rx(&A, (uint8_t)(idB % MC_N_CHANNELS), -70, ck, len);
+    }
 
     /* B is also in the map (via C's and D's entries). */
     {
@@ -279,8 +321,8 @@ int main(void) {
      * (10.2). Refused, no flood. */
     {
         uint8_t ck2[64];
-        uint16_t l2 = chunk_build(ck2, idC, A.id, 7, 0, 0x0C0C, 0, 0, 0);
-        mimeshi_rx(&A, (uint8_t)(idC % MC_N_CHANNELS), -60, ck2, l2);
+        uint16_t l2 = star_build(ck2, 0x0C0C, 7, 0, 0, 0, 0);
+        mimeshi_rx(&A, (uint8_t)(0x0C0C % MC_N_CHANNELS), -60, ck2, l2);
         int inmap = 0;
         for (int i = 0; i < MC_MAP_NODES; i++)
             if (A.map[i].alive && A.map[i].id == 0x0C0C) inmap = 1;
@@ -294,8 +336,18 @@ int main(void) {
      * the C-route costs 1.5x and D wins. */
     mimeshi_start(&A);                       /* starts the proof tick (~56 s) */
     pump_until(400 * 60000000ull);            /* ~6.3 h: C and D entries now stale */
-    len = chunk_build(ck, idD, A.id, 7, 0, idB, 6, 0, 0);
-    mimeshi_rx(&A, (uint8_t)(idD % MC_N_CHANNELS), -70, ck, len);   /* D fresh again */
+    /* D comes back as a confirmed neighbour the way the protocol does
+     * it: a hello ack addressed to us (4.2) - neighbour freshness is
+     * the hello/ack/traffic path, not a star reception. C stays
+     * silent: its entries keep the stale age. The D->B link class 6
+     * arrives as B's owned star (4.3). */
+    confirm_sym(&A, idD, -70);
+    {
+        uint16_t peers[1] = { idD };
+        uint8_t lcls[1] = { 0x66 };
+        uint16_t l3 = star_build(ck, idB, 7, 0, peers, lcls, 1);
+        mimeshi_rx(&A, (uint8_t)(idB % MC_N_CHANNELS), -70, ck, l3);
+    }
     data_tx = 0;
     assert(mimeshi_send_data(&A, idB, (const uint8_t *)"route me", 8, false, 0, 0) == 0);
     pump_until(now + 50000ull);
@@ -322,13 +374,19 @@ int main(void) {
         f_confirm(&A, idn[1]); f_confirm(&B, idn[0]);
         f_confirm(&B, idn[2]); f_confirm(&C, idn[1]);
         f_confirm(&C, idn[3]); f_confirm(&D, idn[2]);
-        /* the graph: B shares (A, C), C shares (B, D) - so A knows the
-         * path A-B-C-D, B knows B-C-D, C knows C-D */
+        /* the graph under link ownership (4.3): C owns BOTH {B,C} and
+         * {C,D} (per-link hash bit), so C's star carries the two
+         * links - A learns the path A-B-C-D from it: A-B is an own
+         * edge, B-C and C-D travel in C's star. B owns nothing on
+         * the line ({A,B} belongs to A), and B needs no map links:
+         * its next hops A and C are direct neighbours. */
         uint8_t ckf[64];
-        uint16_t lf = chunk_build(ckf, idn[1], idn[0], 7, 0, idn[2], 7, 0, 0);
-        f_deliver(ckf, lf);
-        lf = chunk_build(ckf, idn[2], idn[1], 7, 0, idn[3], 7, 0, 0);
-        f_deliver(ckf, lf);
+        {
+            uint16_t peers[2] = { idn[1], idn[3] };   /* sorted: B before D */
+            uint8_t lcls[2] = { 0x77, 0x77 };
+            uint16_t lf = star_build(ckf, idn[2], 7, 0, peers, lcls, 2);
+            f_deliver(ckf, lf);
+        }
         /* A -> D must be accepted (D is in A's graph) */
         f_data_tx_reset();
         assert(mimeshi_send_data(&A, idn[3], (const uint8_t *)"hop", 3, false, 0, 0) == 0);
@@ -367,9 +425,9 @@ int main(void) {
         e_confirm(&CC, ei[3]); e_confirm(&BB, ei[1]);
         e_confirm(&DD, ei[3]); e_confirm(&BB, ei[2]);
         uint8_t cke[64];
-        uint16_t le = chunk_build(cke, ei[1], ei[0], 7, 0, ei[3], 7, 0, 0);
+        uint16_t le = chunk_build(cke, ei[1], ei[0], 7, 0, ei[3], 7, 0, 7);
         e_deliver_all(cke, le);
-        le = chunk_build(cke, ei[2], ei[0], 7, 0, ei[3], 7, 0, 0);
+        le = chunk_build(cke, ei[2], ei[0], 7, 0, ei[3], 7, 0, 7);
         e_deliver_all(cke, le);
         /* A -> B: first choice is C (both cost 20+20, C first in the
          * table order). Blackhole C; after the failed series (2

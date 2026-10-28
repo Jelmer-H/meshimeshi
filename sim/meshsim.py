@@ -15,14 +15,15 @@ New scenarios: add a function with an (mk, jitter) signature, where
 mk(node) builds the C protocol core (CCore; there is no other core) and
 jitter is the max hello phase jitter in microseconds (None = core value).
 """
-import argparse, os, sys
+import argparse, ctypes, math, os, sys
 
 import random
 
 import simpy
 
 from sim1 import (radio_log, Node, CCore, load_lib, Wire, sym_count, nbr_counts,
-                  load_nodes_csv, project, linkbudget, RX_MIN_DBM, DutyLedger, N_CH)
+                  load_nodes_csv, project, linkbudget, RX_MIN_DBM, DutyLedger, N_CH,
+                  StarStats)
 
 class Radio:  # simpy version of the virtual radio; interface equal to sim1.Radio
     def __init__(self):
@@ -30,6 +31,8 @@ class Radio:  # simpy version of the virtual radio; interface equal to sim1.Radi
         self.nodes = {}        # id -> Node
         self.airtime = [0]*N_CH
         self.hello_air = [0]*N_CH   # airtime of hellos (type 1) per channel
+        self.star_air = [0]*N_CH    # airtime of star rounds (type 10) per channel (4.5)
+        self.star_stats = StarStats()  # star-round measurement (4.5, scenario 6)
         self.ack_air = [0]*N_CH     # airtime of hello-acks (type 2) per channel
         self.duty = DutyLedger()
         self.wire = Wire()
@@ -57,6 +60,8 @@ class Radio:  # simpy version of the virtual radio; interface equal to sim1.Radi
         ptype = pkt[0] & 0x0F
         if ptype == 1: self.hello_air[ch] += airtime
         elif ptype == 2: self.ack_air[ch] += airtime
+        elif ptype == 10: self.star_air[ch] += airtime
+        if ptype == 10: self.star_stats.tx(self.now, node.id, ch, pkt, airtime)
         self.duty.add(node.id, ch, self.now, airtime)
         for r in self.nodes.values():
             if r is node: continue
@@ -94,6 +99,141 @@ def report(radio):
             f"hellos heard {nd.hello_rx}, missed {nd.hello_missed}, "
             f"collisions {nd.collided}"
             + (f", confirmed symmetric {sym}" if sym is not None else ""))
+
+def star_report(radio):
+    """Star-round measurements (4.5, scenario 6): per-node round counts,
+    the three areas (content stars / catalogue entries / missed requests),
+    airtime per channel and the hard-bound check."""
+    st = radio.star_stats
+    s = st.summary()
+    out("\n=== Star-round measurements (4.5) ===")
+    out(f"nodes with rounds: {s['nodes']}, rounds: {s['rounds']}, "
+        f"content stars: {s['content']}, catalogue entries: {s['catalogue']}, "
+        f"missed requests: {s['missed']}")
+    for c in range(N_CH):
+        out(f"channel {c}: star-round airtime {radio.star_air[c]/1e6:.3f} s")
+    viol = st.hard_bound_violations()
+    out(f"hard-bound violations (rounds closer than one interval): {len(viol)}")
+    for v in viol[:5]:
+        out(f"  node {v[0]:#06x}: rounds at {v[1]/1e6:.1f}s and {v[2]/1e6:.1f}s")
+
+@scenario("star-round", "2 nodes with the star round enabled: first rounds, "
+                        "own star, catalogue and heartbeat tick (4.5, 6a warm-up)")
+def star_round(mk, jitter):
+    radio = Radio()
+    a = Node(radio, 0x0100)
+    b = Node(radio, 0x0101)
+    a.core = set_jitter(mk(a), jitter); b.core = set_jitter(mk(b), jitter)
+    a.core.start()
+    radio.schedule(500_000, b.core.start)
+    radio.run(until_us=2 * 3600 * 1_000_000)      # 2 h: own-star guarantee x2
+    star_report(radio)
+    # heartbeat probe: b's view of a's star
+    present, tick, age, eff = b.core.star_state(0x0100)
+    out(f"b's view of a's star: present={present} tick={tick} "
+        f"age={age} effective_age={eff}")
+    present, tick, age, eff = a.core.star_state(0x0101)
+    out(f"a's view of b's star: present={present} tick={tick} "
+        f"age={age} effective_age={eff}")
+
+@scenario("star-line", "10 nodes in a line, 4 km spacing, only adjacent "
+                       "neighbours audible: tick propagation, remote liveness "
+                       "and duplicate work over 9 hops (4.5, 6a multi-hop)")
+def star_line(mk, jitter):
+    """Scenario 6a multi-hop (4.5). A line of 10 nodes at 10 m height,
+    4 km apart: adjacent pairs at ~-107 dBm (well above the -110
+    threshold), two hops (8 km) at ~-113 dBm - inaudible. So every node
+    has exactly one symmetric neighbour on each side (ends: one).
+
+    Measures over ~6 simulated hours (with the 15-min round: ample
+    room for a tick of node 0's own star to reach node 9 in 9 hops):
+      - tick propagation: the star_tick of node 0's star as seen by
+        every node, hop by hop (expect: latest tick, within the
+        k-window, arrived within ~hop x interval);
+      - remote liveness: the effective age of node 0's star everywhere
+        (expect: small - refreshed by the catalogue, not drifting
+        toward the 24 h eviction);
+      - duplicate work: how often node 0's star traveled as CONTENT
+        per link (expect ~1 per hop: the content hash suppresses
+        re-sends, the graph check suppresses echoes);
+      - hard bound: one round per node per interval, all nodes."""
+    N = 10
+    SPACING = 4000.0            # metres; height 10 m
+    H = 10.0
+    duration_h = _ARGS.duration if getattr(_ARGS, 'duration', None) else 6
+    duration_us = duration_h * 3_600_000_000
+
+    radio = Radio()
+    radio.wire.open = False     # closed world: only adjacent pairs
+    # positions: line along the x-axis; ids 0x0100..0x0109
+    pos = {}
+    nodes = []
+    lat0, lon0 = 52.09, 5.07    # around Utrecht - the grid_geo encoding needs real lat/lon
+    for i in range(N):
+        nid = 0x0100 + i
+        # exact x in metres along the line:
+        x, y = SPACING * i, 0.0
+        pos[nid] = (x, y, H)
+        kn = Node(radio, nid)
+        kn.core = set_jitter(mk(kn), jitter)
+        # real geo for the 16-bit grid: walk east ~4 km per step
+        d_lon = SPACING / (111320.0 * math.cos(math.radians(lat0)))
+        kn.core.set_geo(*grid_geo(lat0, lon0 + d_lon * i))
+        nodes.append(kn)
+    # links: EXPLICIT, not from the link budget. A controlled 6a
+    # topology: every adjacent pair bidirectionally at -95 dBm (well
+    # above the -110 threshold, comfortably below the +14 capture
+    # zone of the quality gate), no other pairs - the line is exactly
+    # one neighbour per side. The ID-dependent fade of local-net would
+    # cut some directions below the threshold at 4 km (measured: the
+    # 0x0101->0x0102 direction lands at -112 dBm and the line breaks
+    # in half); the radio model itself is exercised by the other
+    # scenarios - here the subject is the star round, not the link.
+    for i in range(N - 1):
+        a, b = 0x0100 + i, 0x0100 + i + 1
+        radio.wire.links[(a, b)] = -95
+        radio.wire.links[(b, a)] = -95
+    # non-adjacent pairs: simply no link entries in the closed world -
+    # the line has exactly N-1 bidirectional edges.
+
+    for i, kn in enumerate(nodes):
+        radio.schedule(i * 250_000, kn.core.start)   # never start synchronously
+    radio.run(until_us=duration_us)
+
+    star_report(radio)
+
+    # hash-chain diagnosis: does the digest each node derives for node 0's
+    # star match what its upstream neighbour would advertise?
+    out("\n--- node 0's star: per-node content hash and tick ---")
+    for i in range(1, N):
+        core = nodes[i].core
+        present, tick, age, eff = core.star_state(0x0100)
+        if not present:
+            out(f"node {0x0100+i:#06x}: not present")
+            continue
+        buf = (ctypes.c_uint8 * 300)()
+        slb = core.lib
+        sl = slb.mimeshi_star_serialize(ctypes.byref(core.mn), 0x0100, buf, 300, None)
+        h = slb.mimeshi_star_content_hash(buf, sl, 3)
+        out(f"node {0x0100+i:#06x}: hash={h:#04x} tick={tick} "
+            f"digest={slb.mimeshi_star_digest(h, tick):#04x} slen={sl}")
+
+    # tick propagation: node 0's star as seen by every node
+    out("\n--- tick of node 0x0100's star per node (heartbeat propagation) ---")
+    for i in range(1, N):
+        nid = 0x0100 + i
+        core = nodes[i].core
+        present, tick, age, eff = core.star_state(0x0100)
+        out(f"node {nid:#06x} ({i} hops): present={present} tick={tick} "
+            f"age={age} effective_age={eff}")
+
+    # duplicate work: how often node 0's star traveled as content per hop
+    out("\n--- duplicate work: content carries of node 0x0100's star ---")
+    st = radio.star_stats
+    # count via the per-node content sum is aggregate; per-link counting
+    # needs the receiver side: report the aggregate and the per-node rounds
+    out(f"(aggregate: content stars total {st.summary()['content']}, "
+        f"rounds {st.summary()['rounds']}, missed requests {st.summary()['missed']})")
 
 @scenario("link-test", "2 nodes: hellos, unicast A->B and B->A with ack1/ack2/ack3")
 def link_test(mk, jitter):
@@ -381,6 +521,9 @@ def local_net(mk, jitter):
     out(f"neighbors per node: seen avg {sum(seen)/len(seen):.1f} (min {min(seen)}, max {max(seen)}), "
         f"confirmed symmetric avg {sum(conf)/len(conf):.1f}")
     out(f"nodes without confirmed neighbor: {sum(1 for b in conf if b == 0)} of {len(conf)}")
+    ids_set = set(n['id'] for n in nodes_list)
+    ghost = [m.id for kn in nodes for m in kn.core.mn.map if m.alive and m.id not in ids_set]
+    out(f"ghost map entries (not in the node list): {len(ghost)}, sample: {[hex(g) for g in ghost[:8]]}")
     maps = [kn.core.map_size() for kn in nodes]
     links = [kn.core.link_count() for kn in nodes]
     geos = [sum(1 for m in kn.core.mn.map if m.alive and m.geo_lat) for kn in nodes]
@@ -418,6 +561,98 @@ def collision(mk, jitter):
     radio.run(until_us=31_000_000)
     report(radio)
 
+
+@scenario("star-rest", "scenario 6c (4.3): utrecht40 at rest, one node silenced mid-run - "
+                         "rest behaviour, freshness and remote liveness (tick stall and death)")
+def star_rest(mk, jitter):
+    """Design 4.3/4.4 scenario 6c. The uniform cadence at rest:
+      - rest behaviour: content drains to ~0, the catalogue carries
+        the maintenance (fill measured per 6-h block via star_stats);
+      - freshness: the effective age of the map entries must stay far
+        from the 24 h eviction while the origins live;
+      - remote liveness (the piece the old 4.4 lacked): one node is
+        silenced at half-time; its star's tick stops advancing and the
+        liveness axis (star_tick_seen, 4.4) must degrade the star
+        EVERYWHERE within the liveness threshold - first de-weighted,
+        then evicted, at every hop distance, not just at the direct
+        neighbours.
+    Reports per node: presence/tick/effective age of the silenced
+    node's star, at silencing time and every 6 h after."""
+    nodes_list = load_nodes_csv(_ARGS.nodes)
+    duration_h = _ARGS.duration if getattr(_ARGS, 'duration', None) else 48
+    duration_us = duration_h * 3_600_000_000
+    radio = Radio()
+    radio.wire.open = False
+    lat0 = sum(n['lat'] for n in nodes_list) / len(nodes_list)
+    lon0 = sum(n['lon'] for n in nodes_list) / len(nodes_list)
+    pos = {n['id']: (*project(n['lat'], n['lon'], lat0, lon0), n['h']) for n in nodes_list}
+    nodes = []
+    for i, nd in enumerate(nodes_list):
+        kn = Node(radio, nd['id'])
+        kn.core = set_jitter(mk(kn), jitter)
+        kn.core.set_geo(*grid_geo(nd['lat'], nd['lon']))
+        nodes.append(kn)
+        radio.schedule(i * 250_000, kn.core.start)
+    ids = [n['id'] for n in nodes_list]
+    for a in ids:
+        for b in ids:
+            if a == b: continue
+            raw = linkbudget(pos[a], pos[b])
+            if raw is None: continue
+            fade = ((a * 31 + b * 17) % 11) - 5
+            r = raw + fade
+            if r >= RX_MIN_DBM:
+                radio.wire.links[(a, b)] = max(-128, min(120, round(r)))
+    out(f"{len(nodes_list)} nodes from {_ARGS.nodes}, duration {duration_h} h")
+
+    # the silenced node: pick a mid-degree node (not a hub, not a leaf)
+    degree = {i: 0 for i in ids}
+    for (a, b) in radio.wire.links:
+        degree[a] += 1
+    victim = sorted(ids, key=lambda i: abs(degree[i] - 19))[0]
+    out(f"victim: {victim:#06x} (degree {degree[victim]}) - silenced at "
+        f"t = {duration_h//2} h")
+    victim_links = {k: v for k, v in radio.wire.links.items() if k[0] == victim}
+
+    def report_state(label):
+        out(f"\n--- {label} ---")
+        present = 0; ticks = []; ages = []
+        for kn in nodes:
+            if kn.id == victim: continue
+            p, t, a, eff = kn.core.star_state(victim)
+            if p:
+                present += 1; ticks.append(t); ages.append(eff)
+        if present:
+            out(f"victim's star present at {present}/{len(nodes)-1} nodes, "
+                f"tick min..max {min(ticks)}..{max(ticks)}, "
+                f"eff age avg {sum(ages)/len(ages):.0f} ticks "
+                f"(max {max(ages)}, eviction at {2*771})")
+        else:
+            out("victim's star present nowhere (evicted everywhere)")
+
+    # silence the victim at half-time: cut all its links (it goes deaf
+    # AND mute - the wire no longer carries anything to or from it)
+    def silence():
+        for k in list(radio.wire.links):
+            if k[0] == victim or k[1] == victim:
+                del radio.wire.links[k]
+        out(f"[t = {duration_h//2} h] {victim:#06x} silenced (links cut)")
+    radio.schedule((duration_h // 2) * 3_600_000_000, silence)
+
+    # snapshots: presence trend of the victim's star after silencing
+    def snap(label):
+        present = sum(1 for kn in nodes if kn.id != victim
+                      and kn.core.star_state(victim)[0])
+        out(f"[snapshot {label}] victim star present at {present}/{len(nodes)-1}")
+    for frac in (0.51, 0.6, 0.7, 0.8, 0.9):
+        ts = int(frac * duration_us)
+        label = f"t = {frac*duration_h:.1f} h"
+        radio.schedule(ts, (lambda l=label: (lambda: snap(l)))())
+
+    report_state("state at start (pre-run)")
+    radio.run(until_us=duration_us)
+    report_state(f"state at end (t = {duration_h} h)")
+    star_report(radio)
 
 @scenario("traffic", "local-net + periodic unicast between confirmed symmetric neighbor pairs")
 def traffic(mk, jitter):
@@ -524,6 +759,403 @@ def traffic(mk, jitter):
     out(f"duty (sliding hour, limit 360 s): max {top[0]/1e6:.1f} s, "
         f"top 5 {[f'{u/1e6:.1f}' for u in top]} s, "
         f"above limit: {sum(1 for u in usage.values() if u > 360_000_000)}")
+
+@scenario("star-dense", "scenario 6f (4.3): dense-cluster stress - 64 fully meshed "
+                          "nodes on one home channel, the shared-channel bound")
+def star_dense(mk, jitter):
+    """Design 4.3 scenario 6f. The per-node hard bound (one chunk per
+    interval) is NOT a per-channel bound: a dense single-channel
+    cluster measures the AGGREGATE channel occupancy. 64 nodes, all
+    mutually in range (a fully meshed tower cluster), all at home on
+    the same channel (ids chosen so id mod 3 is equal), so:
+      - every round of every node lands on the same channel;
+      - every receiver processes 63 neighbours' stars + catalogues;
+      - the stars are thick (each node owns ~half of its 63 links).
+    Measures: aggregate occupancy per channel against the 10% duty
+    budget, convergence of a mutation wave at this density, the
+    map/link/miss bookkeeping at 64x the per-node information, ghost
+    integrity, hard bound. If the budget breaks, open point 1
+    (interval scaling with density) gets its measurement here."""
+    N = _ARGS.nodes_n if hasattr(_ARGS, 'nodes_n') and _ARGS.nodes_n else 64
+    duration_h = _ARGS.duration if getattr(_ARGS, 'duration', None) else 12
+    duration_us = duration_h * 3_600_000_000
+    radio = Radio()
+    radio.wire.open = False
+    # one cluster: everyone within ~2 km of a centre, 30 m masts - all
+    # pairs audible; ids all with the same home channel (mod 3 == 0)
+    lat0, lon0 = 52.09, 5.07
+    nodes = []
+    ids = []
+    for i in range(N):
+        nid = 0x0300 + 3*i          # id mod 3 == 0 for all: one home channel
+        ids.append(nid)
+    pos = {}
+    import math as _math
+    for i, nid in enumerate(ids):
+        ang = 2 * _math.pi * i / N
+        r = 400 + (i % 7) * 100     # 400-1000 m ring
+        lat = lat0 + r * _math.cos(ang) / 111000
+        lon = lon0 + r * _math.sin(ang) / (111000 * _math.cos(_math.radians(lat0)))
+        pos[nid] = (r * _math.cos(ang), r * _math.sin(ang), 30.0)
+    for i, nid in enumerate(ids):
+        kn = Node(radio, nid)
+        kn.core = set_jitter(mk(kn), jitter)
+        gl, go = grid_geo(lat0 + pos[nid][1] / 111000,
+                          lon0 + pos[nid][0] / (111000 * _math.cos(_math.radians(lat0))))
+        kn.core.set_geo(gl, go)
+        nodes.append(kn)
+        radio.schedule(i * 250_000, kn.core.start)
+    for a in ids:
+        for b in ids:
+            if a == b: continue
+            raw = linkbudget(pos[a], pos[b])
+            if raw is None: continue
+            fade = ((a * 31 + b * 17) % 11) - 5
+            r = raw + fade
+            if r >= RX_MIN_DBM:
+                radio.wire.links[(a, b)] = max(-128, min(120, round(r)))
+    deg = {i: 0 for i in ids}
+    for (a, b) in radio.wire.links:
+        deg[a] += 1
+    out(f"{N} nodes, fully meshed cluster, all home on channel {ids[0] % 3}, "
+        f"duration {duration_h} h")
+    out(f"topology: {len(radio.wire.links)} directed links, "
+        f"degree min {min(deg.values())}, max {max(deg.values())}")
+
+    # a mutation wave at half time: a quarter of the nodes moves
+    rng = random.Random(2026)
+    mut_ids = rng.sample(ids, max(1, N // 4))
+    post_geo = {}
+    def wave():
+        for nid in mut_ids:
+            for kn in nodes:
+                if kn.id == nid:
+                    kn.core.set_geo((kn.core.mn.geo_lat + 37) % 65536,
+                                    (kn.core.mn.geo_lon + 41) % 65536)
+        for nid in mut_ids:
+            for kn in nodes:
+                if kn.id == nid:
+                    post_geo[nid] = (kn.core.mn.geo_lat, kn.core.mn.geo_lon)
+        out(f"[wave] t={radio.now/3.6e9:.2f} h: {len(mut_ids)} nodes moved")
+        radio.schedule(30 * 60_000_000, probe)
+    def probe():
+        conv = 0; total = 0
+        for nid in mut_ids:
+            gl, go = post_geo[nid]
+            for kn in nodes:
+                if kn.id == nid: continue
+                m = next((m for m in kn.core.mn.map if m.alive and m.id == nid), None)
+                if m is None: continue
+                total += 1
+                if m.geo_lat == gl and m.geo_lon == go:
+                    conv += 1
+        out(f"[probe t={radio.now/3.6e9:.2f} h] post-wave geo visible: "
+            f"{conv}/{total} ({100*conv/max(total,1):.1f}%)")
+        if radio.now + 30*60_000_000 < duration_us:
+            radio.schedule(30 * 60_000_000, probe)
+    radio.schedule(duration_us // 2, wave)
+
+    radio.run(until_us=duration_us)
+    out(f"\n=== Dense-cluster scenario 6f ({N} nodes, {duration_h} h) ===")
+    st = radio.star_stats.summary()
+    out(f"rounds: {st['rounds']}, per node/h: {st['rounds']/N/duration_h:.1f}")
+    for c in range(N_CH):
+        frac = radio.airtime[c] / duration_us * 100 if duration_us else 0
+        out(f"channel {c}: airtime {radio.airtime[c]/1e6:.1f} s = {frac:.2f}% of the run")
+    usage = {(kn.id, c): radio.duty.usage(kn.id, c, radio.now)
+             for kn in nodes for c in range(N_CH)}
+    top = sorted(usage.values(), reverse=True)[:5]
+    out(f"duty (sliding hour, limit 360 s): max {top[0]/1e6:.1f} s, "
+        f"above limit: {sum(1 for u in usage.values() if u > 360_000_000)}")
+    # map and link load + ghost integrity
+    maps = [kn.core.map_size() for kn in nodes]
+    links = [kn.core.link_count() for kn in nodes]
+    ghosts = sum(1 for kn in nodes for m in kn.core.mn.map
+                 if m.alive and m.id not in set(ids))
+    out(f"map: avg {sum(maps)/len(maps):.1f} (min {min(maps)}, max {max(maps)}), "
+        f"links avg {sum(links)/len(links):.1f}, ghost entries: {ghosts}")
+    star_report(radio)
+
+@scenario("star-quiet", "scenario 6e (4.3): quiet-hour acceleration - a backlog "
+                          "drains at up to 3x speed in quiet hours, day/night profile")
+def star_quiet(mk, jitter):
+    """Design 4.3 scenario 6e. Day/night traffic profile on utrecht40:
+      - day (traffic on): a unicast every --interval s keeps the
+        channels busy - the acceleration gate must stay closed;
+      - night (quiet): no unicast; just before the night starts, a
+        wave of geo mutations (--rate x a burst factor) creates a
+        real content backlog;
+      - the measurement: how much of the backlog drains during the
+        quiet hours, at which round rate (the rounds per hour per
+        node - the acceleration shows as up to 3 rounds/h instead of
+        4/h... at 15-min interval 4/h, at the 5-min floor 12/h), and
+        the airtime: quiet-hour convergence must stay bounded (the
+        duty share criterion).
+    The star_stats rounds counter gives the round rate; the
+    convergence measure is the time until all nodes see the mutated
+    stars' new form (tick advanced, hash changed, map fresh)."""
+    nodes_list = load_nodes_csv(_ARGS.nodes)
+    duration_h = _ARGS.duration if getattr(_ARGS, 'duration', None) else 12
+    duration_us = duration_h * 3_600_000_000
+    interval_us = _ARGS.interval * 1_000_000
+    radio = Radio()
+    radio.wire.open = False
+    lat0 = sum(n['lat'] for n in nodes_list) / len(nodes_list)
+    lon0 = sum(n['lon'] for n in nodes_list) / len(nodes_list)
+    pos = {n['id']: (*project(n['lat'], n['lon'], lat0, lon0), n['h']) for n in nodes_list}
+    nodes = []
+    for i, nd in enumerate(nodes_list):
+        kn = Node(radio, nd['id'])
+        kn.core = set_jitter(mk(kn), jitter)
+        kn.core.set_geo(*grid_geo(nd['lat'], nd['lon']))
+        nodes.append(kn)
+        radio.schedule(i * 250_000, kn.core.start)
+    ids = [n['id'] for n in nodes_list]
+    for a in ids:
+        for b in ids:
+            if a == b: continue
+            raw = linkbudget(pos[a], pos[b])
+            if raw is None: continue
+            fade = ((a * 31 + b * 17) % 11) - 5
+            r = raw + fade
+            if r >= RX_MIN_DBM:
+                radio.wire.links[(a, b)] = max(-128, min(120, round(r)))
+    # day = first half (unicast on), night = second half (quiet)
+    night_start_us = duration_us // 2
+    out(f"{len(nodes_list)} nodes, {duration_h} h: day 0-{duration_h//2} h "
+        f"(unicast every {_ARGS.interval} s), night {duration_h//2}-{duration_h} h (quiet)")
+
+    # day traffic
+    node_geo = {n['id']: grid_geo(n['lat'], n['lon']) for n in nodes_list}
+    rng = random.Random(2026)
+    payload = b'x' * 20
+    attempted = [0]
+    def gen():
+        if radio.now < night_start_us:
+            kn = rng.choice(nodes)
+            dst = rng.choice(ids)
+            if dst != kn.id and kn.core.send_data(dst, payload, ack3=False,
+                                                  geo=node_geo[dst]) == 0:
+                attempted[0] += 1
+            radio.schedule(interval_us, gen)
+    radio.schedule(interval_us, gen)
+
+    # the backlog wave: just before the night, move a third of the nodes
+    n_mut = max(1, len(nodes) // 3)
+    mut_ids = rng.sample([kn.id for kn in nodes], n_mut)
+    t_wave = night_start_us - 10 * 60_000_000   # 10 min before the night
+    def wave():
+        for nid in mut_ids:
+            for kn in nodes:
+                if kn.id == nid:
+                    kn.core.set_geo((kn.core.mn.geo_lat + 37) % 65536,
+                                    (kn.core.mn.geo_lon + 41) % 65536)
+        out(f"[wave] t={radio.now/3.6e9:.2f} h: {n_mut} nodes moved "
+            f"(content backlog created)")
+    radio.schedule(t_wave, wave)
+
+    # convergence probe: a mutated star is CONVERGED at an observer
+    # when the observer's map entry carries the post-wave geo (the
+    # mutation IS a geo move - the sharpest possible criterion)
+    post_geo = {}     # nid -> (lat, lon) after the wave
+    def probe():
+        conv = 0; total = 0
+        for nid in mut_ids:
+            gl, go = post_geo[nid]
+            for kn in nodes:
+                if kn.id == nid: continue
+                m = next((m for m in kn.core.mn.map if m.alive and m.id == nid), None)
+                if m is None: continue
+                total += 1
+                if m.geo_lat == gl and m.geo_lon == go:
+                    conv += 1
+        out(f"[probe t={radio.now/3.6e9:.2f} h] post-wave geo visible: "
+            f"{conv}/{total} ({100*conv/max(total,1):.1f}%)")
+        if radio.now + 30*60_000_000 < duration_us:
+            radio.schedule(30 * 60_000_000, probe)
+    # capture the post-wave geos right after the wave fires
+    def wave_probe():
+        for nid in mut_ids:
+            for kn in nodes:
+                if kn.id == nid:
+                    post_geo[nid] = (kn.core.mn.geo_lat, kn.core.mn.geo_lon)
+        probe()
+    radio.schedule(night_start_us, wave_probe)
+
+    radio.run(until_us=duration_us)
+    out(f"\n=== Quiet-hour scenario 6e ({duration_h} h) ===")
+    out(f"day unicast attempts: {attempted[0]}")
+    st = radio.star_stats.summary()
+    out(f"rounds total: {st['rounds']}, per node/h: "
+        f"{st['rounds']/len(nodes)/duration_h:.1f}")
+    usage = {(kn.id, c): radio.duty.usage(kn.id, c, radio.now)
+             for kn in nodes for c in range(N_CH)}
+    top = sorted(usage.values(), reverse=True)[:5]
+    out(f"duty (sliding hour, limit 360 s): max {top[0]/1e6:.1f} s, "
+        f"above limit: {sum(1 for u in usage.values() if u > 360_000_000)}")
+    star_report(radio)
+
+@scenario("star-churn", "scenario 6d (4.3/4.4): churn - geo mutations, nodes "
+                           "joining and leaving, reboot/reincarnation, delivery under churn")
+def star_churn(mk, jitter):
+    """Design 4.3/4.4 scenario 6d. Churn on utrecht40:
+      - geo mutations: --rate per hour, a random node moves (its own
+        star's content hash changes - the pure mutation-convergence
+        measurement: time until the new form is visible network-wide);
+      - join/leave: --churn = percent of nodes per day that leave
+        (links cut - the network must detect the death via the liveness
+        axis) and later return (links restored - short absence within
+        the liveness threshold must resume seamlessly; long absence
+        rides the newcomer path);
+      - delivery: a unicast every --interval s between random nodes
+        throughout, so the real verdict (delivery ratio) is measured
+        under churn, not just the bookkeeping.
+    Reports: mutation convergence per hop band, missed-requests per
+    node per hour, liveness wave (per hop band) for the leavers,
+    delivery ratio, airtime, hard bound."""
+    nodes_list = load_nodes_csv(_ARGS.nodes)
+    duration_h = _ARGS.duration if getattr(_ARGS, 'duration', None) else 24
+    duration_us = duration_h * 3_600_000_000
+    warmup_h = _ARGS.warmup
+    warmup_us = warmup_h * 3_600_000_000
+    mut_rate = getattr(_ARGS, 'rate', 0)          # geo mutations per hour
+    churn_pct = getattr(_ARGS, 'churn', 0.0)      # percent of nodes per day leave+return
+    interval_us = _ARGS.interval * 1_000_000
+    radio = Radio()
+    radio.wire.open = False
+    lat0 = sum(n['lat'] for n in nodes_list) / len(nodes_list)
+    lon0 = sum(n['lon'] for n in nodes_list) / len(nodes_list)
+    pos = {n['id']: (*project(n['lat'], n['lon'], lat0, lon0), n['h']) for n in nodes_list}
+    nodes = []
+    for i, nd in enumerate(nodes_list):
+        kn = Node(radio, nd['id'])
+        kn.core = set_jitter(mk(kn), jitter)
+        kn.core.set_geo(*grid_geo(nd['lat'], nd['lon']))
+        nodes.append(kn)
+        radio.schedule(i * 250_000, kn.core.start)
+    ids = [n['id'] for n in nodes_list]
+    for a in ids:
+        for b in ids:
+            if a == b: continue
+            raw = linkbudget(pos[a], pos[b])
+            if raw is None: continue
+            fade = ((a * 31 + b * 17) % 11) - 5
+            r = raw + fade
+            if r >= RX_MIN_DBM:
+                radio.wire.links[(a, b)] = max(-128, min(120, round(r)))
+    out(f"{len(nodes_list)} nodes, {duration_h} h (warmup {warmup_h} h), "
+        f"mutations {mut_rate}/h, churn {churn_pct}%/day")
+
+    # hop bands from the topology (BFS over the wire links, undirected)
+    def hop_bands():
+        import collections
+        adj = collections.defaultdict(set)
+        for (a, b) in radio.wire.links:
+            adj[a].add(b)
+        bands = {}
+        for src in ids:
+            dist = {src: 0}
+            q = collections.deque([src])
+            while q:
+                u = q.popleft()
+                for v in adj[u]:
+                    if v not in dist:
+                        dist[v] = dist[u] + 1
+                        q.append(v)
+            bands[src] = dist
+        return bands
+    bands = hop_bands()
+
+    # geo mutations: a random node shifts position (a real content
+    # change of its own star: the hash changes, the tick does not)
+    rng = random.Random(2026)
+    mut_log = []      # (t_us, node_id)
+    n_mut = int(mut_rate * duration_h) if mut_rate else 0
+    for i in range(n_mut):
+        t = warmup_us + rng.random() * (duration_us - warmup_us) if duration_us > warmup_us else 0
+        if t < warmup_us: continue
+        kn = rng.choice(nodes)
+        mut_log.append((int(t), kn.id))
+        def _mut(kn=kn):
+            lat, lon = kn.core.mn.geo_lat, kn.core.mn.geo_lon
+            kn.core.set_geo((lat + 37) % 65536, (lon + 41) % 65536)
+            out(f"[mut] t={(radio.now/3.6e9):.2f} h: node {kn.id:#06x} moved")
+        radio.schedule(max(t - radio.now, 0), _mut)
+
+    # join/leave: churn_pct% of the nodes per day leave (links cut)
+    # and return after an absence (half short < liveness, half long)
+    leave_events = []
+    import math
+    n_leave = int(math.ceil(len(nodes) * churn_pct / 100.0 * duration_h / 24.0))
+    if churn_pct > 0 and n_leave == 0:
+        n_leave = 1 if duration_h >= 3 else 0   # a short run still shows one cycle
+    for i in range(n_leave):
+        t = warmup_us + rng.random() * max(duration_us - warmup_us, 1)
+        kn = rng.choice(nodes)
+        long_absence = (i % 2 == 0)          # half long (reincarnation-scale), half short
+        leave_events.append((int(t), kn, long_absence))
+    cut = {}
+    for (t, kn, long_abs) in leave_events:
+        abs_h = 8 if long_abs else 0.5      # short: within the 6 h liveness threshold
+        def _leave(kn=kn, abs_h=abs_h):
+            cut[kn.id] = {k: v for k, v in radio.wire.links.items()
+                         if k[0] == kn.id or k[1] == kn.id}
+            for k in list(cut[kn.id]):
+                del radio.wire.links[k]
+            out(f"[leave] t={(radio.now/3.6e9):.2f} h: node {kn.id:#06x} "
+                f"leaves (absence {abs_h} h)")
+        def _return(kn=kn, abs_h=abs_h):
+            radio.wire.links.update(cut.get(kn.id, {}))
+            out(f"[return] t={(radio.now/3.6e9):.2f} h: node {kn.id:#06x} returns")
+        radio.schedule(max(t - radio.now, 0), _leave)
+        radio.schedule(max(t + abs_h * 3_600_000_000 - radio.now, 0), _return)
+
+    # delivery throughout: a unicast every --interval s (after warmup)
+    node_geo = {n['id']: grid_geo(n['lat'], n['lon']) for n in nodes_list}
+    payload = b'x' * 20
+    attempted = [0]; delivered = [0]
+    def gen():
+        if radio.now >= warmup_us:
+            kn = rng.choice(nodes)
+            dst = rng.choice(ids)
+            if dst != kn.id and kn.core.send_data(dst, payload, ack3=False,
+                                                  geo=node_geo[dst]) == 0:
+                attempted[0] += 1
+        radio.schedule(interval_us, gen)
+    if interval_us:
+        radio.schedule(interval_us, gen)
+
+    # delivery bookkeeping: DATA receptions at the destination,
+    # dedup per (msg-id, src) - the traffic-scenario style
+    delivered = [0]
+    base_rx = CCore.rx
+    def rx(self, arg):
+        ch, rssi, pkt = arg
+        if pkt and (pkt[0] & 0x0F) == 5 and len(pkt) > 10:
+            dst = pkt[5] | (pkt[6] << 8)
+            if dst == self.n.id:          # only the destination counts
+                src = pkt[3] | (pkt[4] << 8)
+                mid = pkt[1] | (pkt[2] << 8)
+                key = (mid, src)
+                if not hasattr(rx, '_seen'): rx._seen = set()
+                if key not in rx._seen:
+                    rx._seen.add(key)
+                    delivered[0] += 1
+        base_rx(self, arg)
+    CCore.rx = rx
+
+    radio.run(until_us=warmup_us + duration_us)
+
+    out(f"\n=== Churn scenario 6d ({duration_h} h, mut {mut_rate}/h, churn {churn_pct}%/day) ===")
+    out(f"mutations: {len(mut_log)}, leave/return events: {len(leave_events)}")
+    out(f"unicast attempts {attempted[0]}, delivered {delivered[0]} "
+        f"(100.0% = {attempted[0] and 100.0*delivered[0]/attempted[0]:.1f}%)")
+    star_report(radio)
+    out(f"mutations logged at: " + ", ".join(
+        f"t={t/3.6e9:.2f}h {nid:#06x}" for t, nid in mut_log[:12]))
+    out(f"leaves at: " + ", ".join(
+        f"t={t/3.6e9:.2f}h {kn.id:#06x}{'(long)' if la else '(short)'}"
+        for (t, kn, la) in leave_events[:12]))
 
 @scenario("load", "24 h warmup (convergence), then a unicast every N seconds from a random node to a random node")
 def load(mk, jitter):
@@ -716,6 +1348,10 @@ def main():
                     help='unicast payload size in bytes (traffic/newcomer-traffic, default 20)')
     ap.add_argument('--warmup', type=int, default=24, metavar='HOURS',
                     help='convergence warmup before the load phase (load, default 24)')
+    ap.add_argument('--nodes-n', type=int, default=64, metavar='COUNT',
+                    help="scenario 6f: the dense-cluster size (default 64)")
+    ap.add_argument('--churn', type=float, default=0.0, metavar='PCT_DAY',
+                    help="scenario 6d: percent of the nodes per day that leave and later return")
     ap.add_argument('--interval', type=int, default=10, metavar='SECONDS',
                     help='seconds between unicasts (load, default 10)')
     ap.add_argument('--join-at', type=int, default=5400, metavar='SECONDS',

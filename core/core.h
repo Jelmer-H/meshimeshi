@@ -55,8 +55,11 @@ typedef struct {
                                to us, proof list in which we appear, ack1
                                on our data, or table chunk naming us);
                                0 = only seen, one direction (4.2, 10.1) */
-    uint8_t  adv_class;     /* last advertised quality class (3 bits,
-                               hysteresis >= 2 steps, 4.3) */
+    uint8_t  adv_class;     /* the link byte last advertised for this
+                              neighbour in the own star (both direction
+                              nibbles) - hysteresis: only a >= 2-step
+                              class change on either side re-publishes,
+                              sub-threshold EWMA movement does not (4.3) */
     uint8_t  penalty;       /* local failure counter (10.4): +1 per failed
                               series toward this neighbour, -1 per ack1,
                               floor 0; raises the own-edge route cost.
@@ -101,10 +104,63 @@ typedef struct { uint16_t msg_id, src; uint16_t seq; } mimeshi_dedup;
 typedef struct {
     uint16_t id;
     uint16_t geo_lat, geo_lon;
-    uint8_t  quality;        /* advertised quality of the link to its owner (4.3) */
+    uint8_t  quality;        /* local measurement of this node's signal,
+                                refreshed on every identifying reception
+                                of it (snooping, chunks); routing-weight
+                                material, never forwarded */
+    uint8_t  adv_q;        /* entry class byte (both directions) exactly
+                              as the origin advertised it in its star
+                              (4.3 storage-as-received): reproduced
+                              byte-exactly on every hop, hashed by the
+                              content hash. 0 = not received yet. */
     uint16_t arrived_tick;
     uint8_t  age_ticks;
+    uint8_t  star_tick;   /* star round (4.5): the origin's heartbeat
+                            tick as it reached us - carried in the age
+                            byte of the canonical star form. Separate
+                            from age_ticks: age_ticks keeps its 4.3
+                            meaning (travelled age for route weighing
+                            and map eviction); star_tick is liveness.
+                            0 = never seen via a star round (a star
+                            from a plain 4.3 chunk has no tick yet). */
     uint8_t  alive;
+    uint16_t star_fwd_tick;  /* star round (4.3): tick when this star
+                                last entered the content queue (0 =
+                                never; same 16-bit time base as
+                                arrived_tick, wrap-exact) */
+    uint8_t  star_fwd_hash;  /* star round (4.3): content hash of the
+                                star as last CARRIED. Queuing is driven
+                                by content: a star re-enters the queue
+                                when its advertised content (hash over
+                                the canonical bytes, tick excluded)
+                                differs from this - not when a
+                                bookkeeping tick merely moved */
+    uint8_t  star_fwd_bits;  /* star round (4.3): carried-on-channel bits
+                                (bit c = carried on channel c). A star
+                                leaves the content queue only at 7 (all
+                                three channels, 4.3 rotation); a content
+                                change resets the bits. Set in one blow
+                                by a full-spread (backlog) round */
+    uint8_t  star_miss_ctr;  /* star round (4.5): missed-list damping -
+                                fetch attempts for this star that yielded
+                                no new content; reset on a real update */
+    uint16_t star_wanted;    /* star round (4.3): local tick when a
+                                neighbour last requested this star - an
+                                explicit ask overrides the forward
+                                pruning for a few intervals (the missed
+                                list is the net for what the gradient
+                                check gets wrong) */
+    uint16_t star_tick_seen; /* liveness axis (4.4): local tick when this
+                                star's origin heartbeat tick last ADVANCED
+                                - content or a derivable match. Freshness
+                                and liveness are independent: an echo keeps
+                                the age fresh but cannot advance the tick;
+                                a star whose tick stalls for
+                                MC_STAR_DEAD_TICKS is first de-weighted in
+                                routing (the age multiplier), then evicted
+                                - a dead origin's star disappears everywhere
+                                within the threshold, whatever the forwarded
+                                copies claim */
 } mimeshi_mapnode;
 
 /* A link between two map nodes with the advertised quality class (3
@@ -139,6 +195,20 @@ typedef uint32_t (*mimeshi_rand_fn)(mimeshi_node *n);
  * NULL = no CAD available (stub platform): transmit as before. */
 typedef bool (*mimeshi_channel_free_fn)(mimeshi_node *n, uint8_t channel);
 
+/* Star-round missed request (4.5): a star we do not have (or whose
+ * digest fits nothing) as advertised by a neighbour. Travelled in the
+ * missed area of our own round, addressed to that neighbour. The
+ * damping (4.5): after 1-2 attempts without new content the request
+ * falls back to fresh-beats-old weighing instead of re-asking every
+ * interval. */
+#define MC_STAR_MISS_MAX 12u
+typedef struct {
+    uint16_t nb;            /* the neighbour that advertised the star */
+    uint16_t star;          /* the star id we are missing */
+    uint8_t  tries;         /* attempts so far; dropped after 2 (4.5) */
+    uint8_t  alive;
+} mimeshi_star_miss;
+
 /* ---------------- node ---------------------------------------------- */
 struct mimeshi_node {
     uint16_t id;
@@ -168,17 +238,31 @@ struct mimeshi_node {
                                          (0,0) = none (yet) */
     uint32_t tick;                    /* local time base: proof ticks (~56 s)
                                          since start (4.4); starts at 1 */
-    uint8_t  chunk_nr;                /* next table chunk number (4.3) */
     uint16_t dedup_seq;               /* FIFO insertion counter of the dedup cache (14) */
-    uint8_t  chunk_cursor;             /* table position where the next chunk
-                                          continues: tables larger than one
-                                          chunk cycle through the pushes (4.3) */
-    uint8_t  tail_cursor;               /* map position where the next tail
-                                          chunk continues (4.3): the 2-hop
-                                          entries cycle through the
-                                          periodic re-shares */
-    uint8_t  tbl_dirty;               /* prefix mutation pending (4.3) */
-    uint8_t  tbl_push_sched;          /* push window/period timer running */
+    uint8_t  tbl_dirty;               /* own-star content change pending (4.3) */
+    uint8_t  star_round_sched;        /* star-round timer running (4.3) */
+    uint8_t  star_backlog;           /* 6e: content work remained after the last
+                                        round (stars queued or not fully carried) -
+                                        the quiet-hour acceleration halves the
+                                        interval while this is set and the
+                                        channels are quiet; cleared at rest */
+    uint8_t  star_rot_ctr;           /* rotation counter (4.3): the round
+                                        transmits on channel
+                                        (home + ctr) mod 3 at rest, and
+                                        on all three under backlog; the
+                                        guaranteed own-star round (tick)
+                                        fires when the rotation lands on
+                                        the own home channel */
+    mimeshi_star_miss star_miss[MC_STAR_MISS_MAX];  /* missed-list (4.5):
+                                         bounded, damped, per neighbour */
+    uint8_t  star_own_ctr;            /* star rounds since the own star last
+                                         traveled in full; the guaranteed
+                                         own-star round fires when this
+                                         reaches the hour bound (4.5) */
+    uint8_t  star_tick;               /* heartbeat tick of the own star (4.5):
+                                         +1 at every guaranteed own-star
+                                         round; rides in the age byte and
+                                         drives the derivable digest */
     mimeshi_mapnode map[MC_MAP_NODES];  /* 2-hop map (10.1) */
     mimeshi_link   lnk[MC_MAX_LINKS];  /* links between map nodes (4.3) */
     mimeshi_tx_fn     tx;
@@ -221,5 +305,35 @@ void mimeshi_set_geo(mimeshi_node *n, uint16_t lat, uint16_t lon);
 /* Packet received (from radio or simulator). ch = channel of reception. */
 void mimeshi_rx(mimeshi_node *n, uint8_t channel, int8_t rssi_db,
               const uint8_t *pkt, uint16_t len);
+
+/* ---- star canonicalisation and digest (4.5, proposal) --------------- */
+/* Buffer bound for one serialised star: entry (9 B) + max 64 links
+ * (3 B each) — the largest possible star (4.5: 64 links at the
+ * neighbor table limit). */
+#define MC_STAR_BUF (9 + 3 * 64)
+
+/* Serialise the star of node `center` as known by this node: entry (id,
+ * both quality classes, age, geo) + its links, each (peer id, classes
+ * per direction), SORTED by peer id - the canonical byte form of 4.5.
+ * age_off_out (optional) receives the offset of the age byte (the
+ * heartbeat tick lives there). Returns the length, 0 = star unknown or
+ * maxlen too small. */
+uint16_t mimeshi_star_serialize(const mimeshi_node *n, uint16_t center,
+                               uint8_t *buf, uint16_t maxlen,
+                               uint16_t *age_off_out);
+
+/* 1-byte content hash over the canonical star bytes EXCLUDING the age
+ * byte (4.5). */
+uint8_t mimeshi_star_content_hash(const uint8_t *star, uint16_t len,
+                                  uint16_t age_off);
+
+/* Catalogue digest (4.5): (content_hash + tick) mod 256 - derivable. */
+uint8_t mimeshi_star_digest(uint8_t content_hash, uint8_t tick);
+
+/* Heartbeat match (4.5): does `received` fit content_hash at
+ * stored_tick + k, k in 0..k_max? Returns the tick advance (0 = same
+ * tick, 1..k_max = advanced), -1 = no fit (content change or unknown). */
+int mimeshi_star_tick_match(uint8_t received, uint8_t content_hash,
+                           uint8_t stored_tick, uint8_t k_max);
 
 #endif /* MCORE_H */

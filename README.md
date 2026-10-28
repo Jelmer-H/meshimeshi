@@ -11,8 +11,9 @@ Protocol core in C for repeaters/companions + Python simulator. See
   with ack1/2/3, retries, budget, collision and capture model, GPS/height
   link budget.
   Scenarios up to and including `local-net` (40 nodes from a node list).
-- **Building block 2 complete**: table push with chunks (4.3, incl. delta
-  and tail), expiry and aging (4.4), routing (10): Dijkstra over the known
+- **Building block 2 complete**: star rounds (4.3, the uniform convergence
+  cadence — the old chunk-push path is removed from the code), expiry
+  and aging (4.4), routing (10): Dijkstra over the known
   graph with the ETX cost table and age multiplier, forwarding with
   next-hop addressing, retry series with cumulative exclusion (7.4), the
   revised ack2 mechanism (two hops per ack2, spent budget along, T_ack2
