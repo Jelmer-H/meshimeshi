@@ -305,7 +305,7 @@ The solution is the **proof list**: a small packet with the node IDs of neighbou
 
 1. **Freshness axis (routing weight, continuous).** The effective age feeds the existing route weighting (`route_age_mult`): old knowledge weighs heavier but is never refused. Unchanged from 4.3, only the computation is simpler.
 
-2. **Eviction axis (memory, hard).** A map entry (foreign star) whose effective age reaches ~24 h (2 × T_active, the existing bound) is evicted. Direct neighbours are never evicted — they live in the neighbor table.
+2. **Eviction axis (memory, hard).** A map entry (foreign star) whose effective age reaches ~24 h (2 × T_active, the existing bound) is evicted. Direct neighbours are never evicted — they live in the neighbor table. Evicting an entry removes only the links it OWNS (the per-link ownership bit, 4.3); the links of other origins that merely name it as a peer stay as the owning origin's form material - they leave with their owner (storage-as-received holds under pool pressure).
 
    **Pool recycle at the cap (decided, Oct 2026, from the 480-node scale run).** When the map pool is FULL and a new star arrives (the scale reality: MC_MAP_NODES = 256 against a 480-node world), the victim is chosen by **routing value, not freshness**:
    - **Primary: hop distance** to the star (BFS over the own known graph, the same distance field the forward pruning already computes). Closer stars are kept: they are cheaper to re-confirm and more likely on real routes.
