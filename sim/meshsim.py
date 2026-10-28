@@ -890,11 +890,22 @@ def star_churn(mk, jitter):
     if interval_us:
         radio.schedule(interval_us, gen)
 
-    # wrap rx to count deliveries (ACK2 positive = delivered at the
-    # destination or its next hop; the load scenario's probe style)
-    deliv_at = {}
+    # delivery bookkeeping: DATA receptions at the destination,
+    # dedup per (msg-id, src) - the traffic-scenario style
+    delivered = [0]
     base_rx = CCore.rx
     def rx(self, arg):
+        ch, rssi, pkt = arg
+        if pkt and (pkt[0] & 0x0F) == 5 and len(pkt) > 10:
+            dst = pkt[5] | (pkt[6] << 8)
+            if dst == self.n.id:          # only the destination counts
+                src = pkt[3] | (pkt[4] << 8)
+                mid = pkt[1] | (pkt[2] << 8)
+                key = (mid, src)
+                if not hasattr(rx, '_seen'): rx._seen = set()
+                if key not in rx._seen:
+                    rx._seen.add(key)
+                    delivered[0] += 1
         base_rx(self, arg)
     CCore.rx = rx
 
@@ -902,7 +913,8 @@ def star_churn(mk, jitter):
 
     out(f"\n=== Churn scenario 6d ({duration_h} h, mut {mut_rate}/h, churn {churn_pct}%/day) ===")
     out(f"mutations: {len(mut_log)}, leave/return events: {len(leave_events)}")
-    out(f"unicast attempts {attempted[0]}")
+    out(f"unicast attempts {attempted[0]}, delivered {delivered[0]} "
+        f"(100.0% = {attempted[0] and 100.0*delivered[0]/attempted[0]:.1f}%)")
     star_report(radio)
     out(f"mutations logged at: " + ", ".join(
         f"t={t/3.6e9:.2f}h {nid:#06x}" for t, nid in mut_log[:12]))
