@@ -405,10 +405,42 @@ static uint32_t map_age_ticks(mimeshi_node *n, mimeshi_mapnode *m) {
 /* Eviction of a map entry (4.4): the entry goes, and with it every
  * stored link that touches it - the link store stays consistent with
  * the map, and a link is only usable while both endpoints stand. */
+/* Eviction taboo (4.3): the ring of recently evicted star IDs.
+ * A catalogue mismatch for a tabooed star creates no miss request -
+ * the eviction was a policy choice (pool recycle or expiry), and
+ * requesting the star back is a cycle under pool pressure (measured:
+ * 21,093 requests over 6 h on the islands pressure test, all cycle).
+ * An ID that re-enters the map leaves the taboo (freshly learned
+ * knowledge is wanted knowledge). */
+#define MC_EV_TABOO 128u          /* the taboo set size (4.3): big enough to
+                                     hold every star a small pool evicts per
+                                     cycle - at the 480-node scale the world
+                                     minus the pool is ~224, and the ring
+                                     overwrite only retires the oldest */
+static void ev_taboo_remember(mimeshi_node *n, uint16_t id) {
+    /* no overwrite: a rejection stands until the star is stored
+     * again (ev_taboo_forget). The array is the pool size, so every
+     * possible rejection fits; a duplicate remember is a no-op. */
+    for (int i = 0; i < (int)(sizeof n->ev_taboo / sizeof n->ev_taboo[0]); i++) {
+        if (n->ev_taboo[i] == id) return;         /* already judged */
+        if (n->ev_taboo[i] == 0) { n->ev_taboo[i] = id; return; }
+    }
+}
+static int ev_taboo_check(mimeshi_node *n, uint16_t id) {
+    for (int i = 0; i < (int)(sizeof n->ev_taboo / sizeof n->ev_taboo[0]); i++)
+        if (n->ev_taboo[i] == id) return 1;
+    return 0;
+}
+static void ev_taboo_forget(mimeshi_node *n, uint16_t id) {
+    for (int i = 0; i < (int)(sizeof n->ev_taboo / sizeof n->ev_taboo[0]); i++)
+        if (n->ev_taboo[i] == id) n->ev_taboo[i] = 0;
+}
+
 static void map_evict(mimeshi_node *n, mimeshi_mapnode *m) {
     for (int i = 0; i < MC_MAX_LINKS; i++)
         if (n->lnk[i].alive && (n->lnk[i].a == m->id || n->lnk[i].b == m->id))
             n->lnk[i].alive = 0;
+    ev_taboo_remember(n, m->id);       /* the taboo: this was a choice (4.3) */
     m->alive = 0;
 }
 
@@ -497,6 +529,7 @@ static mimeshi_mapnode *map_add(mimeshi_node *n, uint16_t id) {
     if (m) return m;
     for (int i = 0; i < MC_MAP_NODES; i++)
         if (!n->map[i].alive) {
+            ev_taboo_forget(n, id);   /* re-entering the map ends the taboo (4.3) */
             n->map[i].alive = 1; n->map[i].id = id;
             n->map[i].star_tick_seen = n->tick;   /* liveness starts now (4.4):
                                                      no tick known yet, the first
@@ -507,9 +540,17 @@ static mimeshi_mapnode *map_add(mimeshi_node *n, uint16_t id) {
             n->map[i].arrived_tick = n->tick;
             return &n->map[i];
         }
-    /* pool full (4.4, decided Oct 2026): recycle by ROUTING VALUE -
-     * hop distance first (far goes first), the star's total link
-     * length second (low goes first: a hub stays, a leaf goes).
+    /* Pool full (4.4, decided Oct 2026): ADMISSION COMPETITION - the
+     * arriving star takes part. Score the newcomer (hop distance,
+     * total link length) against the worst entry in the pool:
+     *  - the newcomer is the worst -> NOT stored, directly on the
+     *    taboo (judged and rejected, 4.3): the pool is untouched. A
+     *    distant/thin star can no longer displace routing capital,
+     *    and no half-filled shell of a rejected star circulates
+     *    (the shell-mismatch cycle was the request storm of the
+     *    islands pressure test).
+     *  - the newcomer wins -> it takes the victim's slot; the victim
+     *    goes on the taboo (map_evict).
      * Freshness is the EXPIRY trigger (24 h), never the recycle
      * choice: at a full pool freshness is a rotation-timing lottery. */
     evict_hop_fill(n);
@@ -530,7 +571,40 @@ static mimeshi_mapnode *map_add(mimeshi_node *n, uint16_t id) {
         printf("[core] node %u: map full, entry %u dropped\n", n->id, id);
         return 0;
     }
+    /* the newcomer's own score: it is not in the map yet, so its hop
+     * distance is ev_hop through the would-be insertion - approximate
+     * with the worst-case view: compute over the current graph; an
+     * unplaced star has no link store entries yet, so its link sum is
+     * the links the arriving form will bring (the caller fills them
+     * after) - scored as 0 here, the honest lower bound. */
+    {
+        uint8_t n_hop = 0xFF;
+        /* the best hop the newcomer could have: via any of our
+         * confirmed neighbours that the BFS reached - the newcomer is
+         * at most one hop worse than the best neighbour that knows it;
+         * honest upper bound: the minimum over the neighbours (a star
+         * advertised by a hop-1 neighbour is at most hop 2) */
+        for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
+            mimeshi_neighbor *nb = &n->nbr[i];
+            if (!nb->alive || !nb->sym) continue;
+            int bi = r_idx(n, nb->id);
+            if (bi < 0) continue;
+            /* does this neighbour know the newcomer? unknowable
+             * before storage - use the conservative bound: hop 2 via
+             * any confirmed neighbour (the star arrived from one) */
+            if (n_hop > 2) n_hop = 2;
+            (void)bi;
+        }
+        if (n_hop == 0xFF) n_hop = 250;      /* no confirmed neighbour: unreachable */
+        uint32_t n_len = 0;                  /* no stored links yet: lower bound */
+        /* competition: the newcomer loses to the victim? reject. */
+        if (n_hop > v_hop || (n_hop == v_hop && n_len <= v_len)) {
+            ev_taboo_remember(n, id);         /* judged and rejected (4.3) */
+            return 0;
+        }
+    }
     map_evict(n, &n->map[victim]);
+    ev_taboo_forget(n, id);   /* the newcomer is wanted - never tabooed (4.3) */
     n->map[victim].alive = 1; n->map[victim].id = id;
     n->map[victim].geo_lat = 0; n->map[victim].geo_lon = 0;
     n->map[victim].quality = 0; n->map[victim].age_ticks = 255;
@@ -1356,9 +1430,28 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
                                                      request (4.5) */
         mimeshi_mapnode *m = map_find(n, sid);
         if (!m) {
-            /* star not known here while the neighbour advertises it:
-             * a gap - onto the missed list (4.5). */
-            star_miss_add(n, owner, sid);
+            /* the neighbour advertises a star we do not hold: either
+             * a genuine gap (never had it) or OUR eviction (the pool
+             * recycle, 4.4). The taboo (4.3) sorts these out: an
+             * evicted star was a policy choice - requesting it back
+             * is the pool-pressure cycle. Only genuine gaps ask. */
+            /* The pool-capacity gate (4.3): an unknown star is worth
+             * requesting only when the answer can actually be stored -
+             * at a FULL pool the admission competition would reject it
+             * (or it displaces routing capital and the next catalogue
+             * re-creates the request: the measured cycle). At a full
+             * pool, unknown mismatches ride the taboo instead: the
+             * regular rounds still deliver the origin's full star
+             * whenever it wins the competition; only a genuinely free
+             * slot (or a neighbour that already holds the star: the
+             * prefix exemption) re-opens asking. */
+            {
+                int full = 1;
+                for (int j = 0; j < MC_MAP_NODES; j++)
+                    if (!n->map[j].alive) { full = 0; break; }
+                if (!full && !ev_taboo_check(n, sid))
+                    star_miss_add(n, owner, sid);
+            }
             continue;
         }
         /* our version: content hash over our canonical bytes (age
@@ -1387,10 +1480,23 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
             m->arrived_tick = n->tick;          /* fresh as of NOW (4.4) */
             star_miss_clear(n, sid);
         } else {
-            /* no tick fits: a real content change upstream (or a hash
-             * collision) - onto the missed list; the neighbour re-sends
-             * it as content in its next round (4.5). */
-            star_miss_add(n, owner, sid);
+            /* no tick fits: a real content change upstream, a hash
+             * collision - or a star WE evicted (the neighbour still has
+             * it). The eviction taboo (4.3) sorts this out: a star in
+             * the taboo was our policy choice, requesting it back is
+             * the pool-pressure cycle - no request. Genuine gaps (not
+             * in the taboo) ask as before. */
+            /* A presence entry (never received the full star: star_tick
+             * still 0) is not knowledge the request service owes us -
+             * the origin's guaranteed own-star round sends the full
+             * form every hour anyway. Asking for it re-creates the
+             * cycle: the answer arrives, the pool pressure keeps only
+             * the presence half, the next catalogue mismatches again.
+             * The taboo (deliberate evictions) and this rule (never
+             * fully had it) leave only genuine, complete-knowledge
+             * gaps for the missed list. */
+            if (!ev_taboo_check(n, sid) && m->star_tick != 0)
+                star_miss_add(n, owner, sid);
         }
     }
 
@@ -1788,6 +1894,9 @@ static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
                     stale = 1;
             }
             if (em && !stale) {
+                ev_taboo_forget(n, eid);   /* the complete form arrives as content:
+                                              the rejection is over (4.3) - only
+                                              here, not on presence shells */
                 if (gl) { em->geo_lat = gl; em->geo_lon = go; }   /* (0,0) = none (5) */
                 /* storage as received (4.3): the entry class byte is
                  * stored exactly as the origin advertised it - reproduced

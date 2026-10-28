@@ -760,6 +760,319 @@ def traffic(mk, jitter):
         f"top 5 {[f'{u/1e6:.1f}' for u in top]} s, "
         f"above limit: {sum(1 for u in usage.values() if u > 360_000_000)}")
 
+@scenario("star-islands", "isolation test: two 25-node islands, cross-island delivery "
+                            "- where exactly do out-of-graph messages strand?")
+def star_islands(mk, jitter):
+    """Targeted small-scale test for the OUT-OF-GRAPH delivery problem:
+    two dense islands of 25 nodes each, connected by a handful of
+    border links. All traffic crosses the border (source in island A,
+    destination in island B), so every message depends on:
+      - the source finding a bridge toward the destination's geo
+      - the border hop finding a route onward
+      - the receiving island routing internally
+    Per message we log the full hop chain and the failure point, so a
+    failure reads as: source-refused / no-bridge / stranded-at-hop-N /
+    delivered. The islands are 4x2 tiles of a mini-grid: dense
+    internally, ~10 km apart, 3-6 border pairs."""
+    import math as _math
+    N_PER = 25
+    duration_h = _ARGS.duration if getattr(_ARGS, 'duration', None) else 8
+    duration_us = duration_h * 3_600_000_000
+    warmup_h = _ARGS.warmup
+    warmup_us = warmup_h * 3_600_000_000
+    interval_us = _ARGS.interval * 1_000_000
+    radio = Radio()
+    radio.wire.open = False
+    # island A: grid around (0,0); island B: same grid around (+12 km, 0)
+    nodes = []
+    ids = []
+    def mk_positions(cx_m, cy_m, base_id):
+        out = []
+        for i in range(N_PER):
+            gx = (i % 5) * 900            # 900 m grid spacing
+            gy = (i // 5) * 900
+            out.append((base_id + i, cx_m + gx, cy_m + gy, 20.0))
+        return out
+    A = mk_positions(0, 0, 0x0100)
+    B = mk_positions(15000, 0, 0x0200)    # 15 km east, 20 m masts:
+    # 150 border pairs only - thin enough to force real bridging
+    ids_a = [p[0] for p in A]; ids_b = [p[0] for p in B]
+    ids = ids_a + ids_b
+    lat0, lon0 = 52.09, 5.07
+    def geo_of(x_m, y_m):
+        return grid_geo(lat0 + y_m/111000, lon0 + x_m/(111000*0.615))
+    for (nid, x, y, h) in A + B:
+        kn = Node(radio, nid)
+        kn.core = set_jitter(mk(kn), jitter)
+        kn.core.set_geo(*geo_of(x, y))
+        nodes.append(kn)
+        radio.schedule((nid & 0xFF) * 250_000, kn.core.start)
+    # links: all pairs within an island via linkbudget on local metres;
+    # border pairs: the east edge of A to the west edge of B
+    posm = {p[0]: (p[1], p[2], p[3]) for p in A + B}
+    for a in ids:
+        for b in ids:
+            if a == b: continue
+            same = ((a in ids_a) == (b in ids_b))
+            pa = posm[a]; pb = posm[b]
+            raw = linkbudget(pa, pb)
+            if raw is None: continue
+            fade = ((a * 31 + b * 17) % 11) - 5
+            r = raw + fade
+            if r >= RX_MIN_DBM:
+                radio.wire.links[(a, b)] = max(-128, min(120, round(r)))
+    deg = {i: 0 for i in ids}
+    for (a, b) in radio.wire.links: deg[a] += 1
+    border = [(a,b) for (a,b) in radio.wire.links if a in ids_a and b in ids_b]
+    out(f"two islands x{N_PER}: {len(radio.wire.links)} directed links, "
+        f"degree avg {sum(deg.values())/len(ids):.1f}, border pairs: {len(border)}")
+
+    # cross-island traffic: source in A, destination in B (always out of
+    # the local graph at the source, geo from the client)
+    rng = random.Random(2026)
+    node_geo = {nid: geo_of(posm[nid][0], posm[nid][1]) for nid in ids}
+    payload = b'x' * 20
+    att = [0]; dlv = [0]; refused = [0]
+    msg_hops = {}      # msg-id -> [hops...] (for the strand analysis)
+    base_rx = CCore.rx
+    def rx(self, arg):
+        ch, rssi, pkt = arg
+        if pkt and (pkt[0] & 0x0F) == 5 and len(pkt) > 12:
+            mid = pkt[1] | (pkt[2] << 8)
+            nh = pkt[10] | (pkt[11] << 8)
+            msg_hops.setdefault(mid, []).append((self.n.id, nh))
+        base_rx(self, arg)
+    CCore.rx = rx
+    def gen():
+        if radio.now >= warmup_us:
+            src = rng.choice(ids_a)
+            dst = rng.choice(ids_b)
+            rc = src_node(src).core.send_data(dst, payload, ack3=False,
+                                              geo=node_geo[dst])
+            if rc == 0: att[0] += 1
+            else: refused[0] += 1
+        if radio.now + interval_us <= duration_us:
+            radio.schedule(interval_us, gen)
+    def src_node(nid):
+        return next(kn for kn in nodes if kn.id == nid)
+    if interval_us:
+        radio.schedule(warmup_us, gen)
+
+    radio.run(until_us=duration_us)
+    out(f"\n=== Islands test ({duration_h} h) ===")
+
+    # strand analysis: per msg, did it reach its destination?
+    # msg_hops[mid] = [(node-id, next-hop), ...] per DATA reception
+    # A message DELIVERED: its destination appears as a receiver.
+    # delivered set from the rx wrapper: dst field is in the header,
+    # so also track dst per mid.
+    msg_dst = {}
+    base_send = CCore.send_data
+    # find the destination per msg id from the pending records at send
+    # (simpler: re-derive from the send log we keep below)
+    # -- the analysis below uses the rx hop chains + the dst per mid
+    deliveries = set()
+    for mid, hops in msg_hops.items():
+        # every DATA reception recorded (node, next-hop): if the
+        # receiving node IS the next hop target of the previous entry
+        # chain end, or the node equals the dst, it delivered
+        pass
+    # track dst per mid via a send-side hook: wrap send_data to note
+    # (msg-id, dst) - the pending record is readable right after the call
+    def send_wrap(self, dst, data, ack3=True, geo=None):
+        rc = base_send(self, dst, data, ack3=ack3, geo=geo)
+        if rc == 0:
+            for p in self.mn.pend:
+                if p.active and p.dst == dst:
+                    msg_dst[p.msg_id] = dst
+                    break
+        return rc
+    CCore.send_data = send_wrap
+    # note: send_wrap installed AFTER the run - re-installed for a
+    # second short phase is not needed; instead reconstruct dsts from
+    # the send log we recorded: att/refused used the actual pend records
+    # at send time; for the analysis we re-run the bookkeeping from the
+    # logged chains alone (dst = the last next-hop of a delivered chain).
+    delivered = 0
+    stranded = {}
+    for mid, hops in msg_hops.items():
+        # a hop chain: the message delivered when some receiver node's
+        # recorded next-hop equals its own id (dst received it) OR the
+        # chain's last next-hop was the dst and the dst appears as a
+        # receiver
+        rcv = {nid for (nid, nh) in hops}
+        last_nh = hops[-1][1]
+        if last_nh in rcv or (len(hops) > 1 and hops[-1][0] == last_nh):
+            delivered += 1
+        else:
+            # stranded: count by the LAST node that had it
+            last_node = hops[-1][0]
+            stranded[last_node] = stranded.get(last_node, 0) + 1
+    out(f"cross-island: attempts {att[0]}, refused-at-send {refused[0]}")
+    out(f"hop chains seen: {len(msg_hops)}, delivered {delivered} "
+        f"({100*delivered/max(len(msg_hops),1):.1f}%)")
+    out(f"stranded at last holder: " + ", ".join(
+        f"{nid:#06x} x{c}" for nid, c in sorted(stranded.items(), key=lambda kv: -kv[1])[:10]))
+    # which nodes are the stranding points? (their island + border
+    # position tells the story)
+    star_report(radio)
+
+@scenario("star-scale", "scale test: 480 nodes (4x3 tiles of utrecht40) - rest "
+                        "convergence and long-distance delivery")
+def star_scale(mk, jitter):
+    """Scale scenario (post-6): the utrecht40 set tiled 4x3 with ~3 km
+    gaps - 480 nodes over ~180x250 km, every tile internally dense,
+    tens of links across every tile border. Two phases in one run:
+      - convergence at rest: the probes sample how many of the 479
+        OTHER nodes an average node has in its map, and the link
+        coverage - the whole-network picture building up (target:
+        full-graph coverage as measured on 40 nodes, in the 24 h
+        order, not weeks);
+      - delivery: after the warmup, a unicast every --interval s
+        between random node PAIRS ACROSS THE WHOLE WORLD (multi-hop,
+        2-15 hops expected) - the real verdict at scale.
+    Reports per phase: map coverage %, link count, delivery ratio,
+    latency, airtime, duty, hard bound, missed requests."""
+    nodes_list = load_nodes_csv(_ARGS.nodes)
+    duration_h = _ARGS.duration if getattr(_ARGS, 'duration', None) else 24
+    duration_us = duration_h * 3_600_000_000
+    warmup_h = _ARGS.warmup
+    warmup_us = warmup_h * 3_600_000_000
+    interval_us = _ARGS.interval * 1_000_000
+    radio = Radio()
+    radio.wire.open = False
+    lat0 = sum(n['lat'] for n in nodes_list) / len(nodes_list)
+    lon0 = sum(n['lon'] for n in nodes_list) / len(nodes_list)
+    pos = {n['id']: (*project(n['lat'], n['lon'], lat0, lon0), n['h']) for n in nodes_list}
+    nodes = []
+    for i, nd in enumerate(nodes_list):
+        kn = Node(radio, nd['id'])
+        kn.core = set_jitter(mk(kn), jitter)
+        kn.core.set_geo(*grid_geo(nd['lat'], nd['lon']))
+        nodes.append(kn)
+        radio.schedule(i * 250_000, kn.core.start)
+    ids = [n['id'] for n in nodes_list]
+    idset = set(ids)
+    print(f"building {len(ids)}x{len(ids)} link table...")
+    for a in ids:
+        for b in ids:
+            if a == b: continue
+            raw = linkbudget(pos[a], pos[b])
+            if raw is None: continue
+            fade = ((a * 31 + b * 17) % 11) - 5
+            r = raw + fade
+            if r >= RX_MIN_DBM:
+                radio.wire.links[(a, b)] = max(-128, min(120, round(r)))
+    deg = {i: 0 for i in ids}
+    for (a, b) in radio.wire.links:
+        deg[a] += 1
+    out(f"{len(nodes_list)} nodes from {_ARGS.nodes}, duration {duration_h} h "
+        f"(warmup {warmup_h} h)")
+    out(f"topology: {len(radio.wire.links)} directed links, avg degree "
+        f"{sum(deg.values())/len(ids):.1f}, min {min(deg.values())}, max {max(deg.values())}")
+
+    # convergence probes: sampled (full 480x480 scans are too slow)
+    rng = random.Random(2026)
+    probe_sample = rng.sample(nodes, 24)     # 24 observer nodes
+    def probe():
+        known = []; links = []
+        for kn in probe_sample:
+            known.append(sum(1 for m in kn.core.mn.map if m.alive))
+            links.append(sum(1 for l in kn.core.mn.lnk if l.alive))
+        out(f"[probe t={radio.now/3.6e9:.2f} h] map avg "
+            f"{sum(known)/len(known):.1f}/{len(ids)} ({100*sum(known)/len(known)/len(ids):.1f}%), "
+            f"links avg {sum(links)/len(links):.1f}")
+        if radio.now + 60*60_000_000 < duration_us:
+            radio.schedule(60 * 60_000_000, probe)
+    radio.schedule(warmup_us, probe)
+    for fh in (2, 4, 8, 12, 18):
+        if warmup_h < fh < duration_h:
+            radio.schedule(fh * 3_600_000_000, probe)
+
+    # delivery after warmup: random pairs across the whole world
+    node_geo = {n['id']: grid_geo(n['lat'], n['lon']) for n in nodes_list}
+    payload = b'x' * 20
+    # delivery split: IN-GRAPH (destination in the source's map) vs
+    # OUT-OF-GRAPH (the bridge-node rule, 10.2: destination geo from
+    # the client, route toward the nearest known node) - the geo-based
+    # delivery question of the scale run
+    att_in = [0]; dlv_in = [0]; att_out = [0]; dlv_out = [0]; refused = [0]
+    base_rx = CCore.rx
+    def rx(self, arg):
+        ch, rssi, pkt = arg
+        if pkt and (pkt[0] & 0x0F) == 5 and len(pkt) > 10:
+            dst = pkt[5] | (pkt[6] << 8)
+            if dst == self.n.id:
+                src = pkt[3] | (pkt[4] << 8)
+                mid = pkt[1] | (pkt[2] << 8)
+                key = (mid, src)
+                if not hasattr(rx, '_seen'): rx._seen = set()
+                if key not in rx._seen:
+                    rx._seen.add(key)
+                    if key in getattr(rx, '_bymode', {}):
+                        if rx._bymode[key] == 'in': dlv_in[0] += 1
+                        else: dlv_out[0] += 1
+                    else:
+                        dlv_in[0] += 1   # fallback: counted as in-graph
+        base_rx(self, arg)
+    CCore.rx = rx
+    def gen():
+        if radio.now >= warmup_us:
+            kn = rng.choice(nodes)
+            dst = rng.choice(ids)
+            if dst != kn.id:
+                in_graph = any(m.alive and m.id == dst for m in kn.core.mn.map)
+                rc = kn.core.send_data(dst, payload, ack3=False, geo=node_geo[dst])
+                if rc == 0:
+                    if not hasattr(rx, '_bymode'): rx._bymode = {}
+                    # record the msg id per mode (dedup key = (mid, src))
+                    for p in kn.core.mn.pend:
+                        if p.active and p.dst == dst:
+                            rx._bymode[(p.msg_id, kn.id)] = 'in' if in_graph else 'out'
+                            break
+                    if in_graph: att_in[0] += 1
+                    else: att_out[0] += 1
+                else:
+                    refused[0] += 1
+        if radio.now + interval_us <= duration_us:
+            radio.schedule(interval_us, gen)
+    if interval_us:
+        radio.schedule(warmup_us, gen)
+
+    radio.run(until_us=duration_us)
+    out(f"\n=== Scale scenario ({len(nodes_list)} nodes, {duration_h} h) ===")
+    ai, di, ao, do_ = att_in[0], dlv_in[0], att_out[0], dlv_out[0]
+    if ai: out(f"unicast IN-GRAPH: attempts {ai}, delivered {di} ({100*di/ai:.1f}%)")
+    if ao: out(f"unicast OUT-OF-GRAPH (geo/bridge): attempts {ao}, delivered {do_} "
+               f"({100*do_/ao:.1f}%)")
+    # map pool occupancy: MC_MAP_NODES is 256, the world is 480 - how full,
+    # and how many nodes run AT the cap (eviction pressure)
+    pools = sorted(kn.core.map_size() for kn in nodes)
+    at_cap = sum(1 for p in pools if p >= 256)
+    out(f"map pool: avg {sum(pools)/len(pools):.1f}/256, p50 {pools[len(pools)//2]}, "
+        f"max {pools[-1]}, at the 256 cap: {at_cap}/{len(nodes)}")
+    out(f"refused (destination not in the graph yet / no slot): {refused[0]} "
+        f"({100*refused[0]/max(att+refused[0],1):.1f}% of offers)")
+    # LOCAL occupancy: the channel is shared per receiver (a packet
+    # occupies only where it is audible) - the global counter reads as
+    # if the whole world shared one cell. Report per-node local busy
+    # share on the home channel, the honest capacity number.
+    occs = []
+    for kn in nodes:
+        occs.append(radio.wire.occupancy(kn.id, kn.core.mn.home_ch, duration_us))
+    occs.sort()
+    out(f"local occupancy (home channel, per node): avg {100*sum(occs)/len(occs):.2f}%, "
+        f"p50 {100*occs[len(occs)//2]:.2f}%, max {100*occs[-1]:.2f}%")
+    usage = {(kn.id, c): radio.duty.usage(kn.id, c, radio.now)
+             for kn in nodes for c in range(N_CH)}
+    top = sorted(usage.values(), reverse=True)[:5]
+    out(f"duty (sliding hour, limit 360 s): max {top[0]/1e6:.1f} s, "
+        f"above limit: {sum(1 for u in usage.values() if u > 360_000_000)}")
+    ghosts = sum(1 for kn in nodes for m in kn.core.mn.map
+                 if m.alive and m.id not in idset)
+    out(f"ghost entries: {ghosts}")
+    star_report(radio)
+
 @scenario("star-dense", "scenario 6f (4.3): dense-cluster stress - 64 fully meshed "
                           "nodes on one home channel, the shared-channel bound")
 def star_dense(mk, jitter):

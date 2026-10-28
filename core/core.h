@@ -23,7 +23,9 @@
 #define MC_MAX_PENDING   16
 #define MC_MAX_DEDUP    128
 #define MC_MAX_PAYLOAD  230
+#ifndef MC_MAP_NODES
 #define MC_MAP_NODES    256             /* bounded 2-hop map (13.2, 13.3) */
+#endif   /* the sim can override at build time for pool-pressure tests */
 #define MC_MAX_LINKS   1536            /* link store: links between map nodes (13.2) */
 #define MC_T_SYM_US      21600000000ull  /* 6 h: validity of confirmed symmetry (4.2) */
 #define MC_T_EXPIRE_TICKS 257u           /* ~4 h in proof ticks: neighbour-table expiry (4.4) */
@@ -241,6 +243,19 @@ struct mimeshi_node {
     uint16_t dedup_seq;               /* FIFO insertion counter of the dedup cache (14) */
     uint8_t  tbl_dirty;               /* own-star content change pending (4.3) */
     uint8_t  star_round_sched;        /* star-round timer running (4.3) */
+    uint16_t ev_taboo[256];          /* eviction taboo (4.3): the set of judged-
+                                        and-rejected star IDs (admission losses
+                                        and evictions) - a catalogue mismatch
+                                        for a tabooed star creates NO miss
+                                        request: the rejection was a policy
+                                        choice, requesting it back is a cycle
+                                        under pool pressure. No ring overwrite:
+                                        a rejection stands until the star is
+                                        actually stored again (the pool
+                                        composition changes slowly). 256 =
+                                        the map pool size: every possible
+                                        rejection fits. */
+    uint8_t  ev_taboo_idx;            /* ring write position */
     uint8_t  star_backlog;           /* 6e: content work remained after the last
                                         round (stars queued or not fully carried) -
                                         the quiet-hour acceleration halves the

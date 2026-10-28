@@ -70,6 +70,31 @@ class Wire:
     def begin(self, now, ch, tx_id, airtime):
         self.chan[ch] = [w for w in self.chan[ch] if w[1] > now]
         self.chan[ch].append((now, now + airtime, tx_id))
+        # local occupancy (scale runs): the channel is a SHARED MEDIUM
+        # PER RECEIVER - a transmission occupies only where it is
+        # audible. Book the airtime on the AUDIBLE receivers' local
+        # channel, not globally (the global airtime[c] counter is the
+        # sum over the whole world and reads as if one packet occupies
+        # the channel everywhere - which is only true at 40-node scale).
+        if not hasattr(self, 'occ'):
+            self.occ = {}          # (rx-id, ch) -> busy us
+        for rx in self.audible(tx_id, ch):
+            self.occ[(rx, ch)] = self.occ.get((rx, ch), 0) + airtime
+
+    def audible(self, tx_id, ch):
+        """Receivers that can hear tx_id on any channel (their home or
+        an exchange): iterates the link table - at 480 nodes this is
+        the pair list, ~degree entries, cheap enough per packet."""
+        if not hasattr(self, '_adj'):
+            self._adj = {}
+            for (a, b) in self.links:
+                self._adj.setdefault(a, []).append(b)
+        return self._adj.get(tx_id, [])
+
+    def occupancy(self, rx_id, ch, span_us):
+        """Fraction [0..1] of span_us that rx_id's local channel ch
+        was busy with audible transmissions."""
+        return self.occ.get((rx_id, ch), 0) / max(span_us, 1)
     def check(self, now, rx_id, tx_id, ch, start, end):
         """Disturbance of the reception [start, end) on channel ch.
         None = clean; otherwise (reason, disturbing sender).
