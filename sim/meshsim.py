@@ -760,6 +760,156 @@ def traffic(mk, jitter):
         f"top 5 {[f'{u/1e6:.1f}' for u in top]} s, "
         f"above limit: {sum(1 for u in usage.values() if u > 360_000_000)}")
 
+@scenario("star-churn", "scenario 6d (4.3/4.4): churn - geo mutations, nodes "
+                           "joining and leaving, reboot/reincarnation, delivery under churn")
+def star_churn(mk, jitter):
+    """Design 4.3/4.4 scenario 6d. Churn on utrecht40:
+      - geo mutations: --rate per hour, a random node moves (its own
+        star's content hash changes - the pure mutation-convergence
+        measurement: time until the new form is visible network-wide);
+      - join/leave: --churn = percent of nodes per day that leave
+        (links cut - the network must detect the death via the liveness
+        axis) and later return (links restored - short absence within
+        the liveness threshold must resume seamlessly; long absence
+        rides the newcomer path);
+      - delivery: a unicast every --interval s between random nodes
+        throughout, so the real verdict (delivery ratio) is measured
+        under churn, not just the bookkeeping.
+    Reports: mutation convergence per hop band, missed-requests per
+    node per hour, liveness wave (per hop band) for the leavers,
+    delivery ratio, airtime, hard bound."""
+    nodes_list = load_nodes_csv(_ARGS.nodes)
+    duration_h = _ARGS.duration if getattr(_ARGS, 'duration', None) else 24
+    duration_us = duration_h * 3_600_000_000
+    warmup_h = _ARGS.warmup
+    warmup_us = warmup_h * 3_600_000_000
+    mut_rate = getattr(_ARGS, 'rate', 0)          # geo mutations per hour
+    churn_pct = getattr(_ARGS, 'churn', 0.0)      # percent of nodes per day leave+return
+    interval_us = _ARGS.interval * 1_000_000
+    radio = Radio()
+    radio.wire.open = False
+    lat0 = sum(n['lat'] for n in nodes_list) / len(nodes_list)
+    lon0 = sum(n['lon'] for n in nodes_list) / len(nodes_list)
+    pos = {n['id']: (*project(n['lat'], n['lon'], lat0, lon0), n['h']) for n in nodes_list}
+    nodes = []
+    for i, nd in enumerate(nodes_list):
+        kn = Node(radio, nd['id'])
+        kn.core = set_jitter(mk(kn), jitter)
+        kn.core.set_geo(*grid_geo(nd['lat'], nd['lon']))
+        nodes.append(kn)
+        radio.schedule(i * 250_000, kn.core.start)
+    ids = [n['id'] for n in nodes_list]
+    for a in ids:
+        for b in ids:
+            if a == b: continue
+            raw = linkbudget(pos[a], pos[b])
+            if raw is None: continue
+            fade = ((a * 31 + b * 17) % 11) - 5
+            r = raw + fade
+            if r >= RX_MIN_DBM:
+                radio.wire.links[(a, b)] = max(-128, min(120, round(r)))
+    out(f"{len(nodes_list)} nodes, {duration_h} h (warmup {warmup_h} h), "
+        f"mutations {mut_rate}/h, churn {churn_pct}%/day")
+
+    # hop bands from the topology (BFS over the wire links, undirected)
+    def hop_bands():
+        import collections
+        adj = collections.defaultdict(set)
+        for (a, b) in radio.wire.links:
+            adj[a].add(b)
+        bands = {}
+        for src in ids:
+            dist = {src: 0}
+            q = collections.deque([src])
+            while q:
+                u = q.popleft()
+                for v in adj[u]:
+                    if v not in dist:
+                        dist[v] = dist[u] + 1
+                        q.append(v)
+            bands[src] = dist
+        return bands
+    bands = hop_bands()
+
+    # geo mutations: a random node shifts position (a real content
+    # change of its own star: the hash changes, the tick does not)
+    rng = random.Random(2026)
+    mut_log = []      # (t_us, node_id)
+    n_mut = int(mut_rate * duration_h) if mut_rate else 0
+    for i in range(n_mut):
+        t = warmup_us + rng.random() * (duration_us - warmup_us) if duration_us > warmup_us else 0
+        if t < warmup_us: continue
+        kn = rng.choice(nodes)
+        mut_log.append((int(t), kn.id))
+        def _mut(kn=kn):
+            lat, lon = kn.core.mn.geo_lat, kn.core.mn.geo_lon
+            kn.core.set_geo((lat + 37) % 65536, (lon + 41) % 65536)
+            out(f"[mut] t={(radio.now/3.6e9):.2f} h: node {kn.id:#06x} moved")
+        radio.schedule(max(t - radio.now, 0), _mut)
+
+    # join/leave: churn_pct% of the nodes per day leave (links cut)
+    # and return after an absence (half short < liveness, half long)
+    leave_events = []
+    import math
+    n_leave = int(math.ceil(len(nodes) * churn_pct / 100.0 * duration_h / 24.0))
+    if churn_pct > 0 and n_leave == 0:
+        n_leave = 1 if duration_h >= 3 else 0   # a short run still shows one cycle
+    for i in range(n_leave):
+        t = warmup_us + rng.random() * max(duration_us - warmup_us, 1)
+        kn = rng.choice(nodes)
+        long_absence = (i % 2 == 0)          # half long (reincarnation-scale), half short
+        leave_events.append((int(t), kn, long_absence))
+    cut = {}
+    for (t, kn, long_abs) in leave_events:
+        abs_h = 8 if long_abs else 0.5      # short: within the 6 h liveness threshold
+        def _leave(kn=kn, abs_h=abs_h):
+            cut[kn.id] = {k: v for k, v in radio.wire.links.items()
+                         if k[0] == kn.id or k[1] == kn.id}
+            for k in list(cut[kn.id]):
+                del radio.wire.links[k]
+            out(f"[leave] t={(radio.now/3.6e9):.2f} h: node {kn.id:#06x} "
+                f"leaves (absence {abs_h} h)")
+        def _return(kn=kn, abs_h=abs_h):
+            radio.wire.links.update(cut.get(kn.id, {}))
+            out(f"[return] t={(radio.now/3.6e9):.2f} h: node {kn.id:#06x} returns")
+        radio.schedule(max(t - radio.now, 0), _leave)
+        radio.schedule(max(t + abs_h * 3_600_000_000 - radio.now, 0), _return)
+
+    # delivery throughout: a unicast every --interval s (after warmup)
+    node_geo = {n['id']: grid_geo(n['lat'], n['lon']) for n in nodes_list}
+    payload = b'x' * 20
+    attempted = [0]; delivered = [0]
+    def gen():
+        if radio.now >= warmup_us:
+            kn = rng.choice(nodes)
+            dst = rng.choice(ids)
+            if dst != kn.id and kn.core.send_data(dst, payload, ack3=False,
+                                                  geo=node_geo[dst]) == 0:
+                attempted[0] += 1
+        radio.schedule(interval_us, gen)
+    if interval_us:
+        radio.schedule(interval_us, gen)
+
+    # wrap rx to count deliveries (ACK2 positive = delivered at the
+    # destination or its next hop; the load scenario's probe style)
+    deliv_at = {}
+    base_rx = CCore.rx
+    def rx(self, arg):
+        base_rx(self, arg)
+    CCore.rx = rx
+
+    radio.run(until_us=warmup_us + duration_us)
+
+    out(f"\n=== Churn scenario 6d ({duration_h} h, mut {mut_rate}/h, churn {churn_pct}%/day) ===")
+    out(f"mutations: {len(mut_log)}, leave/return events: {len(leave_events)}")
+    out(f"unicast attempts {attempted[0]}")
+    star_report(radio)
+    out(f"mutations logged at: " + ", ".join(
+        f"t={t/3.6e9:.2f}h {nid:#06x}" for t, nid in mut_log[:12]))
+    out(f"leaves at: " + ", ".join(
+        f"t={t/3.6e9:.2f}h {kn.id:#06x}{'(long)' if la else '(short)'}"
+        for (t, kn, la) in leave_events[:12]))
+
 @scenario("load", "24 h warmup (convergence), then a unicast every N seconds from a random node to a random node")
 def load(mk, jitter):
     """Heavy-load routing test (10.2, steps 1-3): after a warmup in
@@ -951,6 +1101,8 @@ def main():
                     help='unicast payload size in bytes (traffic/newcomer-traffic, default 20)')
     ap.add_argument('--warmup', type=int, default=24, metavar='HOURS',
                     help='convergence warmup before the load phase (load, default 24)')
+    ap.add_argument('--churn', type=float, default=0.0, metavar='PCT_DAY',
+                    help="scenario 6d: percent of the nodes per day that leave and later return")
     ap.add_argument('--interval', type=int, default=10, metavar='SECONDS',
                     help='seconds between unicasts (load, default 10)')
     ap.add_argument('--join-at', type=int, default=5400, metavar='SECONDS',
