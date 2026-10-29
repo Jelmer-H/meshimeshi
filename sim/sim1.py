@@ -425,6 +425,7 @@ class CPending(ctypes.Structure):
                 ("msg_id", ctypes.c_uint16), ("src", ctypes.c_uint16),
                 ("dst", ctypes.c_uint16), ("prev_hop", ctypes.c_uint16),
                 ("next_hop", ctypes.c_uint16),
+                ("in_graph", ctypes.c_uint8), ("pad0", ctypes.c_uint8),   # alignment: C pads to 4 before cand[3]
                 ("cand", ctypes.c_uint16 * 3),
                 ("excl", ctypes.c_uint16 * 3),
                 ("pkt", ctypes.c_uint8 * (16 + MC_MAX_PAYLOAD)),

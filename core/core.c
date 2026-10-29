@@ -2395,7 +2395,21 @@ static void ack2_timeout(mimeshi_node *n, void *ud) {
 
 static void pending_try(mimeshi_node *n, mimeshi_pending *p) {
     if (p->cand_cnt == 0) return;             /* no schedule: nothing to send (defensive) */
-    p->next_hop = p->cand[p->try_idx % p->cand_cnt];   /* round-robin over the schedule (7.4) */
+    /* Attempt order (7.4, revised Oct 2026 - the in-graph retry bias):
+     * round-robin gives every candidate the same number of attempts -
+     * fair for a geo-guess plan, wasteful for a Dijkstra-proven one: a
+     * failed exchange on the proven optimum is more likely fluctuation
+     * than structure, and detouring to the second-best abandons proven
+     * quality for a guess. In-graph the order is therefore
+     * optimum-first: cand0 twice, then cand1, cand0 again, cand2, cand0
+     * (the 4-6 attempts of the series, the optimum getting the
+     * majority). Out-of-graph (geo/bridge) the round-robin stands. */
+    if (p->in_graph) {
+        static const uint8_t bias[6] = { 0, 1, 0, 2, 0, 1 };
+        p->next_hop = p->cand[bias[p->try_idx % 6] % p->cand_cnt];
+    } else {
+        p->next_hop = p->cand[p->try_idx % p->cand_cnt];   /* round-robin over the schedule (7.4) */
+    }
     p->pkt[9] = p->budget_left;
     wr16(p->pkt + 10, p->next_hop);           /* next hop in the header (6.1) */
     MTRACE(n, "TRY %u/%u msg %u via %u (budget %u)\n",
@@ -2437,6 +2451,7 @@ int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uin
     /* attempt schedule (7.4): up to 3 Dijkstra-best hops toward dst; the
      * route itself is the first candidate - or the send is refused. */
     p->cand_cnt = schedule_candidates(n, dst, dest_lat, dest_lon, n->id, 0, 0, p->cand);
+    p->in_graph = r_idx(n, dst) >= 0 || nbr_find(n, dst) != 0;   /* Dijkstra-proven plan? (7.4) */
     if (p->cand_cnt == 0) return -1;           /* not in the graph: no flood (10.2) */
     uint16_t nh = p->cand[0];
     p->msg_id = (uint16_t)n->rand(n);
@@ -2734,6 +2749,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
              * after the check - an unforwardable message must not
              * leak its pending slot. */
             p->cand_cnt = schedule_candidates(n, dst, gl, go, prev, 0, 0, p->cand);
+            p->in_graph = r_idx(n, dst) >= 0 || nbr_find(n, dst) != 0;   /* Dijkstra-proven plan? (7.4) */
             if (p->cand_cnt == 0) {
                 /* No routable path from here (7.2/10.5): NEGATIVE back,
                  * not silence - the previous hop retries via its own
