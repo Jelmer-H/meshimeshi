@@ -1407,6 +1407,20 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
     if (len < 10) return;
     uint16_t owner = rd16(pkt + 1);      /* the advertiser: miss requests address it */
 
+    /* Liveness (4.4, fixed Oct 2026, the warmup expiry finding): a star
+     * round is an IDENTIFYING transmission of its advertiser - the id
+     * is in the header, and every node sends one each round (~45 min).
+     * A direct neighbour's own round therefore proves it is alive;
+     * without this refresh the last_seen clock had no keepalive
+     * trigger (hellos turn rare after startup, ACK1s only exist on
+     * traffic, proofs are reactionless by design), and quiet
+     * neighbour pairs expired at ~4 h on a living net - the
+     * routing graph lost edges the knowledge graph still had. */
+    if (owner != n->id) {
+        mimeshi_neighbor *onb = nbr_find(n, owner);
+        if (onb) onb->last_seen = 0;
+    }
+
     /* --- content area: chunk entry layout, processed via chunk_rx ---
      * The header (10 B) is identical to a 4.3 chunk, and the entries
      * follow the same layout. chunk_rx() expects p[4] entries and
