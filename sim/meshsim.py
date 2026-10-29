@@ -1739,6 +1739,10 @@ def main():
                     help="scenario 6d: percent of the nodes per day that leave and later return")
     ap.add_argument('--interval', type=int, default=10, metavar='SECONDS',
                     help='seconds between unicasts (load, default 10)')
+    ap.add_argument('--graph-out', metavar='FILE.json',
+                    help='after the run: dump the final graph state as JSON '
+                         '(nodes with positions, every node\'s link store and map pool) '
+                         'for the graph viewer (tools/graph.html)')
     ap.add_argument('--trace', action='store_true',
                     help='message tracing: every node logs its DATA sends/receives '
                          'and ack1/ack2 with a [msg] prefix (forensics runs; pair '
@@ -1774,6 +1778,35 @@ def main():
 
     lib = load_lib(args.so)
     mk = lambda nd: CCore(nd, lib)
+    import atexit
+    def _graph_dump():
+        if not getattr(_ARGS, 'graph_out', None):
+            return
+        import json
+        radio = sim1.RADIO_REF[0] if getattr(sim1, 'RADIO_REF', None) else None
+        nodes = sim1.ALL_NODES if hasattr(sim1, 'ALL_NODES') else []
+        out_nodes = []
+        for kn in nodes:
+            core = kn.core
+            links = []
+            for l in core.mn.lnk:
+                if l.alive:
+                    links.append([int(l.a), int(l.b)])
+            pool = [int(m.id) for m in core.mn.map if m.alive]
+            nbrs = [int(nb.id) for nb in core.mn.nbr if nb.alive]
+            out_nodes.append({
+                'id': int(kn.id), 'nbrs': nbrs, 'links': links, 'pool': pool})
+        geo = {}
+        for line in open('sim/nodes/utrecht480.csv' if '480' in (_ARGS.nodes or '') else _ARGS.nodes):
+            line = line.strip()
+            if not line or line.startswith('#'): continue
+            p = line.split(',')
+            geo[int(p[0], 16)] = [float(p[1]), float(p[2])]
+        data = {'nodes': out_nodes, 'geo': geo}
+        with open(_ARGS.graph_out, 'w') as f:
+            json.dump(data, f)
+        out(f"graph state dumped to {_ARGS.graph_out}")
+    atexit.register(_graph_dump)
 
     fn, desc = SCENARIOS[args.scenario]
     out(f"=== Scenario '{args.scenario}': {desc} (C core, SF7, 62.5 kHz) ===")

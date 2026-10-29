@@ -557,6 +557,7 @@ class CCore:
     state). The four callbacks run via the simulator above."""
     def __init__(self, node, lib):
         self.n, self.lib = node, lib
+        globals().setdefault('ALL_NODES', []).append(node)
         self.mn = CNode()
         NODES[ctypes.addressof(self.mn)] = node
         lib.mimeshi_init(ctypes.byref(self.mn), node.id, _tx, _timer, _switch, _rand, _channel_free, None)
