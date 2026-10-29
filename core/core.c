@@ -1770,9 +1770,17 @@ static uint16_t route_next_hop_ex_prev(mimeshi_node *n, uint16_t dst,
         int ex = 0;
         for (uint8_t e = 0; e < excl_cnt; e++) if (excl[e] == nb->id) { ex = 1; break; }
         if (ex) continue;                          /* failed for this message (7.4) */
-        if (prev && is_prev_nbr(n, prev, nb->id))
+        if (prev && nb->id != dst && is_prev_nbr(n, prev, nb->id))
             continue;   /* prev's neighbourhood: it already considered this hop
-                           (10.2, the 3-hop-loop closing rule, decided Oct 2026) */
+                           (10.2, the 3-hop-loop closing rule, decided Oct 2026).
+                           The DESTINATION itself is never excluded: delivery is
+                           not a step back but the end (fixed, Oct 2026, the
+                           6670 finding: in a dense cluster the last hops are each
+                           other's neighbours AND shared neighbours of the
+                           destination - the rule blocked every direct delivery
+                           edge toward dst, and the packet circled a destination
+                           that was in the pool and physically reachable the
+                           whole time). */
         int bi = r_idx(n, nb->id);
         if (bi < 0) continue;                     /* no map slot: no further edges */
         uint32_t c = route_edge_own(n, nb);
