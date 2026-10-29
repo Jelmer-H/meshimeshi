@@ -1,4 +1,15 @@
 docs/intern.md
 .venv/
+venv/
 
 __pycache__/
+*.pyc
+
+# build products
+build/
+*.o
+*.so
+
+# sim run outputs (rerunnable from the scenario + seed; keep the repo clean)
+*.log
+graph*.json
