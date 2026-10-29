@@ -1708,8 +1708,17 @@ static int r_idx(mimeshi_node *n, uint16_t id) {
  * `excl` (excl_cnt entries) are next hops that already failed for
  * THIS message: cumulative exclusion per series (7.4) - the
  * computation must not propose a hop the series has buried. */
+static int is_prev_nbr(mimeshi_node *n, uint16_t prev, uint16_t cand);
+static uint16_t route_next_hop_ex_prev(mimeshi_node *n, uint16_t dst,
+                                  const uint16_t *excl, uint8_t excl_cnt,
+                                  uint16_t prev);
 static uint16_t route_next_hop_ex(mimeshi_node *n, uint16_t dst,
                                   const uint16_t *excl, uint8_t excl_cnt) {
+    return route_next_hop_ex_prev(n, dst, excl, excl_cnt, 0);
+}
+static uint16_t route_next_hop_ex_prev(mimeshi_node *n, uint16_t dst,
+                                  const uint16_t *excl, uint8_t excl_cnt,
+                                  uint16_t prev) {
     if (dst == n->id) return n->id;
     int di = r_idx(n, dst);
     /* A direct neighbour is NOT its own first hop by definition: its
@@ -1724,6 +1733,12 @@ static uint16_t route_next_hop_ex(mimeshi_node *n, uint16_t dst,
     if (di < 0) {
         if (direct_ok) {
             for (uint8_t e = 0; e < excl_cnt; e++) if (excl[e] == dst) return 0;
+            /* delivery is never loop-blocked: the destination is not a
+             * 'step back', it is the end (10.2) */
+            if (prev && dst != prev && is_prev_nbr(n, prev, dst)) {
+                /* the destination IS a prev-neighbour - still deliver:
+                 * the loop rule concerns forwarding THROUGH, not TO */
+            }
             return dst;                          /* the only edge toward it is the own one */
         }
         return 0;                                /* not in the graph: no flood (10.2) */
@@ -1735,6 +1750,9 @@ static uint16_t route_next_hop_ex(mimeshi_node *n, uint16_t dst,
         int ex = 0;
         for (uint8_t e = 0; e < excl_cnt; e++) if (excl[e] == nb->id) { ex = 1; break; }
         if (ex) continue;                          /* failed for this message (7.4) */
+        if (prev && is_prev_nbr(n, prev, nb->id))
+            continue;   /* prev's neighbourhood: it already considered this hop
+                           (10.2, the 3-hop-loop closing rule, decided Oct 2026) */
         int bi = r_idx(n, nb->id);
         if (bi < 0) continue;                     /* no map slot: no further edges */
         uint32_t c = route_edge_own(n, nb);
@@ -1791,15 +1809,46 @@ static uint16_t route_next_hop(mimeshi_node *n, uint16_t dst) {
  * bridge-node rule routes toward the closest graph node near the
  * dest geo (15% candidate band, best route cost wins). geo (0,0)
  * = unknown: then a destination outside the graph is refused. */
-static uint16_t route_next_hop_geo(mimeshi_node *n, uint16_t dst,
+/* Prev-neighbourhood exclusion (10.2, decided Oct 2026, the 480-node
+ * loop finding): the hop the message came from already CONSIDERED its
+ * own neighbours and chose us - stepping directly back into its
+ * neighbourhood is a step back into its calculation. Without this,
+ * triangles (A -> B -> C -> A) circulate forever: each hop only knows
+ * to exclude its direct prev, and the third side of the triangle is
+ * never blocked (measured: msg 60004 looped 6165 -> 6171 -> 6166 ->
+ * 6165 for its whole life). With it, a candidate that is a LINK
+ * NEIGHBOUR of the prev hop is skipped - 3-hop loops cannot even
+ * start (the closing hop is forbidden at the hop that would close
+ * it). 4-hop loops remain possible (square without diagonals) but
+ * are rare in dense, clustered topologies. Purely local: a link-store
+ * lookup, no message state, no exclusion-list growth. */
+static int is_prev_nbr(mimeshi_node *n, uint16_t prev, uint16_t cand) {
+    if (!prev || prev == cand) return 1;          /* prev itself: already excluded */
+    for (int i = 0; i < MC_MAX_LINKS; i++) {
+        if (!n->lnk[i].alive) continue;
+        if (n->lnk[i].a == prev && n->lnk[i].b == cand) return 1;
+        if (n->lnk[i].b == prev && n->lnk[i].a == cand) return 1;
+    }
+    return 0;
+}
+
+static uint16_t route_next_hop_geo_prev(mimeshi_node *n, uint16_t dst,
                                   uint16_t lat, uint16_t lon,
-                                  const uint16_t *excl, uint8_t excl_cnt) {
-    uint16_t nh = route_next_hop_ex(n, dst, excl, excl_cnt);
+                                  const uint16_t *excl, uint8_t excl_cnt,
+                                  uint16_t prev);
+static uint16_t route_next_hop_geo_prev(mimeshi_node *n, uint16_t dst,
+                                  uint16_t lat, uint16_t lon,
+                                  const uint16_t *excl, uint8_t excl_cnt,
+                                  uint16_t prev) {
+    uint16_t nh = route_next_hop_ex_prev(n, dst, excl, excl_cnt, prev);
     if (nh) return nh;
     if (!lat && !lon) return 0;               /* no geo: no flood (10.2) */
     uint16_t bridge = route_bridge_node(n, lat, lon, excl, excl_cnt);
     if (!bridge) return 0;
-    return route_next_hop_ex(n, bridge, excl, excl_cnt);
+    /* the route TOWARD the bridge honours the prev-neighbourhood rule
+     * too: the first step must not dive straight back into prev's
+     * calculation space (10.2) */
+    return route_next_hop_ex_prev(n, bridge, excl, excl_cnt, prev);
 }
 
 /* Squared distance on the coarse 16-bit geo grid (5): comparison only,
@@ -2243,7 +2292,7 @@ static uint8_t schedule_candidates(mimeshi_node *n, uint16_t dst,
         if (prev) tmp[ec++] = prev;
         for (uint8_t e = 0; e < excl_cnt && ec < 3; e++) tmp[ec++] = excl[e];
         for (uint8_t k = 0; k < cnt && ec < 3; k++) tmp[ec++] = cand[k];
-        uint16_t nh = route_next_hop_geo(n, dst, gl, go, tmp, ec);
+        uint16_t nh = route_next_hop_geo_prev(n, dst, gl, go, tmp, ec, prev);
         if (!nh) break;
         cand[cnt++] = nh;
     }
