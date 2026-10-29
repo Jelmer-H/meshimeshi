@@ -1728,7 +1728,6 @@ static int r_idx(mimeshi_node *n, uint16_t id) {
  * `excl` (excl_cnt entries) are next hops that already failed for
  * THIS message: cumulative exclusion per series (7.4) - the
  * computation must not propose a hop the series has buried. */
-static int is_prev_nbr(mimeshi_node *n, uint16_t prev, uint16_t cand);
 static uint16_t route_next_hop_ex_prev(mimeshi_node *n, uint16_t dst,
                                   const uint16_t *excl, uint8_t excl_cnt,
                                   uint16_t prev);
@@ -1739,6 +1738,7 @@ static uint16_t route_next_hop_ex(mimeshi_node *n, uint16_t dst,
 static uint16_t route_next_hop_ex_prev(mimeshi_node *n, uint16_t dst,
                                   const uint16_t *excl, uint8_t excl_cnt,
                                   uint16_t prev) {
+    (void)prev;    /* the neighbourhood rule is removed; prev stays for the API */
     if (dst == n->id) return n->id;
     int di = r_idx(n, dst);
     /* A direct neighbour is NOT its own first hop by definition: its
@@ -1753,12 +1753,6 @@ static uint16_t route_next_hop_ex_prev(mimeshi_node *n, uint16_t dst,
     if (di < 0) {
         if (direct_ok) {
             for (uint8_t e = 0; e < excl_cnt; e++) if (excl[e] == dst) return 0;
-            /* delivery is never loop-blocked: the destination is not a
-             * 'step back', it is the end (10.2) */
-            if (prev && dst != prev && is_prev_nbr(n, prev, dst)) {
-                /* the destination IS a prev-neighbour - still deliver:
-                 * the loop rule concerns forwarding THROUGH, not TO */
-            }
             return dst;                          /* the only edge toward it is the own one */
         }
         return 0;                                /* not in the graph: no flood (10.2) */
@@ -1770,17 +1764,21 @@ static uint16_t route_next_hop_ex_prev(mimeshi_node *n, uint16_t dst,
         int ex = 0;
         for (uint8_t e = 0; e < excl_cnt; e++) if (excl[e] == nb->id) { ex = 1; break; }
         if (ex) continue;                          /* failed for this message (7.4) */
-        if (prev && nb->id != dst && is_prev_nbr(n, prev, nb->id))
-            continue;   /* prev's neighbourhood: it already considered this hop
-                           (10.2, the 3-hop-loop closing rule, decided Oct 2026).
-                           The DESTINATION itself is never excluded: delivery is
-                           not a step back but the end (fixed, Oct 2026, the
-                           6670 finding: in a dense cluster the last hops are each
-                           other's neighbours AND shared neighbours of the
-                           destination - the rule blocked every direct delivery
-                           edge toward dst, and the packet circled a destination
-                           that was in the pool and physically reachable the
-                           whole time). */
+        /* The prev-neighbourhood rule is REMOVED (decided Oct 2026, the
+         * 6670 lesson): 'prev already considered its neighbours and chose us'
+         * does not hold - prev's choice is one optimum under ITS cost model
+         * (its link qualities, its age multipliers, its graph), and a
+         * legitimate route from here may well begin with a hop into prev's
+         * neighbourhood: our edge toward X can score better than prev's did,
+         * or X's onward path better in OUR map. The measured cost: in a dense
+         * cluster the last hops are each other's neighbours AND shared
+         * neighbours of the destination - the rule filtered the delivery edge
+         * at every forwarder (the 6670 packet circled a reachable destination
+         * in its pool until the sender gave up). The prev hop ITSELF stays
+         * excluded (the original anti-ping-pong rule, via the excl array);
+         * only the neighbourhood extension is gone. Triangle loops are then
+         * possible again - the measurement decides whether the heuristic was
+         * worth its price. */
         int bi = r_idx(n, nb->id);
         if (bi < 0) continue;                     /* no map slot: no further edges */
         uint32_t c = route_edge_own(n, nb);
@@ -1837,28 +1835,6 @@ static uint16_t route_next_hop(mimeshi_node *n, uint16_t dst) {
  * bridge-node rule routes toward the closest graph node near the
  * dest geo (15% candidate band, best route cost wins). geo (0,0)
  * = unknown: then a destination outside the graph is refused. */
-/* Prev-neighbourhood exclusion (10.2, decided Oct 2026, the 480-node
- * loop finding): the hop the message came from already CONSIDERED its
- * own neighbours and chose us - stepping directly back into its
- * neighbourhood is a step back into its calculation. Without this,
- * triangles (A -> B -> C -> A) circulate forever: each hop only knows
- * to exclude its direct prev, and the third side of the triangle is
- * never blocked (measured: msg 60004 looped 6165 -> 6171 -> 6166 ->
- * 6165 for its whole life). With it, a candidate that is a LINK
- * NEIGHBOUR of the prev hop is skipped - 3-hop loops cannot even
- * start (the closing hop is forbidden at the hop that would close
- * it). 4-hop loops remain possible (square without diagonals) but
- * are rare in dense, clustered topologies. Purely local: a link-store
- * lookup, no message state, no exclusion-list growth. */
-static int is_prev_nbr(mimeshi_node *n, uint16_t prev, uint16_t cand) {
-    if (!prev || prev == cand) return 1;          /* prev itself: already excluded */
-    for (int i = 0; i < MC_MAX_LINKS; i++) {
-        if (!n->lnk[i].alive) continue;
-        if (n->lnk[i].a == prev && n->lnk[i].b == cand) return 1;
-        if (n->lnk[i].b == prev && n->lnk[i].a == cand) return 1;
-    }
-    return 0;
-}
 
 static uint16_t route_next_hop_geo_prev(mimeshi_node *n, uint16_t dst,
                                   uint16_t lat, uint16_t lon,
@@ -1868,6 +1844,7 @@ static uint16_t route_next_hop_geo_prev(mimeshi_node *n, uint16_t dst,
                                   uint16_t lat, uint16_t lon,
                                   const uint16_t *excl, uint8_t excl_cnt,
                                   uint16_t prev) {
+    (void)prev;    /* the neighbourhood rule is removed */
     uint16_t nh = route_next_hop_ex_prev(n, dst, excl, excl_cnt, prev);
     if (nh) return nh;
     if (!lat && !lon) return 0;               /* no geo: no flood (10.2) */
