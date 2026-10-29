@@ -1739,6 +1739,10 @@ def main():
                     help="scenario 6d: percent of the nodes per day that leave and later return")
     ap.add_argument('--interval', type=int, default=10, metavar='SECONDS',
                     help='seconds between unicasts (load, default 10)')
+    ap.add_argument('--trace', action='store_true',
+                    help='message tracing: every node logs its DATA sends/receives '
+                         'and ack1/ack2 with a [msg] prefix (forensics runs; pair '
+                         'with a low --interval to keep the log readable)')
     ap.add_argument('--join-at', type=int, default=5400, metavar='SECONDS',
                     help='newcomer start time in seconds (newcomer-traffic, default 5400)')
     args = ap.parse_args()
@@ -1765,6 +1769,8 @@ def main():
     import sim1
     if args.quiet:
         sim1.VERBOSE = False   # switch off radio logs; [core] lines remain
+    if args.trace:
+        sim1.TRACE_MSGS = True
 
     lib = load_lib(args.so)
     mk = lambda nd: CCore(nd, lib)

@@ -51,6 +51,12 @@
 #define MC_HELLO_ACK_WIN_US 3000000ull     /* max response time hello-acks: 3 s (2) */
 #define MC_HELLO_ACK_JITTER_US (MC_HELLO_ACK_WIN_US / 16u)  /* ~187 ms, > t_ack + S (2) */
 #define MC_BUDGET_INIT     32              /* initial value budget byte (9) */
+
+/* Message tracing (forensics runs): prefix [msg] so the sim can grep
+ * the trace apart from the always-on [core] lines. One byte test per
+ * event - free when off. */
+#define MTRACE(n, ...) do { if ((n)->trace) { \
+    printf("[msg] node %u: ", (n)->id); printf(__VA_ARGS__); } } while (0)
 /* ---------------- attempt schedule (7.4) -------------------------
  * One schedule per hop, no rebuild. Waits: a small fixed gap inside a
  * pass over the candidates (the next attempt goes to a DIFFERENT
@@ -2258,6 +2264,7 @@ static void ack1_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint8_t ch
     p[7] = quality_of(rssi);              /* what we measured on the data (6.2) */
     n->tx(n, ch, p, 8, t_ack_us());       /* same channel as the data (switch rule) */
     ka_called(n, ch);                     /* own call on the data channel (4.1) */
+    MTRACE(n, "ACK1 -> %u for msg %u (their quality %u)\n", src, msg_id, p[7]);
 }
 
 /* Ack2 to the previous hop, on ITS home channel (2, 7.1): the previous
@@ -2274,6 +2281,7 @@ static void ack2_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint16_t p
     p[7] = budget_left;                       /* spent budget travels along (6.2, 7.4) */
     bound_send(n, (uint8_t)(prev % MC_N_CHANNELS), p, 8, t_ack_us()); /* HOME of previous hop */
     ka_called(n, (uint8_t)(prev % MC_N_CHANNELS));  /* own call there (4.1) */
+    MTRACE(n, "ACK2 %s -> %u for msg %u (budget %u)\n", neg ? "NEG" : "pos", prev, msg_id, budget_left);
 }
 
 static void pending_try(mimeshi_node *n, mimeshi_pending *p);
@@ -2405,6 +2413,8 @@ static void pending_try(mimeshi_node *n, mimeshi_pending *p) {
     p->next_hop = p->cand[p->try_idx % p->cand_cnt];   /* round-robin over the schedule (7.4) */
     p->pkt[9] = p->budget_left;
     wr16(p->pkt + 10, p->next_hop);           /* next hop in the header (6.1) */
+    MTRACE(n, "TRY %u/%u msg %u via %u (budget %u)\n",
+           (unsigned)(p->try_idx + 1), (unsigned)schedule_attempts(p), p->msg_id, p->next_hop, p->budget_left);
     bound_send(n, (uint8_t)(p->next_hop % MC_N_CHANNELS), p->pkt, p->pkt_len, t_data_us(p->pkt_len));
     ka_called(n, (uint8_t)(p->next_hop % MC_N_CHANNELS));   /* data as prev_hop (4.1) */
     n->timer(n, MC_S_SWITCH_US + t_data_us(p->pkt_len) + t_ack_us() + MC_ACK1_MARGIN_US, ack1_timeout, p);
@@ -2459,6 +2469,8 @@ int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uin
     }
     memcpy(k + off, payload, len);
     p->pkt_len = (uint16_t)(off + len);
+    MTRACE(n, "SEND msg %u to %u (budget %u, plan %u cands first %u)\n",
+           p->msg_id, dst, p->budget_left, p->cand_cnt, p->cand[0]);
     pending_try(n, p);
     return 0;
 }
@@ -2756,6 +2768,11 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
     default: break;
     }
 }
+
+/* Message tracing (forensics runs, the --trace option of the sim):
+ * every DATA send/receive and each ack of a traced node logs with a
+ * [msg] prefix. One byte test per event - free when off. */
+void mimeshi_set_trace(mimeshi_node *n, uint8_t on) { n->trace = on; }
 
 /* ---------------- init/start ---------------- */
 

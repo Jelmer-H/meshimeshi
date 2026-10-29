@@ -286,6 +286,11 @@ struct mimeshi_node {
                                          drives the derivable digest */
     mimeshi_mapnode map[MC_MAP_NODES];  /* 2-hop map (10.1) */
     mimeshi_link   lnk[MC_MAX_LINKS];  /* links between map nodes (4.3) */
+    uint8_t  trace;                   /* message tracing (measured runs):
+                                         1 = log every send/receive/ack of
+                                         DATA messages on this node. Set via
+                                         mimeshi_set_trace; the simulator
+                                         uses it for low-rate forensics runs. */
     mimeshi_tx_fn     tx;
     mimeshi_timer_fn  timer;
     mimeshi_switch_fn switch_ch;
@@ -299,6 +304,11 @@ struct mimeshi_node {
 void mimeshi_init(mimeshi_node *n, uint16_t id, mimeshi_tx_fn tx, mimeshi_timer_fn timer,
                 mimeshi_switch_fn sw, mimeshi_rand_fn rnd,
                 mimeshi_channel_free_fn cad, void *user);
+
+/* Message tracing (forensics runs): 1 = this node logs every DATA
+ * send/receive and every ack1/ack2 of its messages. Cheap when off (one
+ * byte test per event). */
+void mimeshi_set_trace(mimeshi_node *n, uint8_t on);
 
 /* First hello round immediately, then startup rounds with random phase
  * (jitter). After the startup phase the hello no longer exists:

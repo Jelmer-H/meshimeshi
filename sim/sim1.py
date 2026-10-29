@@ -493,6 +493,7 @@ CNode._fields_ = [
     ("star_tick", ctypes.c_uint8),            # own-star heartbeat tick (4.3)
     ("map", CMapNode * MC_MAP_NODES),   # 2-hop map (10.1)
     ("lnk", CLink * MC_MAX_LINKS),      # link store (4.3)
+    ("trace", ctypes.c_uint8),                 # message tracing (forensics runs)
     ("tx", TX_FN), ("timer", TIMER_FN), ("switch_ch", SWITCH_FN), ("rand", RAND_FN),
     ("channel_free", CAD_FN), ("user", ctypes.c_void_p),
 ]
@@ -533,6 +534,7 @@ def load_lib(path):
     lib = ctypes.CDLL(path)
     lib.mimeshi_init.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint16, TX_FN,
                                  TIMER_FN, SWITCH_FN, RAND_FN, CAD_FN, ctypes.c_void_p]
+    lib.mimeshi_set_trace.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint8]
     lib.mimeshi_start.argtypes = [ctypes.POINTER(CNode)]
     lib.mimeshi_rx.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint8, ctypes.c_int8,
                                ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint16]
@@ -558,6 +560,8 @@ class CCore:
         self.mn = CNode()
         NODES[ctypes.addressof(self.mn)] = node
         lib.mimeshi_init(ctypes.byref(self.mn), node.id, _tx, _timer, _switch, _rand, _channel_free, None)
+        if globals().get('TRACE_MSGS'):
+            lib.mimeshi_set_trace(ctypes.byref(self.mn), 1)
     def start(self):
         self.lib.mimeshi_start(ctypes.byref(self.mn))
     STAR_PROBE = None   # (rx_id, tx_id): if set, prints type-10 rx (debug hook)
