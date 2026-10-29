@@ -2664,6 +2664,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         if (dst == n->id) {
             uint8_t poff = (flags & F_DEST_GEO) ? 16 : 12;   /* geo sits between header and payload (6.1) */
             printf("[core] node %u: DATA from %u: '%.*s\n", n->id, src, (int)(len - poff), (const char *)(pkt + poff));
+            MTRACE(n, "DELIVERED msg %u from %u (budget %u, via %u)\n", msg_id, src, pkt[9], prev);
             ack1_send(n, msg_id, src, ch, rssi);       /* same channel; quality of the data travels along (7.1) */
             /* No ack2 from the destination: the positive ack2 of this
              * final hop goes out by the previous forwarder on OUR
@@ -2746,6 +2747,8 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
             memcpy(p->pkt, pkt, len); p->pkt_len = len;
             p->pkt[7] = (uint8_t)(n->id & 0xFF); p->pkt[8] = (uint8_t)(n->id >> 8);  /* prev hop = us */
             printf("[core] node %u: FORWARD msg %u from %u to %u via %u\n", n->id, msg_id, src, dst, p->cand[0]);
+            MTRACE(n, "FORWARD msg %u from %u to %u via %u (budget %u, plan %u cands)\n",
+                   msg_id, src, dst, p->cand[0], p->budget_left, p->cand_cnt);
             pending_try(n, p);
         }
         break;
