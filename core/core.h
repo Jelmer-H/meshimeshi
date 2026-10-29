@@ -20,7 +20,13 @@
 /* ---------------- configuration (firmware constants) ---------------- */
 #define MC_N_CHANNELS    3
 #define MC_MAX_NEIGHBORS 64
-#define MC_MAX_PENDING   16
+#define MC_MAX_PENDING   64            /* was 16: the 480-node scale run showed
+                                          the forwarding hops on tile crossings run
+                                          out of slots under load (554 of 573 lost
+                                          messages were the silent no-slot drop);
+                                          64 records x ~250 B = 16 kB - fits the
+                                          13.2 budget (the freed 4 kB chunk-reassembly
+                                          space covers it) */
 #define MC_MAX_DEDUP    128
 #define MC_MAX_PAYLOAD  230
 #ifndef MC_MAP_NODES

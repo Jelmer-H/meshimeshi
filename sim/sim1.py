@@ -407,7 +407,7 @@ class Node:
 # Struct layout verified against sizeof/offsetof of core.h
 # (neighbor 24, pending 256, mapnode 12, link 6, node 18528 B).
 # ---------------------------------------------------------------------------
-MC_MAX_NEIGHBORS, MC_MAX_PENDING, MC_MAX_DEDUP, MC_MAX_PAYLOAD = 64, 16, 128, 230
+MC_MAX_NEIGHBORS, MC_MAX_PENDING, MC_MAX_DEDUP, MC_MAX_PAYLOAD = 64, 64, 128, 230
 
 class CNeighbor(ctypes.Structure):
     _fields_ = [("id", ctypes.c_uint16), ("quality", ctypes.c_uint8),

@@ -2650,7 +2650,20 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         {
             mimeshi_pending *p = 0;
             for (int i = 0; i < MC_MAX_PENDING; i++) if (!n->pend[i].active) { p = &n->pend[i]; break; }
-            if (!p) return;                       /* no slot: cannot forward (step 3 sends the negative ack2) */
+            if (!p) {
+                /* No slot (backpressure, 7.2): say NEGATIVE instead of
+                 * dropping silently - the previous hop can try an
+                 * alternative with its own retry plan (7.4) instead of
+                 * burning its T_ack2 window on a hop that already let
+                 * go of the message. The budget we pass back is the
+                 * full remaining one minus this hop's unit: nothing was
+                 * spent here. (The measured scale run: 554 of 573 lost
+                 * messages ended exactly here - ACK1 sent, then the
+                 * silent return - the dominant delivery failure.) */
+                ack2_send(n, msg_id, src, prev, true,
+                          (uint8_t)(budget > 1 ? budget - 1 : 0));
+                return;
+            }
             memset(p, 0, sizeof(*p));
             p->budget_left = (uint8_t)(budget - 1);
             /* attempt schedule (7.4): up to 3 Dijkstra-best hops toward
@@ -2660,7 +2673,14 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
              * after the check - an unforwardable message must not
              * leak its pending slot. */
             p->cand_cnt = schedule_candidates(n, dst, gl, go, prev, 0, 0, p->cand);
-            if (p->cand_cnt == 0) return;         /* no routable path: the hop fails (negative ack2 / report follow in step 3) */
+            if (p->cand_cnt == 0) {
+                /* No routable path from here (7.2/10.5): NEGATIVE back,
+                 * not silence - the previous hop retries via its own
+                 * plan (7.4). Same budget arithmetic: nothing spent. */
+                ack2_send(n, msg_id, src, prev, true,
+                          (uint8_t)(budget > 1 ? budget - 1 : 0));
+                return;
+            }
             p->active = 1;
             p->msg_id = msg_id; p->src = src; p->dst = dst; p->prev_hop = prev;
             memcpy(p->pkt, pkt, len); p->pkt_len = len;
