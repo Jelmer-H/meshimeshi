@@ -51,6 +51,12 @@
 #define MC_HELLO_ACK_WIN_US 3000000ull     /* max response time hello-acks: 3 s (2) */
 #define MC_HELLO_ACK_JITTER_US (MC_HELLO_ACK_WIN_US / 16u)  /* ~187 ms, > t_ack + S (2) */
 #define MC_BUDGET_INIT     32              /* initial value budget byte (9) */
+
+/* Message tracing (forensics runs): prefix [msg] so the sim can grep
+ * the trace apart from the always-on [core] lines. One byte test per
+ * event - free when off. */
+#define MTRACE(n, ...) do { if ((n)->trace) { \
+    printf("[msg] node %u: ", (n)->id); printf(__VA_ARGS__); } } while (0)
 /* ---------------- attempt schedule (7.4) -------------------------
  * One schedule per hop, no rebuild. Waits: a small fixed gap inside a
  * pass over the candidates (the next attempt goes to a DIFFERENT
@@ -125,6 +131,16 @@ enum {
 #define F_DEST_GEO 0x20   /* destination geo present: 4 B after the fixed
                              header (6.1, 10.2) - every hop can recompute
                              the bridge node toward an unknown destination */
+#define F_WAYPOINT_GEO 0x40 /* waypoint geo present (10.2, decided Oct 2026): 4 B
+                              after the dest geo (or after the fixed header when
+                              no dest geo). The traveling koers of the best
+                              bridge the chain has seen - never a required
+                              destination: hops route toward its ZONE with
+                              locally routable steps. A forwarder replaces it
+                              only when its own bridge candidate lies strictly
+                              closer to the destination (better-than, 5%
+                              margin). The destination in the own graph always
+                              wins over the koers. */
 
 #define F_NEG_ACK2 0x40   /* next hop could not forward (7.2) */
 
@@ -610,15 +626,27 @@ static mimeshi_mapnode *map_add_geo(mimeshi_node *n, uint16_t id,
     evict_hop_fill(n);
     int victim = -1;
     uint8_t v_hop = 0; uint32_t v_len = 0;
+    int v_disc = 0;                        /* victim is NOT connected to our graph */
     for (int i = 0; i < MC_MAP_NODES; i++) {
         if (!n->map[i].alive) continue;
         /* direct neighbours never: they live in the prefix */
         if (nbr_find(n, n->map[i].id)) continue;
         uint8_t h = ev_hop[i];
-        if (h == 0xFF) h = 250;            /* unreachable: maximal distance */
+        int disc = (h == 0xFF);            /* unreachable in our graph: a knowledge
+                                              island - stored (first contact may
+                                              arrive disconnected; the graph grows
+                                              onto it later), but the FIRST OUT at
+                                              the cap: routing capital beats
+                                              stranded knowledge (decided Oct 2026).
+                                              The link length never saves an island:
+                                              a richly linked island is still an
+                                              island - its links do not route. */
+        if (h == 0xFF) h = 250;
         uint32_t l = evict_link_len(n, n->map[i].id);
-        if (victim < 0 || h > v_hop || (h == v_hop && l < v_len)) {
-            victim = i; v_hop = h; v_len = l;
+        if (victim < 0
+            || (disc && !v_disc)            /* an island always beats a connected entry */
+            || (disc == v_disc && (h > v_hop || (h == v_hop && l < v_len)))) {
+            victim = i; v_hop = h; v_len = l; v_disc = disc;
         }
     }
     if (victim < 0) {                            /* only direct neighbours in the map */
@@ -1407,6 +1435,20 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
     if (len < 10) return;
     uint16_t owner = rd16(pkt + 1);      /* the advertiser: miss requests address it */
 
+    /* Liveness (4.4, fixed Oct 2026, the warmup expiry finding): a star
+     * round is an IDENTIFYING transmission of its advertiser - the id
+     * is in the header, and every node sends one each round (~45 min).
+     * A direct neighbour's own round therefore proves it is alive;
+     * without this refresh the last_seen clock had no keepalive
+     * trigger (hellos turn rare after startup, ACK1s only exist on
+     * traffic, proofs are reactionless by design), and quiet
+     * neighbour pairs expired at ~4 h on a living net - the
+     * routing graph lost edges the knowledge graph still had. */
+    if (owner != n->id) {
+        mimeshi_neighbor *onb = nbr_find(n, owner);
+        if (onb) onb->last_seen = 0;
+    }
+
     /* --- content area: chunk entry layout, processed via chunk_rx ---
      * The header (10 B) is identical to a 4.3 chunk, and the entries
      * follow the same layout. chunk_rx() expects p[4] entries and
@@ -1423,7 +1465,8 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
     uint16_t cend = 10;                      /* end of the content area */
     for (uint8_t e = 0; e < pkt[4] && cend + 9 <= len; e++)
         cend = (uint16_t)(cend + 9 + 3 * pkt[cend + 8]);   /* walk the content stars */
-    chunk_rx_mode(n, rssi, pkt, cend, 1);   /* entries only: the catalogue and
+
+chunk_rx_mode(n, rssi, pkt, cend, 1);   /* entries only: the catalogue and
                                                missed bytes are not entries */
     uint16_t rx_star[MC_CHUNK_MAX_ENTRIES];     /* content stars of THIS packet */
     uint8_t rx_star_n = 0;
@@ -1708,8 +1751,17 @@ static int r_idx(mimeshi_node *n, uint16_t id) {
  * `excl` (excl_cnt entries) are next hops that already failed for
  * THIS message: cumulative exclusion per series (7.4) - the
  * computation must not propose a hop the series has buried. */
+static uint16_t route_next_hop_ex_prev(mimeshi_node *n, uint16_t dst,
+                                  const uint16_t *excl, uint8_t excl_cnt,
+                                  uint16_t prev);
 static uint16_t route_next_hop_ex(mimeshi_node *n, uint16_t dst,
                                   const uint16_t *excl, uint8_t excl_cnt) {
+    return route_next_hop_ex_prev(n, dst, excl, excl_cnt, 0);
+}
+static uint16_t route_next_hop_ex_prev(mimeshi_node *n, uint16_t dst,
+                                  const uint16_t *excl, uint8_t excl_cnt,
+                                  uint16_t prev) {
+    (void)prev;    /* the neighbourhood rule is removed; prev stays for the API */
     if (dst == n->id) return n->id;
     int di = r_idx(n, dst);
     /* A direct neighbour is NOT its own first hop by definition: its
@@ -1735,6 +1787,21 @@ static uint16_t route_next_hop_ex(mimeshi_node *n, uint16_t dst,
         int ex = 0;
         for (uint8_t e = 0; e < excl_cnt; e++) if (excl[e] == nb->id) { ex = 1; break; }
         if (ex) continue;                          /* failed for this message (7.4) */
+        /* The prev-neighbourhood rule is REMOVED (decided Oct 2026, the
+         * 6670 lesson): 'prev already considered its neighbours and chose us'
+         * does not hold - prev's choice is one optimum under ITS cost model
+         * (its link qualities, its age multipliers, its graph), and a
+         * legitimate route from here may well begin with a hop into prev's
+         * neighbourhood: our edge toward X can score better than prev's did,
+         * or X's onward path better in OUR map. The measured cost: in a dense
+         * cluster the last hops are each other's neighbours AND shared
+         * neighbours of the destination - the rule filtered the delivery edge
+         * at every forwarder (the 6670 packet circled a reachable destination
+         * in its pool until the sender gave up). The prev hop ITSELF stays
+         * excluded (the original anti-ping-pong rule, via the excl array);
+         * only the neighbourhood extension is gone. Triangle loops are then
+         * possible again - the measurement decides whether the heuristic was
+         * worth its price. */
         int bi = r_idx(n, nb->id);
         if (bi < 0) continue;                     /* no map slot: no further edges */
         uint32_t c = route_edge_own(n, nb);
@@ -1791,15 +1858,25 @@ static uint16_t route_next_hop(mimeshi_node *n, uint16_t dst) {
  * bridge-node rule routes toward the closest graph node near the
  * dest geo (15% candidate band, best route cost wins). geo (0,0)
  * = unknown: then a destination outside the graph is refused. */
-static uint16_t route_next_hop_geo(mimeshi_node *n, uint16_t dst,
+
+static uint16_t route_next_hop_geo_prev(mimeshi_node *n, uint16_t dst,
                                   uint16_t lat, uint16_t lon,
-                                  const uint16_t *excl, uint8_t excl_cnt) {
-    uint16_t nh = route_next_hop_ex(n, dst, excl, excl_cnt);
+                                  const uint16_t *excl, uint8_t excl_cnt,
+                                  uint16_t prev);
+static uint16_t route_next_hop_geo_prev(mimeshi_node *n, uint16_t dst,
+                                  uint16_t lat, uint16_t lon,
+                                  const uint16_t *excl, uint8_t excl_cnt,
+                                  uint16_t prev) {
+    (void)prev;    /* the neighbourhood rule is removed */
+    uint16_t nh = route_next_hop_ex_prev(n, dst, excl, excl_cnt, prev);
     if (nh) return nh;
     if (!lat && !lon) return 0;               /* no geo: no flood (10.2) */
     uint16_t bridge = route_bridge_node(n, lat, lon, excl, excl_cnt);
     if (!bridge) return 0;
-    return route_next_hop_ex(n, bridge, excl, excl_cnt);
+    /* the route TOWARD the bridge honours the prev-neighbourhood rule
+     * too: the first step must not dive straight back into prev's
+     * calculation space (10.2) */
+    return route_next_hop_ex_prev(n, bridge, excl, excl_cnt, prev);
 }
 
 /* Squared distance on the coarse 16-bit geo grid (5): comparison only,
@@ -1833,29 +1910,44 @@ static uint32_t route_cost_to(mimeshi_node *n, uint16_t dst,
  * 1.3225, so the margin is +32.25% on d2. */
 static uint16_t route_bridge_node(mimeshi_node *n, uint16_t lat, uint16_t lon,
                                   const uint16_t *excl, uint8_t excl_cnt) {
-    uint32_t best_d = 0;
-    int have = 0;
+    /* Distance first, cost as tiebreak only (10.2, revised Oct 2026 - the
+     * plateau finding). The old 15%-band + route-cost pass modelled a
+     * future we cannot oversee: among geographically comparable
+     * candidates it preferred the CHEAPEST - and the cheapest is
+     * structurally the LOCAL one (few hops in the own graph),
+     * cotangent to the destination, taking the message nowhere.
+     * Measured (the 8h and 16h scale runs): the stranded out-of-graph
+     * messages circled a flat plateau at ~130 km from their
+     * destinations for every hop, while the pool simulation showed the
+     * median pool holds a candidate at 16 km from the destination -
+     * the knowledge was there, the cost pass kept choosing the
+     * useless local step over it. The own entry is NEVER a candidate
+     * (the self-loop fix stands). The rule now: the candidate CLOSEST
+     * to the destination geo wins; the route cost decides only
+     * between candidates at virtually the same distance (within ~5% on
+     * the squared distance) - resolving true ties by quality, never
+     * trading distance for cost. The local nodes near the destination
+     * know better than our forward-thinking here. */
+    uint16_t pick = 0;
+    uint32_t pick_d = 0, pick_cost = MC_DIST_INF;
     for (int i = 0; i < MC_MAP_NODES; i++) {
         if (!n->map[i].alive || !n->map[i].geo_lat) continue;   /* no geo: no candidate (5) */
+        if (n->map[i].id == n->id) continue;     /* never the own entry (10.2) */
         uint32_t d = geo_dist2(n->map[i].geo_lat, n->map[i].geo_lon, lat, lon);
-        if (!have || d < best_d) { best_d = d; have = 1; }
+        if (!pick) { pick = n->map[i].id; pick_d = d; continue; }
+        if (d >= pick_d) continue;               /* farther: not a candidate */
+        if (pick_d > d + d / 20u) {
+            /* significantly closer: wins outright */
+            pick = n->map[i].id; pick_d = d; pick_cost = MC_DIST_INF;
+        } else {
+            /* within ~5%: a tie - the route cost decides */
+            if (pick_cost == MC_DIST_INF)
+                pick_cost = route_cost_to(n, pick, excl, excl_cnt);
+            uint32_t c = route_cost_to(n, n->map[i].id, excl, excl_cnt);
+            if (c < pick_cost) { pick = n->map[i].id; pick_d = d; pick_cost = c; }
+        }
     }
-    if (!have) return 0;                       /* no geo material at all */
-    uint32_t margin = best_d + best_d * 3225u / 10000u;
-    /* first pass: find the best (minimum) route cost among the
-     * candidates; the Dijkstra scratch is filled per candidate run.
-     * Candidates are usually few; the closest-first scan keeps the
-     * result deterministic. */
-    uint16_t pick = 0;
-    uint32_t pick_cost = MC_DIST_INF;
-    for (int i = 0; i < MC_MAP_NODES; i++) {
-        if (!n->map[i].alive || !n->map[i].geo_lat) continue;
-        uint32_t d = geo_dist2(n->map[i].geo_lat, n->map[i].geo_lon, lat, lon);
-        if (d > margin) continue;              /* outside the 15% band (10.2) */
-        uint32_t c = route_cost_to(n, n->map[i].id, excl, excl_cnt);
-        if (c < pick_cost) { pick_cost = c; pick = n->map[i].id; }
-    }
-    return pick;                                /* 0 when no candidate routable */
+    return pick;                                /* 0 when no candidate at all */
 }
 
 
@@ -2181,6 +2273,7 @@ static void ack1_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint8_t ch
     p[7] = quality_of(rssi);              /* what we measured on the data (6.2) */
     n->tx(n, ch, p, 8, t_ack_us());       /* same channel as the data (switch rule) */
     ka_called(n, ch);                     /* own call on the data channel (4.1) */
+    MTRACE(n, "ACK1 -> %u for msg %u (their quality %u)\n", src, msg_id, p[7]);
 }
 
 /* Ack2 to the previous hop, on ITS home channel (2, 7.1): the previous
@@ -2197,6 +2290,7 @@ static void ack2_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint16_t p
     p[7] = budget_left;                       /* spent budget travels along (6.2, 7.4) */
     bound_send(n, (uint8_t)(prev % MC_N_CHANNELS), p, 8, t_ack_us()); /* HOME of previous hop */
     ka_called(n, (uint8_t)(prev % MC_N_CHANNELS));  /* own call there (4.1) */
+    MTRACE(n, "ACK2 %s -> %u for msg %u (budget %u)\n", neg ? "NEG" : "pos", prev, msg_id, budget_left);
 }
 
 static void pending_try(mimeshi_node *n, mimeshi_pending *p);
@@ -2229,7 +2323,7 @@ static uint8_t schedule_candidates(mimeshi_node *n, uint16_t dst,
         if (prev) tmp[ec++] = prev;
         for (uint8_t e = 0; e < excl_cnt && ec < 3; e++) tmp[ec++] = excl[e];
         for (uint8_t k = 0; k < cnt && ec < 3; k++) tmp[ec++] = cand[k];
-        uint16_t nh = route_next_hop_geo(n, dst, gl, go, tmp, ec);
+        uint16_t nh = route_next_hop_geo_prev(n, dst, gl, go, tmp, ec, prev);
         if (!nh) break;
         cand[cnt++] = nh;
     }
@@ -2325,9 +2419,25 @@ static void ack2_timeout(mimeshi_node *n, void *ud) {
 
 static void pending_try(mimeshi_node *n, mimeshi_pending *p) {
     if (p->cand_cnt == 0) return;             /* no schedule: nothing to send (defensive) */
-    p->next_hop = p->cand[p->try_idx % p->cand_cnt];   /* round-robin over the schedule (7.4) */
+    /* Attempt order (7.4, revised Oct 2026 - the in-graph retry bias):
+     * round-robin gives every candidate the same number of attempts -
+     * fair for a geo-guess plan, wasteful for a Dijkstra-proven one: a
+     * failed exchange on the proven optimum is more likely fluctuation
+     * than structure, and detouring to the second-best abandons proven
+     * quality for a guess. In-graph the order is therefore
+     * optimum-first: cand0 twice, then cand1, cand0 again, cand2, cand0
+     * (the 4-6 attempts of the series, the optimum getting the
+     * majority). Out-of-graph (geo/bridge) the round-robin stands. */
+    if (p->in_graph) {
+        static const uint8_t bias[6] = { 0, 1, 0, 2, 0, 1 };
+        p->next_hop = p->cand[bias[p->try_idx % 6] % p->cand_cnt];
+    } else {
+        p->next_hop = p->cand[p->try_idx % p->cand_cnt];   /* round-robin over the schedule (7.4) */
+    }
     p->pkt[9] = p->budget_left;
     wr16(p->pkt + 10, p->next_hop);           /* next hop in the header (6.1) */
+    MTRACE(n, "TRY %u/%u msg %u via %u (budget %u)\n",
+           (unsigned)(p->try_idx + 1), (unsigned)schedule_attempts(p), p->msg_id, p->next_hop, p->budget_left);
     bound_send(n, (uint8_t)(p->next_hop % MC_N_CHANNELS), p->pkt, p->pkt_len, t_data_us(p->pkt_len));
     ka_called(n, (uint8_t)(p->next_hop % MC_N_CHANNELS));   /* data as prev_hop (4.1) */
     n->timer(n, MC_S_SWITCH_US + t_data_us(p->pkt_len) + t_ack_us() + MC_ACK1_MARGIN_US, ack1_timeout, p);
@@ -2365,13 +2475,28 @@ int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uin
     /* attempt schedule (7.4): up to 3 Dijkstra-best hops toward dst; the
      * route itself is the first candidate - or the send is refused. */
     p->cand_cnt = schedule_candidates(n, dst, dest_lat, dest_lon, n->id, 0, 0, p->cand);
+    p->in_graph = r_idx(n, dst) >= 0 || nbr_find(n, dst) != 0;   /* Dijkstra-proven plan? (7.4) */
     if (p->cand_cnt == 0) return -1;           /* not in the graph: no flood (10.2) */
     uint16_t nh = p->cand[0];
     p->msg_id = (uint16_t)n->rand(n);
     p->src = n->id; p->dst = dst; p->prev_hop = n->id; p->next_hop = nh;
     uint8_t *k = p->pkt;
     bool geo = (dest_lat || dest_lon);
-    k[0] = (uint8_t)(PKT_DATA | (ack3 ? F_ACK3_REQ : 0) | (geo ? F_DEST_GEO : 0));
+    /* Waypoint (10.2): an out-of-graph send attaches the koers - the geo
+     * of the chosen bridge candidate - so the hops route toward its zone
+     * with locally routable steps instead of every hop re-inventing a
+     * bridge from possibly worse knowledge (the plateau finding: pools
+     * held candidates at 11 km median from the destination, but no hop
+     * could ROUTE to them - toward the zone, every step is local). */
+    uint16_t wlat = 0, wlon = 0;
+    bool wp = false;
+    if (geo && !p->in_graph) {
+        uint16_t bridge = route_bridge_node(n, dest_lat, dest_lon, 0, 0);
+        mimeshi_mapnode *bm = bridge ? map_find(n, bridge) : 0;
+        if (bm && bm->geo_lat) { wlat = bm->geo_lat; wlon = bm->geo_lon; wp = true; }
+    }
+    k[0] = (uint8_t)(PKT_DATA | (ack3 ? F_ACK3_REQ : 0)
+                     | (geo ? F_DEST_GEO : 0) | (wp ? F_WAYPOINT_GEO : 0));
     wr16(k + 1, p->msg_id); wr16(k + 3, n->id); wr16(k + 5, dst); wr16(k + 7, n->id);
     k[9] = p->budget_left;                 /* header: budget at offset 9 (section 6.1) */
     wr16(k + 10, nh);                      /* next hop at offset 10 (6.1) */
@@ -2380,8 +2505,14 @@ int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uin
         wr16(k + 12, dest_lat); wr16(k + 14, dest_lon);
         off = 16;
     }
+    if (wp) {                               /* waypoint geo after the dest geo (10.2) */
+        wr16(k + 16, wlat); wr16(k + 18, wlon);
+        off = 20;
+    }
     memcpy(k + off, payload, len);
     p->pkt_len = (uint16_t)(off + len);
+    MTRACE(n, "SEND msg %u to %u (budget %u, plan %u cands first %u)\n",
+           p->msg_id, dst, p->budget_left, p->cand_cnt, p->cand[0]);
     pending_try(n, p);
     return 0;
 }
@@ -2590,6 +2721,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         if (dst == n->id) {
             uint8_t poff = (flags & F_DEST_GEO) ? 16 : 12;   /* geo sits between header and payload (6.1) */
             printf("[core] node %u: DATA from %u: '%.*s\n", n->id, src, (int)(len - poff), (const char *)(pkt + poff));
+            MTRACE(n, "DELIVERED msg %u from %u (budget %u, via %u)\n", msg_id, src, pkt[9], prev);
             ack1_send(n, msg_id, src, ch, rssi);       /* same channel; quality of the data travels along (7.1) */
             /* No ack2 from the destination: the positive ack2 of this
              * final hop goes out by the previous forwarder on OUR
@@ -2636,22 +2768,91 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         {
             mimeshi_pending *p = 0;
             for (int i = 0; i < MC_MAX_PENDING; i++) if (!n->pend[i].active) { p = &n->pend[i]; break; }
-            if (!p) return;                       /* no slot: cannot forward (step 3 sends the negative ack2) */
+            if (!p) {
+                /* No slot (backpressure, 7.2): say NEGATIVE instead of
+                 * dropping silently - the previous hop can try an
+                 * alternative with its own retry plan (7.4) instead of
+                 * burning its T_ack2 window on a hop that already let
+                 * go of the message. The budget we pass back is the
+                 * full remaining one minus this hop's unit: nothing was
+                 * spent here. (The measured scale run: 554 of 573 lost
+                 * messages ended exactly here - ACK1 sent, then the
+                 * silent return - the dominant delivery failure.) */
+                ack2_send(n, msg_id, src, prev, true,
+                          (uint8_t)(budget > 1 ? budget - 1 : 0));
+                return;
+            }
             memset(p, 0, sizeof(*p));
             p->budget_left = (uint8_t)(budget - 1);
+
+            /* Waypoint (10.2, the koers): the traveling geo of the best
+             * bridge the chain has seen. The better-than criterion: a
+             * forwarder replaces the waypoint ONLY when its own bridge
+             * candidate lies strictly closer to the destination
+             * (5% margin on the squared distance - no ping-pong on
+             * ties). Hops with worse knowledge FOLLOW the koers: they
+             * route toward the waypoint ZONE with locally routable
+             * steps (the plateau finding: pools held candidates 11 km
+             * from the destination that no hop could ROUTE to -
+             * toward the zone, every step is local and reachable).
+             * The destination in the own graph always wins: the
+             * in-graph Dijkstra runs first and the waypoint focus is
+             * only for out-of-graph. */
+            uint16_t wlat = 0, wlon = 0; bool has_wp = false;
+            uint16_t wp_off = (flags & F_DEST_GEO) ? 16 : 12;
+            if (flags & F_WAYPOINT_GEO) {
+                wlat = rd16(pkt + wp_off); wlon = rd16(pkt + wp_off + 2); has_wp = true;
+            }
+            uint32_t wp_d = has_wp && (gl || go) ? geo_dist2(wlat, wlon, gl, go) : 0;
+            bool wp_replaced = false;
+            if (has_wp && (gl || go)) {
+                uint16_t my_cand = route_bridge_node(n, gl, go, 0, 0);
+                mimeshi_mapnode *mm = my_cand ? map_find(n, my_cand) : 0;
+                if (mm && mm->geo_lat) {
+                    uint32_t d_mine = geo_dist2(mm->geo_lat, mm->geo_lon, gl, go);
+                    if (d_mine + d_mine / 20u < wp_d) {   /* strictly closer */
+                        wlat = mm->geo_lat; wlon = mm->geo_lon;
+                        wp_d = d_mine; wp_replaced = true;
+                        MTRACE(n, "WAYPOINT msg %u re-aimed at %u (d %u -> %u)\n",
+                               msg_id, my_cand, wp_d, d_mine);
+                    }
+                }
+            }
+
             /* attempt schedule (7.4): up to 3 Dijkstra-best hops toward
              * dst; the collector never proposes the previous hop (the
              * 10.2 prev-hop exclusion is thereby part of every
              * candidate, not only the first). active goes on only
              * after the check - an unforwardable message must not
-             * leak its pending slot. */
-            p->cand_cnt = schedule_candidates(n, dst, gl, go, prev, 0, 0, p->cand);
-            if (p->cand_cnt == 0) return;         /* no routable path: the hop fails (negative ack2 / report follow in step 3) */
+             * leak its pending slot. Focus: in-graph, or no waypoint ->
+             * toward the destination as before; out-of-graph WITH a
+             * waypoint -> toward the waypoint ZONE (locally routable;
+             * the in-graph attempt toward dst still runs first inside
+             * the collector - a destination that entered our graph
+             * always wins over the koers). */
+            if (has_wp && r_idx(n, dst) < 0 && !nbr_find(n, dst))
+                p->cand_cnt = schedule_candidates(n, dst, wlat, wlon, prev, 0, 0, p->cand);
+            else
+                p->cand_cnt = schedule_candidates(n, dst, gl, go, prev, 0, 0, p->cand);
+            p->in_graph = r_idx(n, dst) >= 0 || nbr_find(n, dst) != 0;   /* Dijkstra-proven plan? (7.4) */
+            if (p->cand_cnt == 0) {
+                /* No routable path from here (7.2/10.5): NEGATIVE back,
+                 * not silence - the previous hop retries via its own
+                 * plan (7.4). Same budget arithmetic: nothing spent. */
+                ack2_send(n, msg_id, src, prev, true,
+                          (uint8_t)(budget > 1 ? budget - 1 : 0));
+                return;
+            }
             p->active = 1;
             p->msg_id = msg_id; p->src = src; p->dst = dst; p->prev_hop = prev;
             memcpy(p->pkt, pkt, len); p->pkt_len = len;
+            if (wp_replaced) {                /* the new koers travels onward (10.2) */
+                wr16(p->pkt + wp_off, wlat); wr16(p->pkt + wp_off + 2, wlon);
+            }
             p->pkt[7] = (uint8_t)(n->id & 0xFF); p->pkt[8] = (uint8_t)(n->id >> 8);  /* prev hop = us */
             printf("[core] node %u: FORWARD msg %u from %u to %u via %u\n", n->id, msg_id, src, dst, p->cand[0]);
+            MTRACE(n, "FORWARD msg %u from %u to %u via %u (budget %u, plan %u cands)\n",
+                   msg_id, src, dst, p->cand[0], p->budget_left, p->cand_cnt);
             pending_try(n, p);
         }
         break;
@@ -2659,6 +2860,11 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
     default: break;
     }
 }
+
+/* Message tracing (forensics runs, the --trace option of the sim):
+ * every DATA send/receive and each ack of a traced node logs with a
+ * [msg] prefix. One byte test per event - free when off. */
+void mimeshi_set_trace(mimeshi_node *n, uint8_t on) { n->trace = on; }
 
 /* ---------------- init/start ---------------- */
 

@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<title>Meshimeshi graaf-viewer</title>
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #ddd; }
+  #hud { position: fixed; top: 10px; left: 10px; background: rgba(0,0,0,.7);
+         padding: 10px 14px; border-radius: 8px; font-size: 13px; z-index: 2; }
+  #hud b { color: #6cf; }
+  canvas { display: block; cursor: crosshair; }
+  input[type=file] { color: #aaa; font-size: 12px; }
+  .legend span { margin-right: 12px; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <input type="file" id="file" accept=".json"><br><br>
+  <div class="legend">
+    <span style="color:#4a9">● node</span>
+    <span style="color:#d44">— fysieke link (buurtabel)</span>
+    <span style="color:#46c">— link store (kennis)</span>
+    <span style="color:#fc0">— pool/kennis van geselecteerde node</span>
+  </div>
+  <div id="stats"></div>
+</div>
+<canvas id="cv"></canvas>
+<script>
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+let G = null, sel = null, pan = {x:0, y:0}, zoom = 1, W, H;
+function resize(){ W = cv.width = innerWidth; H = cv.height = innerHeight; if (G) draw(); }
+addEventListener('resize', resize); resize();
+
+document.getElementById('file').onchange = e => {
+  const f = e.target.files[0]; if (!f) return;
+  const r = new FileReader();
+  r.onload = () => { G = JSON.parse(r.result); sel = null; fit(); draw(); };
+  r.readAsText(f);
+};
+
+// projectie: lat/lon -> scherm (eenvoudige Mercator-achtig, cos(52) correctie)
+let bb = null;
+function fit(){
+  let la0=99, la1=-99, lo0=99, lo1=-99;
+  for (const k in G.geo){ const [la, lo] = G.geo[k];
+    la0=Math.min(la0,la); la1=Math.max(la1,la); lo0=Math.min(lo0,lo); lo1=Math.max(lo1,lo); }
+  bb = {la0, la1, lo0, lo1};
+  zoom = Math.min(W/( (lo1-lo0)*68 ), H/( (la1-la0)*111 )) * .9;
+  pan = { x: W/2 - ((lo0+lo1)/2)*68*zoom, y: H/2 + ((la0+la1)/2)*111*zoom };
+}
+function px(nid){ const [la, lo] = G.geo[nid] || [52,5];
+  return [ pan.x + lo*68*zoom, pan.y - la*111*zoom ]; }
+
+function draw(){
+  ctx.fillStyle = '#111'; ctx.fillRect(0,0,W,H);
+  if (!G) return;
+  const byId = {}; G.nodes.forEach(n => byId[n.id] = n);
+  // link store (kennis) - dun blauw, alleen tot zoom-niveau
+  ctx.strokeStyle = 'rgba(70,110,200,.15)'; ctx.lineWidth = .5;
+  if (zoom > 1.5) {
+    ctx.beginPath();
+    for (const n of G.nodes) for (const [a,b] of n.links){
+      if (a > b && byId[b] && G.nodes.some(m=>m.id===b)) continue; // dedupe helft
+      const [x1,y1]=px(a), [x2,y2]=px(b); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2);
+    }
+    ctx.stroke();
+  }
+  // fysieke links (buurtabellen) - helder rood
+  ctx.strokeStyle = 'rgba(220,70,70,.5)'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  const seen = new Set();
+  for (const n of G.nodes) for (const b of n.nbrs){
+    const k = Math.min(n.id,b)+'-'+Math.max(n.id,b);
+    if (seen.has(k)) continue; seen.add(k);
+    const [x1,y1]=px(n.id), [x2,y2]=px(b); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2);
+  }
+  ctx.stroke();
+  // pool van geselecteerde node - geel
+  if (sel && byId[sel]){
+    ctx.strokeStyle = 'rgba(250,200,30,.9)'; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (const p of byId[sel].pool){ const [x1,y1]=px(sel), [x2,y2]=px(p);
+      ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); }
+    ctx.stroke();
+  }
+  // nodes
+  for (const n of G.nodes){
+    const [x,y] = px(n.id);
+    ctx.fillStyle = sel===n.id ? '#fff' : (sel && byId[sel].pool.includes(n.id) ? '#fc0' : '#4a9');
+    ctx.beginPath(); ctx.arc(x, y, sel===n.id?5:3, 0, 7); ctx.fill();
+    if (zoom > 6) { ctx.fillStyle = '#888'; ctx.font = '10px monospace';
+      ctx.fillText(n.id.toString(16), x+5, y-4); }
+  }
+  // stats
+  const stats = document.getElementById('stats');
+  if (sel && byId[sel]) stats.innerHTML =
+    `<b>node ${sel.toString(16)}</b><br>buren: ${byId[sel].nbrs.length}` +
+    `<br>link store: ${byId[sel].links.length}<br>pool: ${byId[sel].pool.length}`;
+  else stats.innerHTML = `<b>${G.nodes.length} nodes</b> - klik een node voor zijn pool`;
+}
+
+cv.onclick = e => {
+  if (!G) return;
+  let best = null, bd = 15;
+  for (const n of G.nodes){ const [x,y] = px(n.id);
+    const d = Math.hypot(x-e.clientX, y-e.clientY);
+    if (d < bd) { bd = d; best = n.id; } }
+  sel = (best === sel) ? null : best; draw();
+};
+cv.onwheel = e => { e.preventDefault();
+  const f = e.deltaY < 0 ? 1.15 : 1/1.15;
+  const mx = e.clientX, my = e.clientY;
+  pan.x = mx - (mx-pan.x)*f; pan.y = my - (my-pan.y)*f; zoom *= f; draw(); };
+let drag = null;
+cv.onmousedown = e => drag = {x:e.clientX, y:e.clientY, px:pan.x, py:pan.y};
+cv.onmousemove = e => { if (drag){ pan.x = drag.px + e.clientX-drag.x;
+  pan.y = drag.py + e.clientY-drag.y; draw(); } };
+cv.onmouseup = () => drag = null;
+</script>
+</body>
+</html>

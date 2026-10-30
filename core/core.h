@@ -20,7 +20,13 @@
 /* ---------------- configuration (firmware constants) ---------------- */
 #define MC_N_CHANNELS    3
 #define MC_MAX_NEIGHBORS 64
-#define MC_MAX_PENDING   16
+#define MC_MAX_PENDING   64            /* was 16: the 480-node scale run showed
+                                          the forwarding hops on tile crossings run
+                                          out of slots under load (554 of 573 lost
+                                          messages were the silent no-slot drop);
+                                          64 records x ~250 B = 16 kB - fits the
+                                          13.2 budget (the freed 4 kB chunk-reassembly
+                                          space covers it) */
 #define MC_MAX_DEDUP    128
 #define MC_MAX_PAYLOAD  230
 #ifndef MC_MAP_NODES
@@ -83,6 +89,18 @@ typedef struct {
                               protocol field - the penalty 10.4 carries
                               the long-term lesson) */
     uint16_t msg_id, src, dst, prev_hop, next_hop;
+    uint8_t  in_graph;     /* the destination lies in the own graph (10.2):
+                              the plan is Dijkstra-proven, not a geo guess -
+                              the attempt order then favours the optimum
+                              (7.4, the in-graph retry bias, Oct 2026: a
+                              failed exchange on a proven route is more
+                              likely fluctuation than structure - the
+                              16h scale run: 179 messages reached their
+                              destination as a chosen hop, the single
+                              exchange failed, and the round-robin then
+                              wandered to suboptimal detours that never
+                              came back; in-graph the optimum gets the
+                              majority of the attempts instead) */
     uint16_t cand[3];      /* the attempt plan, best first (7.4) */
     uint16_t excl[3];       /* the failed hops (7.4) */
     uint8_t  pkt[16 + MC_MAX_PAYLOAD];
@@ -280,6 +298,11 @@ struct mimeshi_node {
                                          drives the derivable digest */
     mimeshi_mapnode map[MC_MAP_NODES];  /* 2-hop map (10.1) */
     mimeshi_link   lnk[MC_MAX_LINKS];  /* links between map nodes (4.3) */
+    uint8_t  trace;                   /* message tracing (measured runs):
+                                         1 = log every send/receive/ack of
+                                         DATA messages on this node. Set via
+                                         mimeshi_set_trace; the simulator
+                                         uses it for low-rate forensics runs. */
     mimeshi_tx_fn     tx;
     mimeshi_timer_fn  timer;
     mimeshi_switch_fn switch_ch;
@@ -293,6 +316,11 @@ struct mimeshi_node {
 void mimeshi_init(mimeshi_node *n, uint16_t id, mimeshi_tx_fn tx, mimeshi_timer_fn timer,
                 mimeshi_switch_fn sw, mimeshi_rand_fn rnd,
                 mimeshi_channel_free_fn cad, void *user);
+
+/* Message tracing (forensics runs): 1 = this node logs every DATA
+ * send/receive and every ack1/ack2 of its messages. Cheap when off (one
+ * byte test per event). */
+void mimeshi_set_trace(mimeshi_node *n, uint8_t on);
 
 /* First hello round immediately, then startup rounds with random phase
  * (jitter). After the startup phase the hello no longer exists:

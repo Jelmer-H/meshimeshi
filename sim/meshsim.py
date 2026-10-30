@@ -451,9 +451,15 @@ def newcomer_traffic(mk, jitter):
 
 def grid_geo(lat, lon):
     """16-bit grid encoding of section 5: 180 degrees over 65536 steps
-    for latitude, 360 for longitude (offset +32768)."""
+    for latitude, 360 for longitude - NO offset term: (lon+180)/360 is
+    already centered (lon=0 -> 32768). The old '+32768' was a double
+    offset that clamped the ENTIRE eastern hemisphere (all of Europe,
+    every node in the NL world) to 65535: geo-greedy then navigated on
+    latitude alone - longitude differences were invisible (dist2 saw
+    dlon=0 for every pair). Found via the 6162 forensics: 111,444 of
+    122,777 dumped pool entries had lon=65535."""
     la = int((lat + 90.0) / 180.0 * 65536)
-    lo = int((lon + 180.0) / 360.0 * 65536) + 32768
+    lo = int((lon + 180.0) / 360.0 * 65536)
     return max(1, min(65535, la)), max(1, min(65535, lo))
 
 _ARGS = None   # CLI context for scenarios (local-net reads --nodes/--duration)
@@ -1739,6 +1745,14 @@ def main():
                     help="scenario 6d: percent of the nodes per day that leave and later return")
     ap.add_argument('--interval', type=int, default=10, metavar='SECONDS',
                     help='seconds between unicasts (load, default 10)')
+    ap.add_argument('--graph-out', metavar='FILE.json',
+                    help='after the run: dump the final graph state as JSON '
+                         '(nodes with positions, every node\'s link store and map pool) '
+                         'for the graph viewer (tools/graph.html)')
+    ap.add_argument('--trace', action='store_true',
+                    help='message tracing: every node logs its DATA sends/receives '
+                         'and ack1/ack2 with a [msg] prefix (forensics runs; pair '
+                         'with a low --interval to keep the log readable)')
     ap.add_argument('--join-at', type=int, default=5400, metavar='SECONDS',
                     help='newcomer start time in seconds (newcomer-traffic, default 5400)')
     args = ap.parse_args()
@@ -1765,9 +1779,53 @@ def main():
     import sim1
     if args.quiet:
         sim1.VERBOSE = False   # switch off radio logs; [core] lines remain
+    if args.trace:
+        sim1.TRACE_MSGS = True
 
     lib = load_lib(args.so)
     mk = lambda nd: CCore(nd, lib)
+    import atexit
+    def _graph_dump():
+        if not getattr(_ARGS, 'graph_out', None):
+            return
+        import json
+        radio = sim1.RADIO_REF[0] if getattr(sim1, 'RADIO_REF', None) else None
+        nodes = sim1.ALL_NODES if hasattr(sim1, 'ALL_NODES') else []
+        out_nodes = []
+        for kn in nodes:
+            core = kn.core
+            links = []
+            for l in core.mn.lnk:
+                if l.alive:
+                    links.append([int(l.a), int(l.b), int(l.q)])   # q = direction classes (hi<<4 | lo)
+            pool = []
+            pmeta = {}
+            for m in core.mn.map:
+                if m.alive:
+                    pool.append(int(m.id))
+                    pmeta[int(m.id)] = {'adv_q': int(m.adv_q), 'star_tick': int(m.star_tick),
+                                       'geo': [int(m.geo_lat), int(m.geo_lon)]}
+            nbrs = []
+            nmeta = {}
+            for nb in core.mn.nbr:
+                if nb.alive:
+                    nbrs.append(int(nb.id))
+                    nmeta[int(nb.id)] = {'sym': int(nb.sym), 'quality': int(nb.quality),
+                                        'penalty': int(nb.penalty)}
+            out_nodes.append({
+                'id': int(kn.id), 'nbrs': nbrs, 'links': links, 'pool': pool,
+                'pmeta': pmeta, 'nmeta': nmeta})
+        geo = {}
+        for line in open('sim/nodes/utrecht480.csv' if '480' in (_ARGS.nodes or '') else _ARGS.nodes):
+            line = line.strip()
+            if not line or line.startswith('#'): continue
+            p = line.split(',')
+            geo[int(p[0], 16)] = [float(p[1]), float(p[2])]
+        data = {'nodes': out_nodes, 'geo': geo}
+        with open(_ARGS.graph_out, 'w') as f:
+            json.dump(data, f)
+        out(f"graph state dumped to {_ARGS.graph_out}")
+    atexit.register(_graph_dump)
 
     fn, desc = SCENARIOS[args.scenario]
     out(f"=== Scenario '{args.scenario}': {desc} (C core, SF7, 62.5 kHz) ===")
