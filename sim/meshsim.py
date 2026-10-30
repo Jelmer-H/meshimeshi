@@ -1791,11 +1791,24 @@ def main():
             links = []
             for l in core.mn.lnk:
                 if l.alive:
-                    links.append([int(l.a), int(l.b)])
-            pool = [int(m.id) for m in core.mn.map if m.alive]
-            nbrs = [int(nb.id) for nb in core.mn.nbr if nb.alive]
+                    links.append([int(l.a), int(l.b), int(l.q)])   # q = direction classes (hi<<4 | lo)
+            pool = []
+            pmeta = {}
+            for m in core.mn.map:
+                if m.alive:
+                    pool.append(int(m.id))
+                    pmeta[int(m.id)] = {'adv_q': int(m.adv_q), 'star_tick': int(m.star_tick),
+                                       'geo': [int(m.geo_lat), int(m.geo_lon)]}
+            nbrs = []
+            nmeta = {}
+            for nb in core.mn.nbr:
+                if nb.alive:
+                    nbrs.append(int(nb.id))
+                    nmeta[int(nb.id)] = {'sym': int(nb.sym), 'quality': int(nb.quality),
+                                        'penalty': int(nb.penalty)}
             out_nodes.append({
-                'id': int(kn.id), 'nbrs': nbrs, 'links': links, 'pool': pool})
+                'id': int(kn.id), 'nbrs': nbrs, 'links': links, 'pool': pool,
+                'pmeta': pmeta, 'nmeta': nmeta})
         geo = {}
         for line in open('sim/nodes/utrecht480.csv' if '480' in (_ARGS.nodes or '') else _ARGS.nodes):
             line = line.strip()
