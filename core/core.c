@@ -616,15 +616,27 @@ static mimeshi_mapnode *map_add_geo(mimeshi_node *n, uint16_t id,
     evict_hop_fill(n);
     int victim = -1;
     uint8_t v_hop = 0; uint32_t v_len = 0;
+    int v_disc = 0;                        /* victim is NOT connected to our graph */
     for (int i = 0; i < MC_MAP_NODES; i++) {
         if (!n->map[i].alive) continue;
         /* direct neighbours never: they live in the prefix */
         if (nbr_find(n, n->map[i].id)) continue;
         uint8_t h = ev_hop[i];
-        if (h == 0xFF) h = 250;            /* unreachable: maximal distance */
+        int disc = (h == 0xFF);            /* unreachable in our graph: a knowledge
+                                              island - stored (first contact may
+                                              arrive disconnected; the graph grows
+                                              onto it later), but the FIRST OUT at
+                                              the cap: routing capital beats
+                                              stranded knowledge (decided Oct 2026).
+                                              The link length never saves an island:
+                                              a richly linked island is still an
+                                              island - its links do not route. */
+        if (h == 0xFF) h = 250;
         uint32_t l = evict_link_len(n, n->map[i].id);
-        if (victim < 0 || h > v_hop || (h == v_hop && l < v_len)) {
-            victim = i; v_hop = h; v_len = l;
+        if (victim < 0
+            || (disc && !v_disc)            /* an island always beats a connected entry */
+            || (disc == v_disc && (h > v_hop || (h == v_hop && l < v_len)))) {
+            victim = i; v_hop = h; v_len = l; v_disc = disc;
         }
     }
     if (victim < 0) {                            /* only direct neighbours in the map */
@@ -1443,7 +1455,8 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
     uint16_t cend = 10;                      /* end of the content area */
     for (uint8_t e = 0; e < pkt[4] && cend + 9 <= len; e++)
         cend = (uint16_t)(cend + 9 + 3 * pkt[cend + 8]);   /* walk the content stars */
-    chunk_rx_mode(n, rssi, pkt, cend, 1);   /* entries only: the catalogue and
+
+chunk_rx_mode(n, rssi, pkt, cend, 1);   /* entries only: the catalogue and
                                                missed bytes are not entries */
     uint16_t rx_star[MC_CHUNK_MAX_ENTRIES];     /* content stars of THIS packet */
     uint8_t rx_star_n = 0;
