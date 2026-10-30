@@ -451,9 +451,15 @@ def newcomer_traffic(mk, jitter):
 
 def grid_geo(lat, lon):
     """16-bit grid encoding of section 5: 180 degrees over 65536 steps
-    for latitude, 360 for longitude (offset +32768)."""
+    for latitude, 360 for longitude - NO offset term: (lon+180)/360 is
+    already centered (lon=0 -> 32768). The old '+32768' was a double
+    offset that clamped the ENTIRE eastern hemisphere (all of Europe,
+    every node in the NL world) to 65535: geo-greedy then navigated on
+    latitude alone - longitude differences were invisible (dist2 saw
+    dlon=0 for every pair). Found via the 6162 forensics: 111,444 of
+    122,777 dumped pool entries had lon=65535."""
     la = int((lat + 90.0) / 180.0 * 65536)
-    lo = int((lon + 180.0) / 360.0 * 65536) + 32768
+    lo = int((lon + 180.0) / 360.0 * 65536)
     return max(1, min(65535, la)), max(1, min(65535, lo))
 
 _ARGS = None   # CLI context for scenarios (local-net reads --nodes/--duration)
