@@ -2488,15 +2488,15 @@ int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uin
      * bridge from possibly worse knowledge (the plateau finding: pools
      * held candidates at 11 km median from the destination, but no hop
      * could ROUTE to them - toward the zone, every step is local). */
-    uint16_t wlat = 0, wlon = 0;
-    bool wp = false;
-    if (geo && !p->in_graph) {
-        uint16_t bridge = route_bridge_node(n, dest_lat, dest_lon, 0, 0);
-        mimeshi_mapnode *bm = bridge ? map_find(n, bridge) : 0;
-        if (bm && bm->geo_lat) { wlat = bm->geo_lat; wlon = bm->geo_lon; wp = true; }
-    }
+    /* Waypoint retired (Oct 2026): the koers was built against the
+     * collapsed-geo plateau - an artifact of the sim's broken longitude
+     * encoding, fixed since. With a healthy two-dimensional geo space the
+     * distance-first bridge rule alone navigates; the waypoint's extra
+     * state did not pay for its complexity (the 1347 trace: re-aims on
+     * equal koersen, chains still leaving the arrival zone). The flag
+     * stays defined for format compatibility; nothing sets it. */
     k[0] = (uint8_t)(PKT_DATA | (ack3 ? F_ACK3_REQ : 0)
-                     | (geo ? F_DEST_GEO : 0) | (wp ? F_WAYPOINT_GEO : 0));
+                     | (geo ? F_DEST_GEO : 0));
     wr16(k + 1, p->msg_id); wr16(k + 3, n->id); wr16(k + 5, dst); wr16(k + 7, n->id);
     k[9] = p->budget_left;                 /* header: budget at offset 9 (section 6.1) */
     wr16(k + 10, nh);                      /* next hop at offset 10 (6.1) */
@@ -2504,10 +2504,6 @@ int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uin
     if (geo) {                              /* dest geo after the fixed header (6.1, 10.2) */
         wr16(k + 12, dest_lat); wr16(k + 14, dest_lon);
         off = 16;
-    }
-    if (wp) {                               /* waypoint geo after the dest geo (10.2) */
-        wr16(k + 16, wlat); wr16(k + 18, wlon);
-        off = 20;
     }
     memcpy(k + off, payload, len);
     p->pkt_len = (uint16_t)(off + len);
@@ -2785,55 +2781,18 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
             memset(p, 0, sizeof(*p));
             p->budget_left = (uint8_t)(budget - 1);
 
-            /* Waypoint (10.2, the koers): the traveling geo of the best
-             * bridge the chain has seen. The better-than criterion: a
-             * forwarder replaces the waypoint ONLY when its own bridge
-             * candidate lies strictly closer to the destination
-             * (5% margin on the squared distance - no ping-pong on
-             * ties). Hops with worse knowledge FOLLOW the koers: they
-             * route toward the waypoint ZONE with locally routable
-             * steps (the plateau finding: pools held candidates 11 km
-             * from the destination that no hop could ROUTE to -
-             * toward the zone, every step is local and reachable).
-             * The destination in the own graph always wins: the
-             * in-graph Dijkstra runs first and the waypoint focus is
-             * only for out-of-graph. */
-            uint16_t wlat = 0, wlon = 0; bool has_wp = false;
-            uint16_t wp_off = (flags & F_DEST_GEO) ? 16 : 12;
-            if (flags & F_WAYPOINT_GEO) {
-                wlat = rd16(pkt + wp_off); wlon = rd16(pkt + wp_off + 2); has_wp = true;
-            }
-            uint32_t wp_d = has_wp && (gl || go) ? geo_dist2(wlat, wlon, gl, go) : 0;
-            bool wp_replaced = false;
-            if (has_wp && (gl || go)) {
-                uint16_t my_cand = route_bridge_node(n, gl, go, 0, 0);
-                mimeshi_mapnode *mm = my_cand ? map_find(n, my_cand) : 0;
-                if (mm && mm->geo_lat) {
-                    uint32_t d_mine = geo_dist2(mm->geo_lat, mm->geo_lon, gl, go);
-                    if (d_mine + d_mine / 20u < wp_d) {   /* strictly closer */
-                        wlat = mm->geo_lat; wlon = mm->geo_lon;
-                        wp_d = d_mine; wp_replaced = true;
-                        MTRACE(n, "WAYPOINT msg %u re-aimed at %u (d %u -> %u)\n",
-                               msg_id, my_cand, wp_d, d_mine);
-                    }
-                }
-            }
+            /* Waypoint retired (Oct 2026 - see mimeshi_send_data): every
+             * hop applies the distance-first bridge rule on the DESTINATION
+             * geo directly. No traveling state; the header format keeps the
+             * F_WAYPOINT_GEO flag defined but unused. */
 
             /* attempt schedule (7.4): up to 3 Dijkstra-best hops toward
              * dst; the collector never proposes the previous hop (the
              * 10.2 prev-hop exclusion is thereby part of every
              * candidate, not only the first). active goes on only
              * after the check - an unforwardable message must not
-             * leak its pending slot. Focus: in-graph, or no waypoint ->
-             * toward the destination as before; out-of-graph WITH a
-             * waypoint -> toward the waypoint ZONE (locally routable;
-             * the in-graph attempt toward dst still runs first inside
-             * the collector - a destination that entered our graph
-             * always wins over the koers). */
-            if (has_wp && r_idx(n, dst) < 0 && !nbr_find(n, dst))
-                p->cand_cnt = schedule_candidates(n, dst, wlat, wlon, prev, 0, 0, p->cand);
-            else
-                p->cand_cnt = schedule_candidates(n, dst, gl, go, prev, 0, 0, p->cand);
+             * leak its pending slot. */
+            p->cand_cnt = schedule_candidates(n, dst, gl, go, prev, 0, 0, p->cand);
             p->in_graph = r_idx(n, dst) >= 0 || nbr_find(n, dst) != 0;   /* Dijkstra-proven plan? (7.4) */
             if (p->cand_cnt == 0) {
                 /* No routable path from here (7.2/10.5): NEGATIVE back,
@@ -2846,9 +2805,6 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
             p->active = 1;
             p->msg_id = msg_id; p->src = src; p->dst = dst; p->prev_hop = prev;
             memcpy(p->pkt, pkt, len); p->pkt_len = len;
-            if (wp_replaced) {                /* the new koers travels onward (10.2) */
-                wr16(p->pkt + wp_off, wlat); wr16(p->pkt + wp_off + 2, wlon);
-            }
             p->pkt[7] = (uint8_t)(n->id & 0xFF); p->pkt[8] = (uint8_t)(n->id >> 8);  /* prev hop = us */
             printf("[core] node %u: FORWARD msg %u from %u to %u via %u\n", n->id, msg_id, src, dst, p->cand[0]);
             MTRACE(n, "FORWARD msg %u from %u to %u via %u (budget %u, plan %u cands)\n",
