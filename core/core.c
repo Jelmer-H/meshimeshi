@@ -1887,43 +1887,44 @@ static uint32_t route_cost_to(mimeshi_node *n, uint16_t dst,
  * 1.3225, so the margin is +32.25% on d2. */
 static uint16_t route_bridge_node(mimeshi_node *n, uint16_t lat, uint16_t lon,
                                   const uint16_t *excl, uint8_t excl_cnt) {
-    /* The own entry is NEVER a bridge candidate (10.2, the scale
-     * finding): the own node has a geo, and once the 15% distance band
-     * admits it (which happens structurally toward far destinations:
-     * the band is 15% of a large distance, and the forwarder itself
-     * is often the closest-known geo simply by having advanced toward
-     * the destination), the route-cost pass picks it at cost 0 - no
-     * real neighbour can beat distance-to-self. The result was a
-     * self-loop that burned the attempt schedule (measured: 258
-     * 'schedule exhausted' failures on the 480-node run, the
-     * majority this exact pattern: FORWARD via self, schedule failed
-     * toward self). A bridge is by definition a NEIGHBOUR we send to;
-     * without one the honest answer is 0 (cannot route). */
-    uint32_t best_d = 0;
-    int have = 0;
+    /* Distance first, cost as tiebreak only (10.2, revised Oct 2026 - the
+     * plateau finding). The old 15%-band + route-cost pass modelled a
+     * future we cannot oversee: among geographically comparable
+     * candidates it preferred the CHEAPEST - and the cheapest is
+     * structurally the LOCAL one (few hops in the own graph),
+     * cotangent to the destination, taking the message nowhere.
+     * Measured (the 8h and 16h scale runs): the stranded out-of-graph
+     * messages circled a flat plateau at ~130 km from their
+     * destinations for every hop, while the pool simulation showed the
+     * median pool holds a candidate at 16 km from the destination -
+     * the knowledge was there, the cost pass kept choosing the
+     * useless local step over it. The own entry is NEVER a candidate
+     * (the self-loop fix stands). The rule now: the candidate CLOSEST
+     * to the destination geo wins; the route cost decides only
+     * between candidates at virtually the same distance (within ~5% on
+     * the squared distance) - resolving true ties by quality, never
+     * trading distance for cost. The local nodes near the destination
+     * know better than our forward-thinking here. */
+    uint16_t pick = 0;
+    uint32_t pick_d = 0, pick_cost = MC_DIST_INF;
     for (int i = 0; i < MC_MAP_NODES; i++) {
         if (!n->map[i].alive || !n->map[i].geo_lat) continue;   /* no geo: no candidate (5) */
         if (n->map[i].id == n->id) continue;     /* never the own entry (10.2) */
         uint32_t d = geo_dist2(n->map[i].geo_lat, n->map[i].geo_lon, lat, lon);
-        if (!have || d < best_d) { best_d = d; have = 1; }
+        if (!pick) { pick = n->map[i].id; pick_d = d; continue; }
+        if (d >= pick_d) continue;               /* farther: not a candidate */
+        if (pick_d > d + d / 20u) {
+            /* significantly closer: wins outright */
+            pick = n->map[i].id; pick_d = d; pick_cost = MC_DIST_INF;
+        } else {
+            /* within ~5%: a tie - the route cost decides */
+            if (pick_cost == MC_DIST_INF)
+                pick_cost = route_cost_to(n, pick, excl, excl_cnt);
+            uint32_t c = route_cost_to(n, n->map[i].id, excl, excl_cnt);
+            if (c < pick_cost) { pick = n->map[i].id; pick_d = d; pick_cost = c; }
+        }
     }
-    if (!have) return 0;                       /* no geo material at all */
-    uint32_t margin = best_d + best_d * 3225u / 10000u;
-    /* first pass: find the best (minimum) route cost among the
-     * candidates; the Dijkstra scratch is filled per candidate run.
-     * Candidates are usually few; the closest-first scan keeps the
-     * result deterministic. */
-    uint16_t pick = 0;
-    uint32_t pick_cost = MC_DIST_INF;
-    for (int i = 0; i < MC_MAP_NODES; i++) {
-        if (!n->map[i].alive || !n->map[i].geo_lat) continue;
-        if (n->map[i].id == n->id) continue;     /* never the own entry (10.2) */
-        uint32_t d = geo_dist2(n->map[i].geo_lat, n->map[i].geo_lon, lat, lon);
-        if (d > margin) continue;              /* outside the 15% band (10.2) */
-        uint32_t c = route_cost_to(n, n->map[i].id, excl, excl_cnt);
-        if (c < pick_cost) { pick_cost = c; pick = n->map[i].id; }
-    }
-    return pick;                                /* 0 when no candidate routable */
+    return pick;                                /* 0 when no candidate at all */
 }
 
 
