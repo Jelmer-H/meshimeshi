@@ -71,7 +71,10 @@ static void r16w(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v
  * hsender with the given RSSI quality: proves symmetry there (4.2). */
 static void confirm_sym(mimeshi_node *hsender, uint16_t responder, int8_t rssi) {
     uint8_t ha[6] = { 2, 0,0, 0,0, 0 };
-    r16w(ha + 1, hsender->id); r16w(ha + 3, responder); ha[5] = 0;
+    /* the rq byte carries the responder's measurement of OUR signal
+     * (6.2) - the three-way closure (4.2, Oct 2026) gates symmetry on
+     * this received evidence, so a realistic quality travels along */
+    r16w(ha + 1, hsender->id); r16w(ha + 3, responder); ha[5] = 34;
     mimeshi_rx(hsender, (uint8_t)(hsender->id % MC_N_CHANNELS), rssi, ha, 6);
 }
 
@@ -174,7 +177,7 @@ static void f_rx(mimeshi_node *r, uint8_t ch, const uint8_t *pkt, uint16_t len) 
 static void f_confirm(mimeshi_node *hs, uint16_t responder) {
     uint8_t ha[6] = { 2, 0,0, 0,0, 0 };
     ha[1] = (uint8_t)hs->id; ha[2] = (uint8_t)(hs->id >> 8);
-    ha[3] = (uint8_t)responder; ha[4] = (uint8_t)(responder >> 8);
+    ha[3] = (uint8_t)responder; ha[4] = (uint8_t)(responder >> 8); ha[5] = 34;   /* rq: the three-way closure evidence (4.2) */
     mimeshi_rx(hs, (uint8_t)(hs->id % MC_N_CHANNELS), -55, ha, 6);
 }
 static void f_deliver(const uint8_t *pkt, uint16_t len) {
@@ -193,7 +196,7 @@ static int e_tx[4], e_deliv[4];
 static void e_confirm(mimeshi_node *hs, uint16_t responder) {
     uint8_t ha[6] = { 2, 0,0, 0,0, 0 };
     ha[1] = (uint8_t)hs->id; ha[2] = (uint8_t)(hs->id >> 8);
-    ha[3] = (uint8_t)responder; ha[4] = (uint8_t)(responder >> 8);
+    ha[3] = (uint8_t)responder; ha[4] = (uint8_t)(responder >> 8); ha[5] = 34;   /* rq: the three-way closure evidence (4.2) */
     mimeshi_rx(hs, (uint8_t)(hs->id % MC_N_CHANNELS), -55, ha, 6);
 }
 static void e_rxnode(mimeshi_node *r, uint8_t ch, const uint8_t *pkt, uint16_t len) {
@@ -240,7 +243,7 @@ static uint8_t g_last_ch;
 static void g_confirm(mimeshi_node *hs, uint16_t responder) {
     uint8_t ha[6] = { 2, 0,0, 0,0, 0 };
     ha[1] = (uint8_t)hs->id; ha[2] = (uint8_t)(hs->id >> 8);
-    ha[3] = (uint8_t)responder; ha[4] = (uint8_t)(responder >> 8);
+    ha[3] = (uint8_t)responder; ha[4] = (uint8_t)(responder >> 8); ha[5] = 34;   /* rq: the three-way closure evidence (4.2) */
     mimeshi_rx(hs, (uint8_t)(hs->id % MC_N_CHANNELS), -55, ha, 6);
 }
 static void g_deliv_reset(void) { g_last_ch = 0xFF; }

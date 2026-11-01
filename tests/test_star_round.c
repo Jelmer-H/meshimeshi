@@ -90,10 +90,10 @@ int main(void) {
     /* B learns A and C as confirmed symmetric neighbours through
      * hello-acks (the same injection style as test_table_chunk.c):
      * hello-ack from A to B and from C to B on B's home channel. */
-    uint8_t ack_a[5] = { 2, 0x01,0x01, 0x00,0x01 };   /* HELLO_ACK, dst=B, from=A */
-    uint8_t ack_c[5] = { 2, 0x01,0x01, 0x02,0x01 };   /* HELLO_ACK, dst=B, from=C */
-    mimeshi_rx(&B, B.home_ch, -60, ack_a, 5);
-    mimeshi_rx(&B, B.home_ch, -70, ack_c, 5);
+    uint8_t ack_a[6] = { 2, 0x01,0x01, 0x00,0x01, 34 };  /* HELLO_ACK, dst=B, from=A, rq=34 */
+    uint8_t ack_c[6] = { 2, 0x01,0x01, 0x02,0x01, 30 };  /* HELLO_ACK, dst=B, from=C, rq=30 */
+    mimeshi_rx(&B, B.home_ch, -60, ack_a, 6);
+    mimeshi_rx(&B, B.home_ch, -70, ack_c, 6);
     {
         int sym_a = -1, sym_c = -1;
         for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {

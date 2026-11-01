@@ -86,9 +86,12 @@ static void inject_star(mimeshi_node *n, uint16_t owner,
 }
 
 static void ack_neighbour(mimeshi_node *n, uint16_t from) {
-    uint8_t ack[5] = { 2, (uint8_t)(n->id & 0xFF), (uint8_t)(n->id >> 8),
-                       (uint8_t)(from & 0xFF), (uint8_t)(from >> 8) };
-    mimeshi_rx(n, n->home_ch, -60, ack, 5);
+    /* 6 B with the rq byte (6.2): the three-way closure (4.2, Oct 2026)
+     * gates symmetry on this received evidence - a realistic quality
+     * (34 = quality_of(-60)) travels along */
+    uint8_t ack[6] = { 2, (uint8_t)(n->id & 0xFF), (uint8_t)(n->id >> 8),
+                       (uint8_t)(from & 0xFF), (uint8_t)(from >> 8), 34 };
+    mimeshi_rx(n, n->home_ch, -60, ack, 6);
 }
 
 /* unit-test level map/link builders: fill the store directly */

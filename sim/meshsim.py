@@ -21,6 +21,7 @@ import random
 
 import simpy
 
+import sim1
 from sim1 import (radio_log, Node, CCore, load_lib, Wire, sym_count, nbr_counts,
                   load_nodes_csv, project, linkbudget, RX_MIN_DBM, DutyLedger, N_CH,
                   StarStats)
@@ -451,9 +452,15 @@ def newcomer_traffic(mk, jitter):
 
 def grid_geo(lat, lon):
     """16-bit grid encoding of section 5: 180 degrees over 65536 steps
-    for latitude, 360 for longitude (offset +32768)."""
+    for latitude, 360 for longitude - NO offset term: (lon+180)/360 is
+    already centered (lon=0 -> 32768). The old '+32768' was a double
+    offset that clamped the ENTIRE eastern hemisphere (all of Europe,
+    every node in the NL world) to 65535: geo-greedy then navigated on
+    latitude alone - longitude differences were invisible (dist2 saw
+    dlon=0 for every pair). Found via the 6162 forensics: 111,444 of
+    122,777 dumped pool entries had lon=65535."""
     la = int((lat + 90.0) / 180.0 * 65536)
-    lo = int((lon + 180.0) / 360.0 * 65536) + 32768
+    lo = int((lon + 180.0) / 360.0 * 65536)
     return max(1, min(65535, la)), max(1, min(65535, lo))
 
 _ARGS = None   # CLI context for scenarios (local-net reads --nodes/--duration)
@@ -1108,6 +1115,139 @@ def star_scale(mk, jitter):
                     refused[0] += 1
         if radio.now + interval_us <= duration_us:
             radio.schedule(interval_us, gen)
+    # --- deep forensics: --trace-one SRC,DST -------------------------
+    # The warm state is expensive; the experiments are cheap. Fork: the
+    # child runs the single-message experiment and exits; the parent
+    # could fork again from the SAME warm state (same process, rerun).
+    # --- warm-state checkpoint / resume (no repeated warmups) --------
+    # The warmup is the expensive part (hours of sim time); the state it
+    # produces lives entirely in the node structs (map, links, neighbor
+    # table, dedup - all C memory) plus the wire. A checkpoint captures
+    # exactly that; a resume rebuilds the world in seconds. The protocol
+    # timers restart fresh (proof ticks, star rounds rebuild within one
+    # cycle) - the KNOWLEDGE is the warmup product and it survives.
+    import pickle as _pickle
+    _checkpoint = getattr(_ARGS, 'checkpoint', None)
+    _resume = getattr(_ARGS, 'resume', None)
+    if _resume:
+        with open(_resume, 'rb') as f:
+            snap = _pickle.load(f)
+        # KNOWLEDGE-BLOCK RESTORE: the full-struct memmove also drags the
+        # callback pointers (tx/timer/switch/rand/cad/user) into the node -
+        # and restoring them from Python proved fragile (the trampolines
+        # segfaulted on the first start). Instead: keep the live, freshly
+        # initialized core untouched and place ONLY the warmup product -
+        # the map, the link store, the neighbor table, the dedup cache,
+        # the eviction taboo, the missed list and the time base - at their
+        # struct offsets. The callbacks stay exactly as mimeshi_init built
+        # them; the pending records stay fresh (their half-flown timers
+        # were never part of the warmup product anyway).
+        for kn in nodes:
+            blob = snap['nodes'].get(kn.id)
+            if blob is None: continue
+            mn = kn.core.mn
+            base = ctypes.addressof(mn)
+            for off, size in snap['blocks']:
+                ctypes.memmove(base + off, blob[off:off+size], size)
+        radio.wire.links = snap['wire_links']
+        out(f"resumed from checkpoint {_resume} (checkpoint t={snap['now']/3.6e9:.2f} h, "
+            f"{len(snap['nodes'])} nodes) - warmup skipped, the clock restarts at 0")
+        # restart the protocol timers (they were not part of the snapshot):
+        for kn in nodes:
+            kn.core.start()
+        warmup_us = 0   # the traffic/trace phase starts NOW
+    elif _checkpoint:
+        radio.run(until_us=warmup_us)
+        blocks = [
+            (sim1.CNode.nbr.offset, ctypes.sizeof(sim1.CNeighbor) * sim1.MC_MAX_NEIGHBORS),
+            (sim1.CNode.dedup.offset, ctypes.sizeof(sim1.CDedup) * sim1.MC_MAX_DEDUP),
+            (sim1.CNode.ev_taboo.offset, 2 * 256),
+            (sim1.CNode.star_miss.offset, ctypes.sizeof(sim1.CStarMiss) * 12),
+            (sim1.CNode.map.offset, ctypes.sizeof(sim1.CMapNode) * sim1.MC_MAP_NODES),
+            (sim1.CNode.lnk.offset, ctypes.sizeof(sim1.CLink) * sim1.MC_MAX_LINKS),
+            (sim1.CNode.geo_lat.offset, 4),
+            (sim1.CNode.tick.offset, 4),
+        ]
+        snap = {'nodes': {kn.id: bytes(kn.core.mn) for kn in nodes},
+                'blocks': blocks,
+                'wire_links': radio.wire.links,
+                'now': radio.now}
+        with open(_checkpoint, 'wb') as f:
+            _pickle.dump(snap, f)
+        out(f"checkpoint saved: {_checkpoint} (t={radio.now/3.6e9:.2f} h) - "
+            f"traffic phase skipped; resume with --resume {_checkpoint}")
+        return
+
+    trace_ones = getattr(_ARGS, 'trace_one', None) or []
+    if trace_ones:
+        import os
+        radio.run(until_us=warmup_us)          # the full warmup, ONCE for all
+        for exp_i, trace_one in enumerate(trace_ones):
+            tsrc_s, tdst_s = trace_one.split(',')
+            tsrc = int(tsrc_s, 16) if tsrc_s.startswith('0x') else int(tsrc_s)
+            tdst = int(tdst_s, 16) if tdst_s.startswith('0x') else int(tdst_s)
+            tracefile = f'hoptrace-{exp_i}.trace'
+            pid = os.fork()
+            if pid == 0:
+                # child: the single-message experiment (its own output file)
+                libc = ctypes.CDLL(None)
+                libc.fopen.restype = ctypes.c_void_p
+                libc.fopen.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+                libc.fflush.argtypes = [ctypes.c_void_p]
+                libc.fclose.argtypes = [ctypes.c_void_p]   # without this the 64-bit
+                                                           # FILE* truncates to c_int
+                                                           # and the flush never lands
+                cfile = libc.fopen(tracefile.encode(), b'w')
+                # ALL nodes get the hoptrace: the message's path is unknown
+                # beforehand - every potential deciding node must log.
+                for kn in nodes:
+                    kn.core.set_hoptrace(cfile)
+                src_node = next(kn for kn in nodes if kn.id == tsrc)
+                rc = src_node.core.send_data(tdst, b'trace-one', ack3=False,
+                                             geo=node_geo[tdst])
+                out(f"trace-one: send rc={rc} ({tsrc:#x} -> {tdst:#x})")
+                # count the decision dossiers BEFORE the run (they grow per decision)
+                libc.fflush(cfile)                # the dossiers so far (the send decision)
+                pre = os.path.getsize(tracefile)
+                radio.run(until_us=duration_us)   # let the message resolve
+                libc.fflush(cfile)                # os._exit skips the C atexit flush
+                libc.fclose(cfile)
+                # THE EXPERIMENT REPORT: was it delivered, at what cost?
+                # The pending record of the source tells the tale: active=0
+                # after a resolved delivery (DELIVERED + ack-close), and the
+                # destination's dedup saw the message. Read both.
+                delivered = False
+                dst_node = next((kn for kn in nodes if kn.id == tdst), None)
+                if dst_node is not None:
+                    for dd in dst_node.core.mn.dedup:
+                        if dd.msg_id and dd.src == tsrc:
+                            delivered = True
+                            break
+                # the source's pending state: budget left + still active (unresolved)
+                pend_state = None
+                for p in src_node.core.mn.pend:
+                    if p.active and p.dst == tdst:
+                        pend_state = p
+                        break
+                n_dossiers = 0
+                with open(tracefile) as f:
+                    n_dossiers = sum(1 for line in f if line.startswith('{"node"'))
+                out(f"\n=== trace-one experiment {exp_i} ({tsrc:#x} -> {tdst:#x}) ===")
+                if rc != 0:
+                    out(f"  REFUSED at the source (rc={rc}: no routable first hop)")
+                else:
+                    out(f"  delivered: {'YES' if delivered else 'NO'}")
+                    if pend_state is not None:
+                        out(f"  source pending still ACTIVE: budget left "
+                             f"{pend_state.budget_left}, the message never resolved")
+                    else:
+                        out(f"  source pending closed: the exchange chain ended")
+                    out(f"  decision dossiers: {n_dossiers}")
+                os._exit(0)
+            else:
+                os.waitpid(pid, 0)
+                out(f"trace-one: experiment {exp_i} done - dossiers in {tracefile}")
+        return
     if interval_us:
         radio.schedule(warmup_us, gen)
 
@@ -1739,6 +1879,29 @@ def main():
                     help="scenario 6d: percent of the nodes per day that leave and later return")
     ap.add_argument('--interval', type=int, default=10, metavar='SECONDS',
                     help='seconds between unicasts (load, default 10)')
+    ap.add_argument('--graph-out', metavar='FILE.json',
+                    help='after the run: dump the final graph state as JSON '
+                         '(nodes with positions, every node\'s link store and map pool) '
+                         'for the graph viewer (tools/graph.html)')
+    ap.add_argument('--trace', action='store_true',
+                    help='message tracing: every node logs its DATA sends/receives '
+                         'and ack1/ack2 with a [msg] prefix (forensics runs; pair '
+                         'with a low --interval to keep the log readable)')
+    ap.add_argument('--checkpoint', metavar='FILE',
+                    help='star-scale: after the warmup, save the warm world state '
+                         '(all node structs + wire) to FILE and exit. The traffic '
+                         'phase is skipped - this run only produces the warm state.')
+    ap.add_argument('--resume', metavar='FILE',
+                    help='star-scale: load a checkpoint (no warmup - seconds instead '
+                         'of the full warmup run), rebuild the world from the saved '
+                         'node structs, restart the protocol timers and run the '
+                         'traffic/trace-one phase from there.')
+    ap.add_argument('--trace-one', metavar='SRC,DST', action='append',
+                    help='DEEP FORENSICS (star-scale): after the (single) warmup, '
+                         'fork and trace ONE message src->dst with full hop-decision '
+                         'dossiers. REPEATABLE: each --trace-one runs a separate '
+                         'experiment from the SAME warm state - the warmup happens '
+                         'once, every extra pair is free. Output: hoptrace-N.trace')
     ap.add_argument('--join-at', type=int, default=5400, metavar='SECONDS',
                     help='newcomer start time in seconds (newcomer-traffic, default 5400)')
     args = ap.parse_args()
@@ -1765,9 +1928,53 @@ def main():
     import sim1
     if args.quiet:
         sim1.VERBOSE = False   # switch off radio logs; [core] lines remain
+    if args.trace:
+        sim1.TRACE_MSGS = True
 
     lib = load_lib(args.so)
     mk = lambda nd: CCore(nd, lib)
+    import atexit
+    def _graph_dump():
+        if not getattr(_ARGS, 'graph_out', None):
+            return
+        import json
+        radio = sim1.RADIO_REF[0] if getattr(sim1, 'RADIO_REF', None) else None
+        nodes = sim1.ALL_NODES if hasattr(sim1, 'ALL_NODES') else []
+        out_nodes = []
+        for kn in nodes:
+            core = kn.core
+            links = []
+            for l in core.mn.lnk:
+                if l.alive:
+                    links.append([int(l.a), int(l.b), int(l.q)])   # q = direction classes (hi<<4 | lo)
+            pool = []
+            pmeta = {}
+            for m in core.mn.map:
+                if m.alive:
+                    pool.append(int(m.id))
+                    pmeta[int(m.id)] = {'adv_q': int(m.adv_q), 'star_tick': int(m.star_tick),
+                                       'geo': [int(m.geo_lat), int(m.geo_lon)]}
+            nbrs = []
+            nmeta = {}
+            for nb in core.mn.nbr:
+                if nb.alive:
+                    nbrs.append(int(nb.id))
+                    nmeta[int(nb.id)] = {'sym': int(nb.sym), 'quality': int(nb.quality),
+                                        'penalty': int(nb.penalty)}
+            out_nodes.append({
+                'id': int(kn.id), 'nbrs': nbrs, 'links': links, 'pool': pool,
+                'pmeta': pmeta, 'nmeta': nmeta})
+        geo = {}
+        for line in open('sim/nodes/utrecht480.csv' if '480' in (_ARGS.nodes or '') else _ARGS.nodes):
+            line = line.strip()
+            if not line or line.startswith('#'): continue
+            p = line.split(',')
+            geo[int(p[0], 16)] = [float(p[1]), float(p[2])]
+        data = {'nodes': out_nodes, 'geo': geo}
+        with open(_ARGS.graph_out, 'w') as f:
+            json.dump(data, f)
+        out(f"graph state dumped to {_ARGS.graph_out}")
+    atexit.register(_graph_dump)
 
     fn, desc = SCENARIOS[args.scenario]
     out(f"=== Scenario '{args.scenario}': {desc} (C core, SF7, 62.5 kHz) ===")

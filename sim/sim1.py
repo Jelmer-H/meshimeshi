@@ -407,7 +407,7 @@ class Node:
 # Struct layout verified against sizeof/offsetof of core.h
 # (neighbor 24, pending 256, mapnode 12, link 6, node 18528 B).
 # ---------------------------------------------------------------------------
-MC_MAX_NEIGHBORS, MC_MAX_PENDING, MC_MAX_DEDUP, MC_MAX_PAYLOAD = 64, 16, 128, 230
+MC_MAX_NEIGHBORS, MC_MAX_PENDING, MC_MAX_DEDUP, MC_MAX_PAYLOAD = 64, 64, 128, 230
 
 class CNeighbor(ctypes.Structure):
     _fields_ = [("id", ctypes.c_uint16), ("quality", ctypes.c_uint8),
@@ -415,7 +415,8 @@ class CNeighbor(ctypes.Structure):
                 ("ack_try", ctypes.c_uint8), ("last_seen", ctypes.c_uint32),
                 ("proven_age_us", ctypes.c_uint64), ("alive", ctypes.c_uint8),
                 ("sym", ctypes.c_uint8), ("adv_class", ctypes.c_uint8),
-                ("penalty", ctypes.c_uint8)]
+                ("penalty", ctypes.c_uint8),
+                ("acked_round", ctypes.c_uint8)]   # three-way closure (4.2): we acked this neighbour's round
 
 class CPending(ctypes.Structure):
     _fields_ = [("active", ctypes.c_uint8), ("tries_left", ctypes.c_uint8),
@@ -425,6 +426,7 @@ class CPending(ctypes.Structure):
                 ("msg_id", ctypes.c_uint16), ("src", ctypes.c_uint16),
                 ("dst", ctypes.c_uint16), ("prev_hop", ctypes.c_uint16),
                 ("next_hop", ctypes.c_uint16),
+                ("in_graph", ctypes.c_uint8), ("pad0", ctypes.c_uint8),   # alignment: C pads to 4 before cand[3]
                 ("cand", ctypes.c_uint16 * 3),
                 ("excl", ctypes.c_uint16 * 3),
                 ("pkt", ctypes.c_uint8 * (16 + MC_MAX_PAYLOAD)),
@@ -484,6 +486,8 @@ CNode._fields_ = [
     ("dedup_seq", ctypes.c_uint16),
     ("tbl_dirty", ctypes.c_uint8),             # own-star content change pending (4.3)
     ("star_round_sched", ctypes.c_uint8),     # star-round timer running (4.3)
+    ("proof_ack_pend", ctypes.c_uint8),       # three-way closure (4.2): acked round pending
+    ("proof_ack_best_rq", ctypes.c_uint8),     # the round's strongest received rq (two-sided gate)
     ("star_backlog", ctypes.c_uint8),         # content work remained (6e acceleration)
     ("star_rot_ctr", ctypes.c_uint8),         # rotation counter (4.3)
     ("ev_taboo", ctypes.c_uint16 * 256),      # eviction taboo (4.3): judged-and-rejected set
@@ -493,6 +497,8 @@ CNode._fields_ = [
     ("star_tick", ctypes.c_uint8),            # own-star heartbeat tick (4.3)
     ("map", CMapNode * MC_MAP_NODES),   # 2-hop map (10.1)
     ("lnk", CLink * MC_MAX_LINKS),      # link store (4.3)
+    ("hoptrace", ctypes.c_void_p),             # hop-decision trace FILE* (deep forensics)
+    ("trace", ctypes.c_uint8),                 # message tracing (forensics runs)
     ("tx", TX_FN), ("timer", TIMER_FN), ("switch_ch", SWITCH_FN), ("rand", RAND_FN),
     ("channel_free", CAD_FN), ("user", ctypes.c_void_p),
 ]
@@ -533,6 +539,8 @@ def load_lib(path):
     lib = ctypes.CDLL(path)
     lib.mimeshi_init.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint16, TX_FN,
                                  TIMER_FN, SWITCH_FN, RAND_FN, CAD_FN, ctypes.c_void_p]
+    lib.mimeshi_set_trace.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint8]
+    lib.mimeshi_set_hoptrace.argtypes = [ctypes.POINTER(CNode), ctypes.c_void_p]
     lib.mimeshi_start.argtypes = [ctypes.POINTER(CNode)]
     lib.mimeshi_rx.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint8, ctypes.c_int8,
                                ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint16]
@@ -555,11 +563,20 @@ class CCore:
     state). The four callbacks run via the simulator above."""
     def __init__(self, node, lib):
         self.n, self.lib = node, lib
+        globals().setdefault('ALL_NODES', []).append(node)
         self.mn = CNode()
         NODES[ctypes.addressof(self.mn)] = node
         lib.mimeshi_init(ctypes.byref(self.mn), node.id, _tx, _timer, _switch, _rand, _channel_free, None)
+        if globals().get('TRACE_MSGS'):
+            lib.mimeshi_set_trace(ctypes.byref(self.mn), 1)
     def start(self):
         self.lib.mimeshi_start(ctypes.byref(self.mn))
+    def set_hoptrace(self, f):
+        """Deep forensics: every next-hop decision of this node logs its
+        complete dossier (full graph at decision time, plan, chosen hop)
+        to the C FILE* wrapper f - see sim.fopen helper. NULL = off."""
+        self.lib.mimeshi_set_hoptrace(ctypes.byref(self.mn), f)
+
     STAR_PROBE = None   # (rx_id, tx_id): if set, prints type-10 rx (debug hook)
     def rx(self, arg):
         ch, rssi, pkt = arg
