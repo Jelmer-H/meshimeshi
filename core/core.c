@@ -363,23 +363,16 @@ static void hello_round(mimeshi_node *n) {
      * responder. */
     if (n->proof_ack_pend) {
         n->proof_ack_pend = 0;
-        /* the two-sided threshold (4.2, decided Oct 2026): the
-         * PROOF_ACK only closes the agreement when the received
-         * evidence is STRONG - the best rq of the round clears the
-         * gate. A weak round stays silent: the responder's own ack
-         * gate already blocked its weak hello reception, and our
-         * silence is the second gate - both sides end WITHOUT
-         * symmetry, in agreement. Our own quality measurement of the
-         * neighbour plays NO role in the confirmation: it prices the
-         * edge in the route cost (route_edge_own), it does not veto
-         * what the neighbour's packet proved. */
-        if (quality_ok(n->proof_ack_best_rq)) {
-            n->proof_ack_best_rq = 0;
-            n->timer(n, MC_HELLO_ACK_WIN_US + MC_HELLO_ACK_JITTER_US + t_ack_us(),
-                     proof_ack_fire, 0);
-        } else {
-            n->proof_ack_best_rq = 0;    /* reset: the next round starts fresh */
-        }
+        /* the responders' side of the two-sided threshold is already
+         * enforced by their own ack gates (an ack implies a reception
+         * above the gate); our side is enforced per responder by their
+         * reception of THIS packet (weakly received = they ignore it).
+         * The round's acks are therefore all the evidence needed -
+         * the collective PROOF_ACK fires and every responder that
+         * receives it strongly closes its side. */
+        n->proof_ack_best_rq = 0;
+        n->timer(n, MC_HELLO_ACK_WIN_US + MC_HELLO_ACK_JITTER_US + t_ack_us(),
+                 proof_ack_fire, 0);
     }
 }
 
@@ -2053,9 +2046,13 @@ static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
                  * star that names us (6.2) — no extra airtime */
                 uint8_t oq = quality_from_class(cls);
                 nb->rev_quality = quality_ewma(nb->rev_quality ? nb->rev_quality : oq, oq);
-                /* his advertised class IS his measurement of our signal:
-                 * the gate is on the received evidence (4.2, Oct 2026) */
-                if (quality_ok((uint8_t)nb->rev_quality)) {
+                /* the TWO-SIDED THRESHOLD (4.2, final form): his star
+                 * naming us is his direction's claim (his class for us
+                 * becomes the link quality rev_quality, no gate); our
+                 * reception of THIS star is the measured other
+                 * direction - the only gate. Weakly received claims
+                 * confirm nothing. */
+                if (quality_ok(quality_of(rssi))) {
                     if (!nb->sym) tbl_nbr_added(n, owner);
                     nb->sym = 1; nb->ack_try = 0;
                 }
@@ -2137,8 +2134,10 @@ static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
                             enb->proven_age_us = 0;
                             uint8_t oq = quality_from_class((uint8_t)(lb >> 4));
                             enb->rev_quality = quality_ewma(enb->rev_quality ? enb->rev_quality : oq, oq);
-                            /* gate on the received evidence (4.2, Oct 2026) */
-                            if (quality_ok((uint8_t)enb->rev_quality)) {
+                            /* two-sided threshold, final form (4.2, Oct 2026):
+                             * the claim is his direction, our reception of
+                             * the star is the other - the only gate */
+                            if (quality_ok(quality_of(rssi))) {
                                 if (!enb->sym) tbl_nbr_added(n, eid);
                                 enb->sym = 1; enb->ack_try = 0;
                             }
@@ -2700,27 +2699,21 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                  * agreement falls out of the shared threshold. */
                 if (rq > n->proof_ack_best_rq) n->proof_ack_best_rq = rq;
             }
-            /* Three-way closure (4.2, Oct 2026): the gate moves from OUR
-             * measurement to the RECEIVED evidence. The ack addressed to us
-             * proves both directions worked (our hello reached him, his
-             * ack reached us) and rq carries HIS measurement of OUR
-             * signal. The old gate on nb->quality let two working
-             * directions disagree (the 12/13 case). Our own measurement
-             * keeps its role in the ROUTE COST, never as the gatekeeper
-             * of what the neighbour just proved. */
-            /* the TWO-SIDED threshold (4.2, decided Oct 2026): both
-             * reception directions must clear the gate. His rq is his
-             * measurement of OUR signal (in the packet); our RSSI on
-             * THIS reception is our measurement of HIS signal. Both
-             * above the gate = both sides measured, both agree, the
-             * symmetry is mutual. Either side weak = no confirmation
-             * anywhere: his ack gate already filtered his weak hello
-             * receptions, and our silence on weak evidence is the
-             * second gate - both nodes end WITHOUT symmetry, in
-             * agreement (the 12/13 case no longer splits opinions:
-             * one weak direction blocks both sides equally). */
-            if (dst == n->id && nb->rev_quality && quality_ok((uint8_t)nb->rev_quality)
-                && quality_ok(quality_of(rssi))) {
+            /* the TWO-SIDED THRESHOLD (4.2, decided Oct 2026), final
+             * form: the reception quality of THIS packet is the only
+             * gate here. The responder's side of the threshold is
+             * already enforced by HIS ack gate (hello_ack_wait: he
+             * only acks a hello he received above the gate - a
+             * received ack therefore implies his measurement of us
+             * cleared it; no rq re-test needed). Our side: we only
+             * confirm what we received strongly. Either side weak =
+             * no confirmation anywhere - both nodes end WITHOUT
+             * symmetry, in agreement. The rq itself plays NO role in
+             * the gate: it IS the link quality measurement toward us
+             * (rev_quality, refreshed above) and prices the edge in
+             * the route cost. The stored nb->quality never gates
+             * what the packet proved either - same role: route cost. */
+            if (dst == n->id && quality_ok(quality_of(rssi))) {
                 if (!nb->sym) tbl_nbr_added(n, from);  /* delta + table round (4.3) */
                 nb->sym = 1; nb->ack_try = 0;          /* confirmed symmetric (4.2, 10.1) */
             }
@@ -2813,8 +2806,12 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                     if (len >= 8 && pkt[7]) {            /* what the acker measured on OUR data (6.2) */
                         nb->rev_quality = quality_ewma(nb->rev_quality ? nb->rev_quality : pkt[7], pkt[7]);
                     }
-                    /* gate on the received evidence (4.2, Oct 2026) */
-                    if (nb->rev_quality && quality_ok((uint8_t)nb->rev_quality)) {
+                    /* two-sided threshold, final form (4.2, Oct 2026): the
+                     * ack1 arriving here IS the reverse direction worked;
+                     * our reception quality of it is the measured gate.
+                     * The rq byte (pkt[7]) is the link quality toward us,
+                     * never a gate. */
+                    if (quality_ok(quality_of(rssi))) {
                         if (!nb->sym) tbl_nbr_added(n, rd16(pkt + 5));
                         nb->sym = 1; nb->ack_try = 0;
                     }
