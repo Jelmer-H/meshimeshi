@@ -824,6 +824,32 @@ static void lnk_set_class(mimeshi_node *n, uint16_t from, uint16_t to, uint8_t c
     mimeshi_link *l = lnk_add(n, from, to);
     if (!l) return;
     uint16_t a = from < to ? from : to;
+    uint8_t cur = (from == a) ? (uint8_t)(l->q >> 4) : (uint8_t)(l->q & 0x0F);
+    if (cls == 0) {
+        /* A zero in an advertisement is NOT a measurement - it is an
+         * absent one (the owner has not measured/published that
+         * direction yet, 4.3). Writing it would WIPE a class we
+         * already learned through our own exchange (the hard-learned
+         * lesson of the persistent zero-directions: every star round
+         * re-published the not-yet-measured direction as 0 and reset
+         * whatever the receiver knew). A zero never overwrites; the
+         * direction simply keeps its current state. */
+        return;
+    }
+    if (cls == 1 && cur == 0) {
+        /* The INITIAL CLASS (decided Oct 2026): a class-1 advertisement
+         * on a direction we have at 0 is often the owner's FIRST
+         * published measurement of a link we know works (the proof
+         * threshold guarantees it: no hello-ack or proof-ack exists
+         * on a link whose direction failed the gate). Writing class 1
+         * makes the direction IMMEDIATELY routable (ETX 228 - the
+         * most expensive, honest for an unmeasured link) instead of
+         * dead until our own measurement arrives. Real measurements
+         * (2..7) always overwrite as before. */
+        if (from == a) l->q = (uint8_t)((l->q & 0x0F) | (1 << 4));
+        else           l->q = (uint8_t)((l->q & 0xF0) | 1);
+        return;
+    }
     if (from == a) l->q = (uint8_t)((l->q & 0x0F) | (cls << 4));
     else           l->q = (uint8_t)((l->q & 0xF0) | cls);
 }
