@@ -1983,26 +1983,51 @@ static uint16_t route_bridge_node(mimeshi_node *n, uint16_t lat, uint16_t lon,
      * the squared distance) - resolving true ties by quality, never
      * trading distance for cost. The local nodes near the destination
      * know better than our forward-thinking here. */
+    /* REACHABILITY-FIRST (decided Oct 2026, the two hoptrace findings):
+     * an unreachable candidate must NEVER win the bridge choice. The old
+     * distance-first rule picked the closest pool entry, and when the
+     * Dijkstra then found no route toward it the WHOLE geo-route failed
+     * (route_next_hop_geo_prev: if (!bridge) return 0) - while a slightly
+     * farther but REACHABLE candidate stood ready. Measured (the two
+     * trace-ones): spoor 1 - the source held the mast at dist2 6025 and
+     * chose a LOCAL hop at 149364 because the geo-route failed; spoor 2 -
+     * every near hop held dst itself at dist2 0 unreachable in the
+     * confirmed graph, and the plans fell back to local wandering.
+     *
+     * The rule now: sort by distance as before, but a candidate only
+     * sticks when a route toward it EXISTS (route_cost_to < INF). The
+     * nearest unreachable candidate is skipped, not chosen; the first
+     * reachable one on the distance ladder wins. The tiebreak (~5% on
+     * the squared distance) stays for equal distances. This is one
+     * Dijkstra per candidate - bounded by the pool, the same cost the
+     * old tiebreak already paid. */
     uint16_t pick = 0;
     uint32_t pick_d = 0, pick_cost = MC_DIST_INF;
     for (int i = 0; i < MC_MAP_NODES; i++) {
         if (!n->map[i].alive || !n->map[i].geo_lat) continue;   /* no geo: no candidate (5) */
         if (n->map[i].id == n->id) continue;     /* never the own entry (10.2) */
         uint32_t d = geo_dist2(n->map[i].geo_lat, n->map[i].geo_lon, lat, lon);
-        if (!pick) { pick = n->map[i].id; pick_d = d; continue; }
-        if (d >= pick_d) continue;               /* farther: not a candidate */
+        if (!pick) {
+            /* the first candidate only sticks when reachable */
+            uint32_t c = route_cost_to(n, n->map[i].id, excl, excl_cnt);
+            if (c >= MC_DIST_INF) continue;     /* unreachable: skip, not choose */
+            pick = n->map[i].id; pick_d = d; pick_cost = c;
+            continue;
+        }
+        if (d >= pick_d) continue;               /* farther than the pick: not a candidate */
+        uint32_t c = route_cost_to(n, n->map[i].id, excl, excl_cnt);
+        if (c >= MC_DIST_INF) continue;          /* unreachable: never wins */
         if (pick_d > d + d / 20u) {
-            /* significantly closer: wins outright */
-            pick = n->map[i].id; pick_d = d; pick_cost = MC_DIST_INF;
+            /* significantly closer AND reachable: wins outright */
+            pick = n->map[i].id; pick_d = d; pick_cost = c;
         } else {
             /* within ~5%: a tie - the route cost decides */
             if (pick_cost == MC_DIST_INF)
                 pick_cost = route_cost_to(n, pick, excl, excl_cnt);
-            uint32_t c = route_cost_to(n, n->map[i].id, excl, excl_cnt);
             if (c < pick_cost) { pick = n->map[i].id; pick_d = d; pick_cost = c; }
         }
     }
-    return pick;                                /* 0 when no candidate at all */
+    return pick;                                /* 0 when no reachable candidate at all */
 }
 
 
