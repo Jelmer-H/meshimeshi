@@ -21,6 +21,7 @@ import random
 
 import simpy
 
+import sim1
 from sim1 import (radio_log, Node, CCore, load_lib, Wire, sym_count, nbr_counts,
                   load_nodes_csv, project, linkbudget, RX_MIN_DBM, DutyLedger, N_CH,
                   StarStats)
@@ -1118,6 +1119,65 @@ def star_scale(mk, jitter):
     # The warm state is expensive; the experiments are cheap. Fork: the
     # child runs the single-message experiment and exits; the parent
     # could fork again from the SAME warm state (same process, rerun).
+    # --- warm-state checkpoint / resume (no repeated warmups) --------
+    # The warmup is the expensive part (hours of sim time); the state it
+    # produces lives entirely in the node structs (map, links, neighbor
+    # table, dedup - all C memory) plus the wire. A checkpoint captures
+    # exactly that; a resume rebuilds the world in seconds. The protocol
+    # timers restart fresh (proof ticks, star rounds rebuild within one
+    # cycle) - the KNOWLEDGE is the warmup product and it survives.
+    import pickle as _pickle
+    _checkpoint = getattr(_ARGS, 'checkpoint', None)
+    _resume = getattr(_ARGS, 'resume', None)
+    if _resume:
+        with open(_resume, 'rb') as f:
+            snap = _pickle.load(f)
+        # KNOWLEDGE-BLOCK RESTORE: the full-struct memmove also drags the
+        # callback pointers (tx/timer/switch/rand/cad/user) into the node -
+        # and restoring them from Python proved fragile (the trampolines
+        # segfaulted on the first start). Instead: keep the live, freshly
+        # initialized core untouched and place ONLY the warmup product -
+        # the map, the link store, the neighbor table, the dedup cache,
+        # the eviction taboo, the missed list and the time base - at their
+        # struct offsets. The callbacks stay exactly as mimeshi_init built
+        # them; the pending records stay fresh (their half-flown timers
+        # were never part of the warmup product anyway).
+        for kn in nodes:
+            blob = snap['nodes'].get(kn.id)
+            if blob is None: continue
+            mn = kn.core.mn
+            base = ctypes.addressof(mn)
+            for off, size in snap['blocks']:
+                ctypes.memmove(base + off, blob[off:off+size], size)
+        radio.wire.links = snap['wire_links']
+        out(f"resumed from checkpoint {_resume} (checkpoint t={snap['now']/3.6e9:.2f} h, "
+            f"{len(snap['nodes'])} nodes) - warmup skipped, the clock restarts at 0")
+        # restart the protocol timers (they were not part of the snapshot):
+        for kn in nodes:
+            kn.core.start()
+        warmup_us = 0   # the traffic/trace phase starts NOW
+    elif _checkpoint:
+        radio.run(until_us=warmup_us)
+        blocks = [
+            (sim1.CNode.nbr.offset, ctypes.sizeof(sim1.CNeighbor) * sim1.MC_MAX_NEIGHBORS),
+            (sim1.CNode.dedup.offset, ctypes.sizeof(sim1.CDedup) * sim1.MC_MAX_DEDUP),
+            (sim1.CNode.ev_taboo.offset, 2 * 256),
+            (sim1.CNode.star_miss.offset, ctypes.sizeof(sim1.CStarMiss) * 12),
+            (sim1.CNode.map.offset, ctypes.sizeof(sim1.CMapNode) * sim1.MC_MAP_NODES),
+            (sim1.CNode.lnk.offset, ctypes.sizeof(sim1.CLink) * sim1.MC_MAX_LINKS),
+            (sim1.CNode.geo_lat.offset, 4),
+            (sim1.CNode.tick.offset, 4),
+        ]
+        snap = {'nodes': {kn.id: bytes(kn.core.mn) for kn in nodes},
+                'blocks': blocks,
+                'wire_links': radio.wire.links,
+                'now': radio.now}
+        with open(_checkpoint, 'wb') as f:
+            _pickle.dump(snap, f)
+        out(f"checkpoint saved: {_checkpoint} (t={radio.now/3.6e9:.2f} h) - "
+            f"traffic phase skipped; resume with --resume {_checkpoint}")
+        return
+
     trace_ones = getattr(_ARGS, 'trace_one', None) or []
     if trace_ones:
         import os
@@ -1793,6 +1853,15 @@ def main():
                     help='message tracing: every node logs its DATA sends/receives '
                          'and ack1/ack2 with a [msg] prefix (forensics runs; pair '
                          'with a low --interval to keep the log readable)')
+    ap.add_argument('--checkpoint', metavar='FILE',
+                    help='star-scale: after the warmup, save the warm world state '
+                         '(all node structs + wire) to FILE and exit. The traffic '
+                         'phase is skipped - this run only produces the warm state.')
+    ap.add_argument('--resume', metavar='FILE',
+                    help='star-scale: load a checkpoint (no warmup - seconds instead '
+                         'of the full warmup run), rebuild the world from the saved '
+                         'node structs, restart the protocol timers and run the '
+                         'traffic/trace-one phase from there.')
     ap.add_argument('--trace-one', metavar='SRC,DST', action='append',
                     help='DEEP FORENSICS (star-scale): after the (single) warmup, '
                          'fork and trace ONE message src->dst with full hop-decision '
