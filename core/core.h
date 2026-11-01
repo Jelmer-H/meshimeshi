@@ -298,6 +298,9 @@ struct mimeshi_node {
                                          drives the derivable digest */
     mimeshi_mapnode map[MC_MAP_NODES];  /* 2-hop map (10.1) */
     mimeshi_link   lnk[MC_MAX_LINKS];  /* links between map nodes (4.3) */
+    void    *hoptrace;                /* hop-decision trace FILE* (deep
+                                         forensics): NULL = off; see
+                                         mimeshi_set_hoptrace */
     uint8_t  trace;                   /* message tracing (measured runs):
                                          1 = log every send/receive/ack of
                                          DATA messages on this node. Set via
@@ -321,6 +324,12 @@ void mimeshi_init(mimeshi_node *n, uint16_t id, mimeshi_tx_fn tx, mimeshi_timer_
  * send/receive and every ack1/ack2 of its messages. Cheap when off (one
  * byte test per event). */
 void mimeshi_set_trace(mimeshi_node *n, uint8_t on);
+
+/* Hop-decision tracing (deep forensics): a FILE* per node. When set,
+ * every next-hop decision of this node logs its complete dossier: the
+ * full graph (map, neighbors, links) at the moment of the decision,
+ * the exclusion list, the candidate plan and the chosen hop. JSONL. */
+void mimeshi_set_hoptrace(mimeshi_node *n, void *file);
 
 /* First hello round immediately, then startup rounds with random phase
  * (jitter). After the startup phase the hello no longer exists:

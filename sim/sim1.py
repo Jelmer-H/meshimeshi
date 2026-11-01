@@ -494,6 +494,7 @@ CNode._fields_ = [
     ("star_tick", ctypes.c_uint8),            # own-star heartbeat tick (4.3)
     ("map", CMapNode * MC_MAP_NODES),   # 2-hop map (10.1)
     ("lnk", CLink * MC_MAX_LINKS),      # link store (4.3)
+    ("hoptrace", ctypes.c_void_p),             # hop-decision trace FILE* (deep forensics)
     ("trace", ctypes.c_uint8),                 # message tracing (forensics runs)
     ("tx", TX_FN), ("timer", TIMER_FN), ("switch_ch", SWITCH_FN), ("rand", RAND_FN),
     ("channel_free", CAD_FN), ("user", ctypes.c_void_p),
@@ -536,6 +537,7 @@ def load_lib(path):
     lib.mimeshi_init.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint16, TX_FN,
                                  TIMER_FN, SWITCH_FN, RAND_FN, CAD_FN, ctypes.c_void_p]
     lib.mimeshi_set_trace.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint8]
+    lib.mimeshi_set_hoptrace.argtypes = [ctypes.POINTER(CNode), ctypes.c_void_p]
     lib.mimeshi_start.argtypes = [ctypes.POINTER(CNode)]
     lib.mimeshi_rx.argtypes = [ctypes.POINTER(CNode), ctypes.c_uint8, ctypes.c_int8,
                                ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint16]
@@ -566,6 +568,12 @@ class CCore:
             lib.mimeshi_set_trace(ctypes.byref(self.mn), 1)
     def start(self):
         self.lib.mimeshi_start(ctypes.byref(self.mn))
+    def set_hoptrace(self, f):
+        """Deep forensics: every next-hop decision of this node logs its
+        complete dossier (full graph at decision time, plan, chosen hop)
+        to the C FILE* wrapper f - see sim.fopen helper. NULL = off."""
+        self.lib.mimeshi_set_hoptrace(ctypes.byref(self.mn), f)
+
     STAR_PROBE = None   # (rx_id, tx_id): if set, prints type-10 rx (debug hook)
     def rx(self, arg):
         ch, rssi, pkt = arg

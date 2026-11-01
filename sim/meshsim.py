@@ -1114,6 +1114,44 @@ def star_scale(mk, jitter):
                     refused[0] += 1
         if radio.now + interval_us <= duration_us:
             radio.schedule(interval_us, gen)
+    # --- deep forensics: --trace-one SRC,DST -------------------------
+    # The warm state is expensive; the experiments are cheap. Fork: the
+    # child runs the single-message experiment and exits; the parent
+    # could fork again from the SAME warm state (same process, rerun).
+    trace_one = getattr(_ARGS, 'trace_one', None)
+    if trace_one:
+        import os
+        tsrc_s, tdst_s = trace_one.split(',')
+        tsrc = int(tsrc_s, 16) if tsrc_s.startswith('0x') else int(tsrc_s)
+        tdst = int(tdst_s, 16) if tdst_s.startswith('0x') else int(tdst_s)
+        radio.run(until_us=warmup_us)          # the full warmup, once
+        pid = os.fork()
+        if pid == 0:
+            # child: the single-message experiment
+            libc = ctypes.CDLL(None)
+            libc.fopen.restype = ctypes.c_void_p
+            libc.fopen.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+            libc.fflush.argtypes = [ctypes.c_void_p]
+            libc.fclose.argtypes = [ctypes.c_void_p]   # without this the 64-bit
+                                                       # FILE* truncates to c_int
+                                                       # and the flush never lands
+            cfile = libc.fopen(b'hoptmp.trace', b'w')
+            # ALL nodes get the hoptrace: the message's path is unknown
+            # beforehand - every potential deciding node must log.
+            for kn in nodes:
+                kn.core.set_hoptrace(cfile)
+            src_node = next(kn for kn in nodes if kn.id == tsrc)
+            rc = src_node.core.send_data(tdst, b'trace-one', ack3=False,
+                                         geo=node_geo[tdst])
+            out(f"trace-one: send rc={rc} ({tsrc:#x} -> {tdst:#x})")
+            radio.run(until_us=duration_us)   # let the message resolve
+            libc.fflush(cfile)                # os._exit skips the C atexit flush
+            libc.fclose(cfile)
+            os._exit(0)
+        else:
+            os.waitpid(pid, 0)
+            out("trace-one: child done - dossiers in hoptmp.trace")
+            return
     if interval_us:
         radio.schedule(warmup_us, gen)
 
@@ -1753,6 +1791,11 @@ def main():
                     help='message tracing: every node logs its DATA sends/receives '
                          'and ack1/ack2 with a [msg] prefix (forensics runs; pair '
                          'with a low --interval to keep the log readable)')
+    ap.add_argument('--trace-one', metavar='SRC,DST',
+                    help='DEEP FORENSICS (star-scale): fork after the warmup and '
+                         'trace ONE message src->dst with full hop-decision dossiers '
+                         '(the complete graph of every deciding node at the moment '
+                         'of its decision). Repeats the warmup per invocation.')
     ap.add_argument('--join-at', type=int, default=5400, metavar='SECONDS',
                     help='newcomer start time in seconds (newcomer-traffic, default 5400)')
     args = ap.parse_args()

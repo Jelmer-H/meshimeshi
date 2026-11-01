@@ -2458,6 +2458,60 @@ static void pending_try(mimeshi_node *n, mimeshi_pending *p) {
  * demand that confirmation before forwarding; until then this direct
  * sending is bounded by retries+budget and fails visibly on the ack1
  * timeout. */
+/* Hop-decision dossier (deep forensics): the COMPLETE graph of the
+ * deciding node at the moment of the decision - map, neighbor table,
+ * link store - plus the candidate plan and the chosen first hop.
+ * One JSON object per decision, JSONL. Called at the decision sites
+ * (send + forward) when n->hoptrace is set (mimeshi_set_hoptrace).
+ * The graph dump is the exact state the Dijkstra and the bridge rule
+ * saw - no reconstruction from end-state dumps, no offset drift. */
+static void hoptrace_dossier(mimeshi_node *n, uint16_t dst, uint16_t prev,
+                             uint16_t gl, uint16_t go, uint8_t budget,
+                             const uint16_t *excl, uint8_t excl_cnt,
+                             const uint16_t *cand, uint8_t cand_cnt,
+                             uint16_t chosen) {
+    FILE *f = (FILE *)n->hoptrace;
+    if (!f) return;
+    fprintf(f, "{\"node\":%u,\"dst\":%u,\"prev\":%u,\"budget\":%u,"
+               "\"dst_geo\":[%u,%u],\"in_graph\":%d,\"excl\":[",
+            n->id, dst, prev, budget, gl, go,
+            (r_idx(n, dst) >= 0 || nbr_find(n, dst) != 0) ? 1 : 0);
+    for (uint8_t e = 0; e < excl_cnt; e++)
+        fprintf(f, "%s%u", e ? "," : "", excl[e]);
+    fprintf(f, "],\"plan\":[");
+    for (uint8_t k = 0; k < cand_cnt; k++)
+        fprintf(f, "%s%u", k ? "," : "", cand[k]);
+    fprintf(f, "],\"chosen\":%u,\"nbrs\":[", chosen);
+    int first = 1;
+    for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
+        mimeshi_neighbor *nb = &n->nbr[i];
+        if (!nb->alive) continue;
+        fprintf(f, "%s{\"id\":%u,\"sym\":%u,\"q\":%u,\"pen\":%u}",
+                first ? "" : ",", nb->id, nb->sym, nb->quality, nb->penalty);
+        first = 0;
+    }
+    fprintf(f, "],\"map\":[");
+    first = 1;
+    for (int i = 0; i < MC_MAP_NODES; i++) {
+        mimeshi_mapnode *m = &n->map[i];
+        if (!m->alive) continue;
+        fprintf(f, "%s{\"id\":%u,\"geo\":[%u,%u],\"aq\":%u,\"age\":%u,\"st\":%u}",
+                first ? "" : ",", m->id, m->geo_lat, m->geo_lon,
+                m->adv_q, m->age_ticks, m->star_tick);
+        first = 0;
+    }
+    fprintf(f, "],\"links\":[");
+    first = 1;
+    for (int i = 0; i < MC_MAX_LINKS; i++) {
+        mimeshi_link *l = &n->lnk[i];
+        if (!l->alive) continue;
+        fprintf(f, "%s{\"a\":%u,\"b\":%u,\"q\":%u}",
+                first ? "" : ",", l->a, l->b, l->q);
+        first = 0;
+    }
+    fprintf(f, "]}\n");
+}
+
 int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uint16_t len, bool ack3,
                       uint16_t dest_lat, uint16_t dest_lon) {
     /* routing (10.2): the first hop follows from the own known graph -
@@ -2476,6 +2530,10 @@ int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uin
      * route itself is the first candidate - or the send is refused. */
     p->cand_cnt = schedule_candidates(n, dst, dest_lat, dest_lon, n->id, 0, 0, p->cand);
     p->in_graph = r_idx(n, dst) >= 0 || nbr_find(n, dst) != 0;   /* Dijkstra-proven plan? (7.4) */
+    if (n->hoptrace)
+        hoptrace_dossier(n, dst, n->id, dest_lat, dest_lon, p->budget_left,
+                         p->excl, 0, p->cand, p->cand_cnt,
+                         p->cand_cnt ? p->cand[0] : 0);
     if (p->cand_cnt == 0) return -1;           /* not in the graph: no flood (10.2) */
     uint16_t nh = p->cand[0];
     p->msg_id = (uint16_t)n->rand(n);
@@ -2794,6 +2852,10 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
              * leak its pending slot. */
             p->cand_cnt = schedule_candidates(n, dst, gl, go, prev, 0, 0, p->cand);
             p->in_graph = r_idx(n, dst) >= 0 || nbr_find(n, dst) != 0;   /* Dijkstra-proven plan? (7.4) */
+            if (n->hoptrace)
+                hoptrace_dossier(n, dst, prev, gl, go, (uint8_t)(budget - 1),
+                                 p->excl, 0, p->cand, p->cand_cnt,
+                                 p->cand_cnt ? p->cand[0] : 0);
             if (p->cand_cnt == 0) {
                 /* No routable path from here (7.2/10.5): NEGATIVE back,
                  * not silence - the previous hop retries via its own
@@ -2821,6 +2883,8 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
  * every DATA send/receive and each ack of a traced node logs with a
  * [msg] prefix. One byte test per event - free when off. */
 void mimeshi_set_trace(mimeshi_node *n, uint8_t on) { n->trace = on; }
+
+void mimeshi_set_hoptrace(mimeshi_node *n, void *file) { n->hoptrace = file; }
 
 /* ---------------- init/start ---------------- */
 
