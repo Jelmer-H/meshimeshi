@@ -1206,9 +1206,43 @@ def star_scale(mk, jitter):
                 rc = src_node.core.send_data(tdst, b'trace-one', ack3=False,
                                              geo=node_geo[tdst])
                 out(f"trace-one: send rc={rc} ({tsrc:#x} -> {tdst:#x})")
+                # count the decision dossiers BEFORE the run (they grow per decision)
+                libc.fflush(cfile)                # the dossiers so far (the send decision)
+                pre = os.path.getsize(tracefile)
                 radio.run(until_us=duration_us)   # let the message resolve
                 libc.fflush(cfile)                # os._exit skips the C atexit flush
                 libc.fclose(cfile)
+                # THE EXPERIMENT REPORT: was it delivered, at what cost?
+                # The pending record of the source tells the tale: active=0
+                # after a resolved delivery (DELIVERED + ack-close), and the
+                # destination's dedup saw the message. Read both.
+                delivered = False
+                dst_node = next((kn for kn in nodes if kn.id == tdst), None)
+                if dst_node is not None:
+                    for dd in dst_node.core.mn.dedup:
+                        if dd.msg_id and dd.src == tsrc:
+                            delivered = True
+                            break
+                # the source's pending state: budget left + still active (unresolved)
+                pend_state = None
+                for p in src_node.core.mn.pend:
+                    if p.active and p.dst == tdst:
+                        pend_state = p
+                        break
+                n_dossiers = 0
+                with open(tracefile) as f:
+                    n_dossiers = sum(1 for line in f if line.startswith('{"node"'))
+                out(f"\n=== trace-one experiment {exp_i} ({tsrc:#x} -> {tdst:#x}) ===")
+                if rc != 0:
+                    out(f"  REFUSED at the source (rc={rc}: no routable first hop)")
+                else:
+                    out(f"  delivered: {'YES' if delivered else 'NO'}")
+                    if pend_state is not None:
+                        out(f"  source pending still ACTIVE: budget left "
+                             f"{pend_state.budget_left}, the message never resolved")
+                    else:
+                        out(f"  source pending closed: the exchange chain ended")
+                    out(f"  decision dossiers: {n_dossiers}")
                 os._exit(0)
             else:
                 os.waitpid(pid, 0)
