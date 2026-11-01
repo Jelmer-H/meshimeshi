@@ -1799,7 +1799,24 @@ static uint32_t mult_apply(uint32_t c, uint16_t m) {
  * addition of the map entry when we have one. Penalty (10.4) follows
  * in a later building step. */
 static uint32_t route_edge_own(mimeshi_node *n, mimeshi_neighbor *nb) {
-    uint8_t cls = adv_class_of(nb->quality);
+    /* the AUTHORITATIVE class (decided Oct 2026): the star of the link
+     * owner is the shared truth - the stored link class prices the edge,
+     * the same information every neighbour holds. The private measurement
+     * is only the fallback for a link the stars have not covered yet.
+     * The store keeps the canonical order (lnk_add: a < b) with the
+     * class in OUR direction: hi nibble = a->b when we are a, lo = b->a
+     * when we are b. */
+    uint8_t cls = 0;
+    uint16_t us = n->id, them = nb->id;
+    for (int j = 0; j < MC_MAX_LINKS && !cls; j++) {
+        mimeshi_link *l = &n->lnk[j];
+        if (!l->alive) continue;
+        if ((l->a == us && l->b == them) || (l->a == them && l->b == us)) {
+            uint16_t mn = us < them ? us : them;   /* canonical a (lnk_add) */
+            cls = (us == mn) ? (uint8_t)(l->q >> 4) : (uint8_t)(l->q & 0x0F);
+        }
+    }
+    if (!cls) cls = adv_class_of(nb->quality);   /* fallback: private measurement */
     uint32_t c = (cls < 8 && mc_etx_class[cls]) ? mc_etx_class[cls] : MC_ROUTE_SCALE;
     mimeshi_mapnode *m = map_find(n, nb->id);
     if (m) {
@@ -1864,7 +1881,22 @@ static uint16_t route_next_hop_ex_prev(mimeshi_node *n, uint16_t dst,
     for (int i = 0; i < MC_MAP_NODES; i++) { r_dist[i] = MC_DIST_INF; r_prev[i] = 0xFFFF; r_done[i] = 0; }
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {           /* own edges (virtual start) */
         mimeshi_neighbor *nb = &n->nbr[i];
-        if (!nb->alive || !nb->sym || !quality_ok(nb->quality)) continue;
+        /* ONE TRUTH (decided Oct 2026, the doorgeef-cirkel finding):
+         * the virtual start admits CONFIRMED (sym) neighbours and
+         * prices the own edge with the AUTHORITATIVE link class from
+         * the star - the same information every neighbour holds in
+         * its link store - instead of our private last-heard quality.
+         * Private measurements made neighbours disagree: each
+         * door-holder measured the destination just under the gate
+         * (q 10-12), saw its star-published class-1 link, concluded
+         * 'I cannot, but my neighbour can' - and they handed the
+         * message to each other until the budget ran out. With the
+         * star class, everyone prices the edge identically and
+         * computes the same path. The quality gate itself falls:
+         * sym (the two-sided threshold proof) is the admission, the
+         * star class is the price - marginal links stay expensive
+         * (class 1 = ETX 228), never invisible. */
+        if (!nb->alive || !nb->sym) continue;
         int ex = 0;
         for (uint8_t e = 0; e < excl_cnt; e++) if (excl[e] == nb->id) { ex = 1; break; }
         if (ex) continue;                          /* failed for this message (7.4) */
@@ -2941,11 +2973,27 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
     }
     case PKT_DATA: {
         uint16_t msg_id = rd16(pkt + 1), src = rd16(pkt + 3), dst = rd16(pkt + 5), prev = rd16(pkt + 7);
+        /* THE DESTINATION SHORTCUT (decided Oct 2026): a data packet
+         * routed toward another neighbour but received HERE, where WE
+         * are the final destination, is DELIVERED on the spot. The
+         * sender aimed at a relay; the physical reach brought it to
+         * the right address anyway (same channel, audible) - refusing
+         * it would be pure formality while the message sits one hop
+         * from its goal. The delivery path below handles the dedup
+         * (a second copy is ignored) and the ack1 goes to the actual
+         * sender, exactly as a directly addressed delivery would.
+         * This closes the doorgeef-cirkel: the last stretch becomes
+         * 'any transmission the destination happens to hear'. */
+        if (dst == n->id && rd16(pkt + 10) != n->id) {
+            /* fall through into the delivery processing below: the
+             * dedup check there gates double deliveries, the ack1
+             * closes the sender's pending. */
+        }
         /* next-hop addressing (6.1): only the hop the sender chose
          * processes the packet; other hearers on the home channel
          * snoop (liveness, quality) - a routed unicast must not
          * multiply. */
-        if (rd16(pkt + 10) != n->id) return;
+        else if (rd16(pkt + 10) != n->id) return;
         /* dedup gates the processing (no second delivery, no second
          * forward), but a retry STILL gets its ack1 (7.4, decided Oct
          * 2026): the most likely reason for the retry is a lost ack1,
