@@ -72,6 +72,13 @@ typedef struct {
                               series toward this neighbour, -1 per ack1,
                               floor 0; raises the own-edge route cost.
                               Never transmitted. */
+    uint8_t  acked_round;  /* three-way closure (4.2, decided Oct 2026): we
+                              hello-ACKED this neighbour's CURRENT round - a
+                              PROOF_ACK from it closes our side of the
+                              symmetry agreement (sym = 1 on received
+                              evidence, our own quality measurement no
+                              longer gates what the packet proves). One bit
+                              of bookkeeping, never transmitted. */
 } mimeshi_neighbor;
 
 typedef struct {
@@ -261,6 +268,16 @@ struct mimeshi_node {
     uint16_t dedup_seq;               /* FIFO insertion counter of the dedup cache (14) */
     uint8_t  tbl_dirty;               /* own-star content change pending (4.3) */
     uint8_t  star_round_sched;        /* star-round timer running (4.3) */
+    uint8_t  proof_ack_pend;          /* three-way closure (4.2): this hello
+                                         round collected hello-acks - the
+                                         collective PROOF_ACK fires at the
+                                         end of the ack window */
+    uint8_t  proof_ack_best_rq;       /* the strongest received rq of the current
+                                         round (4.2, the two-sided threshold):
+                                         the PROOF_ACK fires only when this
+                                         clears the gate - both reception
+                                         directions measured, both above the
+                                         threshold, or both sides silent */
     uint16_t ev_taboo[256];          /* eviction taboo (4.3): the set of judged-
                                         and-rejected star IDs (admission losses
                                         and evictions) - a catalogue mismatch

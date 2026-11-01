@@ -137,7 +137,7 @@ int main(void) {
      * symmetric links. A hello proves one direction; the hello-ack
      * addressed to us proves the other (4.2). Give B that proof
      * before the unicast tests. */
-    uint8_t hackA[6] = { 2, 0x00,0x01, 0x02,0x01, 0 };  /* hello-ack from A (0x0102) to B (0x0100) */
+    uint8_t hackA[6] = { 2, 0x00,0x01, 0x02,0x01, 34 };  /* hello-ack from A (0x0102) to B (0x0100) */
     mimeshi_rx(&B, 1, -60, hackA, 6);
     {
         int sym = 0;
@@ -240,7 +240,7 @@ int main(void) {
             if (A.nbr[i].alive && A.nbr[i].id == 0x0108) seen = A.nbr[i].sym;
         assert(seen == 0);
     }
-    uint8_t hack_weak[6] = { 2, 0x02,0x01, 0x06,0x01, 0 };    /* from 0x0106, addressed to A (us) */
+    uint8_t hack_weak[6] = { 2, 0x02,0x01, 0x06,0x01, 34 };    /* from 0x0106, addressed to A (us) */
     mimeshi_rx(&A, 0, -105, hack_weak, 6);
     {
         int seen = -1;

@@ -415,7 +415,8 @@ class CNeighbor(ctypes.Structure):
                 ("ack_try", ctypes.c_uint8), ("last_seen", ctypes.c_uint32),
                 ("proven_age_us", ctypes.c_uint64), ("alive", ctypes.c_uint8),
                 ("sym", ctypes.c_uint8), ("adv_class", ctypes.c_uint8),
-                ("penalty", ctypes.c_uint8)]
+                ("penalty", ctypes.c_uint8),
+                ("acked_round", ctypes.c_uint8)]   # three-way closure (4.2): we acked this neighbour's round
 
 class CPending(ctypes.Structure):
     _fields_ = [("active", ctypes.c_uint8), ("tries_left", ctypes.c_uint8),
@@ -485,6 +486,8 @@ CNode._fields_ = [
     ("dedup_seq", ctypes.c_uint16),
     ("tbl_dirty", ctypes.c_uint8),             # own-star content change pending (4.3)
     ("star_round_sched", ctypes.c_uint8),     # star-round timer running (4.3)
+    ("proof_ack_pend", ctypes.c_uint8),       # three-way closure (4.2): acked round pending
+    ("proof_ack_best_rq", ctypes.c_uint8),     # the round's strongest received rq (two-sided gate)
     ("star_backlog", ctypes.c_uint8),         # content work remained (6e acceleration)
     ("star_rot_ctr", ctypes.c_uint8),         # rotation counter (4.3)
     ("ev_taboo", ctypes.c_uint16 * 256),      # eviction taboo (4.3): judged-and-rejected set

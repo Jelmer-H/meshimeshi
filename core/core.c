@@ -112,6 +112,14 @@ static uint64_t t_data_us(uint16_t l) { return l <= 40 ? 173000ull : l <= 150 ? 
  *   PROOF       3+2n B type, node-id(2), n x neighbour-id(2), n <= 17 (4.2).
  *                     Reactionless keepalive + symmetry flush; an empty list
  *                     is the minimal keepalive beacon (type + node-id).
+ *   PROOF_ACK   3 B   type, node-id(2) = the hello sender (4.2, Oct 2026).
+ *                     The collectieve derde stap van de three-way: once per
+ *                     hello round, scheduled at the ack window's end, the
+ *                     sender confirms ALL received hello-acks at once. A
+ *                     responder that acked that round and hears this packet
+ *                     closes its side of the symmetry agreement (sym = 1 on
+ *                     this received evidence - the neighbour's own quality
+ *                     measurement no longer blocks what the packet proves).
  *   DATA      12+n B  type+F_ACK3_REQ+F_DEST_GEO, msg-id(2), source(2),
  *                     destination(2), previous-hop(2), budget(1, offset 9),
  *                     next-hop(2, offset 10), [dest geo 4 B when F_DEST_GEO,
@@ -126,7 +134,15 @@ static uint64_t t_data_us(uint16_t l) { return l <= 40 ? 173000ull : l <= 150 ? 
 enum {
     PKT_HELLO = 1, PKT_HELLO_ACK, PKT_PROOF, PKT_TABLE_CHUNK,
     PKT_DATA, PKT_ACK1, PKT_ACK2, PKT_ACK3, PKT_FAIL_RPT
+    /* The three-way closure (4.2, decided Oct 2026): the hello sender's
+     * COLLECTIVE confirmation, one packet per hello round after the ack
+     * window - every responder of that round learns 'my ack arrived,
+     * my direction works, the sender's symmetry conclusion is drawn'
+     * in one airtime. Wire value 11: appended after PKT_STAR_ROUND (10,
+     * a #define outside this enum) - the wire values of the existing
+     * types are sacred (chunks are 4, data is 5, ack1 is 6, star round 10). */
 };
+#define PKT_PROOF_ACK 11
 #define F_ACK3_REQ 0x10   /* requested by the source of the message (11) */
 #define F_DEST_GEO 0x20   /* destination geo present: 4 B after the fixed
                              header (6.1, 10.2) - every hop can recompute
@@ -322,6 +338,8 @@ static void bound_send(mimeshi_node *n, uint8_t ch, const uint8_t *pkt, uint16_t
  * the fixed order gives responders a predictable moment when the sender
  * is listening on its own channel again — their hello-acks go there.
  * Startup only (4.1). Cost: 3 x 3 B with adaptive interval. */
+static void proof_ack_fire(mimeshi_node *n, void *ud);
+
 static void hello_round(mimeshi_node *n) {
     uint8_t p[3] = { PKT_HELLO, 0, 0 };
     wr16(p + 1, n->id);
@@ -330,6 +348,50 @@ static void hello_round(mimeshi_node *n) {
         ka_called(n, c);                                   /* own call on c (4.1) */
     }
     /* after the round the node is home; hello-acks arrive there (within the window) */
+
+    /* The three-way closure (4.2, decided Oct 2026): one COLLECTIVE
+     * PROOF_ACK per hello round, at the end of the ack window - but
+     * ONLY when the round actually collected hello-acks (a silent
+     * round has no agreement to close and no airtime to spend). Every
+     * responder of THIS round hears one small packet instead of N
+     * individual confirmations: 'my ack arrived, my direction works,
+     * the sender drew its symmetry conclusion'. The responder-side
+     * bookkeeping (acked_round on the neighbor) makes the packet
+     * exact: only nodes that actually acked this round treat it as
+     * their closure - a non-responder has no open agreement and
+     * ignores it. Airtime: 3 B per ACKED round, versus 3 B per
+     * responder. */
+    if (n->proof_ack_pend) {
+        n->proof_ack_pend = 0;
+        /* the two-sided threshold (4.2, decided Oct 2026): the
+         * PROOF_ACK only closes the agreement when the received
+         * evidence is STRONG - the best rq of the round clears the
+         * gate. A weak round stays silent: the responder's own ack
+         * gate already blocked its weak hello reception, and our
+         * silence is the second gate - both sides end WITHOUT
+         * symmetry, in agreement. Our own quality measurement of the
+         * neighbour plays NO role in the confirmation: it prices the
+         * edge in the route cost (route_edge_own), it does not veto
+         * what the neighbour's packet proved. */
+        if (quality_ok(n->proof_ack_best_rq)) {
+            n->proof_ack_best_rq = 0;
+            n->timer(n, MC_HELLO_ACK_WIN_US + MC_HELLO_ACK_JITTER_US + t_ack_us(),
+                     proof_ack_fire, 0);
+        } else {
+            n->proof_ack_best_rq = 0;    /* reset: the next round starts fresh */
+        }
+    }
+}
+
+static void proof_ack_fire(mimeshi_node *n, void *ud) {
+    (void)ud;
+    uint8_t p[3] = { PKT_PROOF_ACK, 0, 0 };
+    wr16(p + 1, n->id);
+    for (uint8_t c = 0; c < MC_N_CHANNELS; c++) {          /* the responders
+        sit on their home channels - the closure reaches them there */
+        bound_send(n, c, p, 3, t_hello_us());             /* 3 B: hello airtime */
+        ka_called(n, c);
+    }
 }
 
 /* Random phase per round. Without jitter the following holds (4.1): nodes
@@ -1991,7 +2053,9 @@ static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
                  * star that names us (6.2) — no extra airtime */
                 uint8_t oq = quality_from_class(cls);
                 nb->rev_quality = quality_ewma(nb->rev_quality ? nb->rev_quality : oq, oq);
-                if (quality_ok(nb->quality)) {
+                /* his advertised class IS his measurement of our signal:
+                 * the gate is on the received evidence (4.2, Oct 2026) */
+                if (quality_ok((uint8_t)nb->rev_quality)) {
                     if (!nb->sym) tbl_nbr_added(n, owner);
                     nb->sym = 1; nb->ack_try = 0;
                 }
@@ -2073,7 +2137,8 @@ static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
                             enb->proven_age_us = 0;
                             uint8_t oq = quality_from_class((uint8_t)(lb >> 4));
                             enb->rev_quality = quality_ewma(enb->rev_quality ? enb->rev_quality : oq, oq);
-                            if (quality_ok(enb->quality)) {
+                            /* gate on the received evidence (4.2, Oct 2026) */
+                            if (quality_ok((uint8_t)enb->rev_quality)) {
                                 if (!enb->sym) tbl_nbr_added(n, eid);
                                 enb->sym = 1; enb->ack_try = 0;
                             }
@@ -2191,6 +2256,12 @@ static void hello_ack_fire(mimeshi_node *n, void *ud) {
         if (phack[i].used && phack[i].to == to) { p[5] = phack[i].quality; phack[i].used = 0; break; }
     bound_send(n, (uint8_t)(to % MC_N_CHANNELS), p, 6, t_hack_us()); /* to HOME of the sender */
     ka_called(n, (uint8_t)(to % MC_N_CHANNELS));    /* own call on that channel (4.1) */
+    /* three-way closure bookkeeping (4.2, Oct 2026): we acked this
+     * neighbour's round - a later PROOF_ACK from it closes our side. */
+    {
+        mimeshi_neighbor *nb = nbr_find(n, to);
+        if (nb) nb->acked_round = 1;
+    }
 }
 
 /* Wait time and decision for the hello-ack, after receiving a hello:
@@ -2597,6 +2668,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         break;
     }
     case PKT_HELLO_ACK: {
+        n->proof_ack_pend = 1;                 /* this round collected acks (4.2) */
         /* Directional ack (5 B): destination = the original hello
          * sender.
          *  - Addressed to US: the responder received our hello and
@@ -2620,11 +2692,62 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                 uint8_t rq = pkt[5];     /* what the responder measured on OUR signal (6.2) */
                 nb->rev_quality = rq ? quality_ewma(nb->rev_quality ? nb->rev_quality : rq, rq)
                                      : nb->rev_quality;
+                /* the round's STRONGEST received evidence (4.2, the
+                 * two-sided threshold): the PROOF_ACK fires only when
+                 * the best received rq clears the gate - a round of
+                 * weak acks confirms nothing and the sender stays
+                 * silent, so BOTH sides end without symmetry: the
+                 * agreement falls out of the shared threshold. */
+                if (rq > n->proof_ack_best_rq) n->proof_ack_best_rq = rq;
             }
-            if (dst == n->id && quality_ok(nb->quality)) {
+            /* Three-way closure (4.2, Oct 2026): the gate moves from OUR
+             * measurement to the RECEIVED evidence. The ack addressed to us
+             * proves both directions worked (our hello reached him, his
+             * ack reached us) and rq carries HIS measurement of OUR
+             * signal. The old gate on nb->quality let two working
+             * directions disagree (the 12/13 case). Our own measurement
+             * keeps its role in the ROUTE COST, never as the gatekeeper
+             * of what the neighbour just proved. */
+            /* the TWO-SIDED threshold (4.2, decided Oct 2026): both
+             * reception directions must clear the gate. His rq is his
+             * measurement of OUR signal (in the packet); our RSSI on
+             * THIS reception is our measurement of HIS signal. Both
+             * above the gate = both sides measured, both agree, the
+             * symmetry is mutual. Either side weak = no confirmation
+             * anywhere: his ack gate already filtered his weak hello
+             * receptions, and our silence on weak evidence is the
+             * second gate - both nodes end WITHOUT symmetry, in
+             * agreement (the 12/13 case no longer splits opinions:
+             * one weak direction blocks both sides equally). */
+            if (dst == n->id && nb->rev_quality && quality_ok((uint8_t)nb->rev_quality)
+                && quality_ok(quality_of(rssi))) {
                 if (!nb->sym) tbl_nbr_added(n, from);  /* delta + table round (4.3) */
                 nb->sym = 1; nb->ack_try = 0;          /* confirmed symmetric (4.2, 10.1) */
             }
+        }
+        break;
+    }
+    case PKT_PROOF_ACK: {
+        /* The collectieve derde stap (4.2, decided Oct 2026): the hello
+         * sender confirms all received hello-acks of its round at once.
+         * Only a node that ACKED that round has an open agreement - for
+         * it, this packet is the closure: our ack ARRIVED (the packet is
+         * the proof), our direction works, and the sender drew its
+         * symmetry conclusion. sym = 1 on this RECEIVED evidence: our
+         * own quality measurement of the neighbour no longer blocks
+         * what the packet proves (the 12/13-case: both directions
+         * physically working, one point under the gate, link refused -
+         * the two two-way handshakes could disagree). Our own
+         * measurement keeps its role in the ROUTE COST (poorly heard
+         * = expensive edge), never again as the gatekeeper of what
+         * the neighbour just proved. */
+        uint16_t from = rd16(pkt + 1);
+        mimeshi_neighbor *nb = nbr_find(n, from);
+        if (nb && nb->acked_round) {
+            nb->acked_round = 0;                  /* the agreement is closed */
+            nb->proven_age_us = 0;                /* reverse direction freshly proven */
+            if (!nb->sym) tbl_nbr_added(n, from); /* delta + table round (4.3) */
+            nb->sym = 1; nb->ack_try = 0;         /* confirmed symmetric (4.2) */
         }
         break;
     }
@@ -2650,7 +2773,16 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         for (uint16_t i = 0; i < ids; i++) {
             if (rd16(pkt + 3 + 2 * i) == n->id && nb) {
                 nb->proven_age_us = 0;
-                if (quality_ok(nb->quality) && !nb->sym) { nb->sym = 1; nb->ack_try = 0; tbl_nbr_added(n, from); }
+                /* his proof list naming us = he claims the link works both
+                 * ways. The TWO-SIDED threshold (4.2, decided Oct 2026):
+                 * his claim is one direction's evidence; our reception
+                 * quality of THIS packet is the other. Both above the
+                 * gate = mutual; a claim received weakly confirms
+                 * nothing (and his own gates filter his side the same
+                 * way - both end without symmetry, in agreement). */
+                if (quality_ok(quality_of(rssi)) && !nb->sym) {
+                    nb->sym = 1; nb->ack_try = 0; tbl_nbr_added(n, from);
+                }
             }
         }
         break;
@@ -2681,7 +2813,8 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                     if (len >= 8 && pkt[7]) {            /* what the acker measured on OUR data (6.2) */
                         nb->rev_quality = quality_ewma(nb->rev_quality ? nb->rev_quality : pkt[7], pkt[7]);
                     }
-                    if (quality_ok(nb->quality)) {
+                    /* gate on the received evidence (4.2, Oct 2026) */
+                    if (nb->rev_quality && quality_ok((uint8_t)nb->rev_quality)) {
                         if (!nb->sym) tbl_nbr_added(n, rd16(pkt + 5));
                         nb->sym = 1; nb->ack_try = 0;
                     }
