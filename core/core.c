@@ -149,14 +149,14 @@ enum {
                              the bridge node toward an unknown destination */
 #define F_WAYPOINT_GEO 0x40 /* waypoint geo present (10.2, decided Oct 2026): 4 B
                               after the dest geo (or after the fixed header when
-                              no dest geo). The traveling koers of the best
+                              no dest geo). The traveling heading of the best
                               bridge the chain has seen - never a required
                               destination: hops route toward its ZONE with
                               locally routable steps. A forwarder replaces it
                               only when its own bridge candidate lies strictly
                               closer to the destination (better-than, 5%
                               margin). The destination in the own graph always
-                              wins over the koers. */
+                              wins over the heading. */
 
 #define F_NEG_ACK2 0x40   /* next hop could not forward (7.2) */
 
@@ -1158,7 +1158,7 @@ static uint8_t star_fwd_useful(mimeshi_node *n, uint16_t center) {
         if (d < my_dist) my_dist = d;
     }
     if (my_dist == 0x7FFFFFFF) return 1;       /* we are not on the graph of the
-                                                  star: our buren are unknown
+                                                  star: our neighbours are unknown
                                                   territory - forward */
 
     /* useful iff at least one neighbour lies STRICTLY farther */
@@ -1881,7 +1881,7 @@ static uint16_t route_next_hop_ex_prev(mimeshi_node *n, uint16_t dst,
     for (int i = 0; i < MC_MAP_NODES; i++) { r_dist[i] = MC_DIST_INF; r_prev[i] = 0xFFFF; r_done[i] = 0; }
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {           /* own edges (virtual start) */
         mimeshi_neighbor *nb = &n->nbr[i];
-        /* ONE TRUTH (decided Oct 2026, the doorgeef-cirkel finding):
+        /* ONE TRUTH (decided Oct 2026, the forwarding-loop finding):
          * the virtual start admits CONFIRMED (sym) neighbours and
          * prices the own edge with the AUTHORITATIVE link class from
          * the star - the same information every neighbour holds in
@@ -2693,18 +2693,18 @@ int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uin
     p->src = n->id; p->dst = dst; p->prev_hop = n->id; p->next_hop = nh;
     uint8_t *k = p->pkt;
     bool geo = (dest_lat || dest_lon);
-    /* Waypoint (10.2): an out-of-graph send attaches the koers - the geo
+    /* Waypoint (10.2): an out-of-graph send attaches the heading - the geo
      * of the chosen bridge candidate - so the hops route toward its zone
      * with locally routable steps instead of every hop re-inventing a
      * bridge from possibly worse knowledge (the plateau finding: pools
      * held candidates at 11 km median from the destination, but no hop
      * could ROUTE to them - toward the zone, every step is local). */
-    /* Waypoint retired (Oct 2026): the koers was built against the
+    /* Waypoint retired (Oct 2026): the heading was built against the
      * collapsed-geo plateau - an artifact of the sim's broken longitude
      * encoding, fixed since. With a healthy two-dimensional geo space the
      * distance-first bridge rule alone navigates; the waypoint's extra
      * state did not pay for its complexity (the 1347 trace: re-aims on
-     * equal koersen, chains still leaving the arrival zone). The flag
+     * equal headings, chains still leaving the arrival zone). The flag
      * stays defined for format compatibility; nothing sets it. */
     k[0] = (uint8_t)(PKT_DATA | (ack3 ? F_ACK3_REQ : 0)
                      | (geo ? F_DEST_GEO : 0));
@@ -2804,7 +2804,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         break;
     }
     case PKT_PROOF_ACK: {
-        /* The collectieve derde stap (4.2, decided Oct 2026): the hello
+        /* The collective third step (4.2, decided Oct 2026): the hello
          * sender confirms all received hello-acks of its round at once.
          * Only a node that ACKED that round has an open agreement - for
          * it, this packet is the closure: our ack ARRIVED (the packet is
@@ -2982,7 +2982,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
          * from its goal. The delivery path below handles the dedup
          * (a second copy is ignored) and the ack1 goes to the actual
          * sender, exactly as a directly addressed delivery would.
-         * This closes the doorgeef-cirkel: the last stretch becomes
+         * This closes the forwarding loop: the last stretch becomes
          * 'any transmission the destination happens to hear'. */
         if (dst == n->id && rd16(pkt + 10) != n->id) {
             /* fall through into the delivery processing below: the
