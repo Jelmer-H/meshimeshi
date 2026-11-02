@@ -113,7 +113,7 @@ static uint64_t t_data_us(uint16_t l) { return l <= 40 ? 173000ull : l <= 150 ? 
  *                     Reactionless keepalive + symmetry flush; an empty list
  *                     is the minimal keepalive beacon (type + node-id).
  *   PROOF_ACK   3 B   type, node-id(2) = the hello sender (4.2, Oct 2026).
- *                     The collectieve derde stap van de three-way: once per
+ *                     The collective third step of the three-way: once per
  *                     hello round, scheduled at the ack window's end, the
  *                     sender confirms ALL received hello-acks at once. A
  *                     responder that acked that round and hears this packet
