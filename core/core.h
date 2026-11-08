@@ -34,8 +34,8 @@
 #endif   /* the sim can override at build time for pool-pressure tests */
 #define MC_MAX_LINKS   1536            /* link store: links between map nodes (13.2) */
 #define MC_T_SYM_US      21600000000ull  /* 6 h: validity of confirmed symmetry (4.2) */
-#define MC_T_EXPIRE_TICKS 257u           /* ~4 h in proof ticks: neighbour-table expiry (4.4) */
-#define MC_T_ACTIVE_TICKS 771u           /* ~12 h: map entry stays fully usable (4.4); ~2
+#define MC_T_EXPIRE_TICKS 240u           /* 4 h in proof ticks (1 min each): neighbour-table expiry (4.4) */
+#define MC_T_ACTIVE_TICKS 720u           /* 12 h in proof ticks (1 min each): map entry stays fully usable (4.4); ~2
                                             re-shares, so a live node with at least one
                                             neighbour never falls below this */
 #define MC_SYM_MARGIN_US  7200000000ull  /* 2 h flush margin (4.2) */
@@ -125,8 +125,8 @@ typedef struct { uint16_t msg_id, src; uint16_t seq; } mimeshi_dedup;
  * table chunks) or directly. Geo in the 16-bit grid of section 5;
  * (0,0) = invalid. Age bookkeeping without a clock: arrived_tick is
  * the local tick counter of the last refresh; age_ticks is the on-air
- * age (in proof ticks, ~56 s) at that moment. Effective age =
- * (tick - arrived_tick) + age_ticks, in proof ticks; 255 (~4 h) =
+ * age (in proof ticks, 1 min each) at that moment. Effective age =
+ * (tick - arrived_tick) + age_ticks, in proof ticks; 255 (>4 h) =
  * expired (4.4). */
 typedef struct {
     uint16_t id;
@@ -263,7 +263,7 @@ struct mimeshi_node {
                                          every fire: the hourly cap */
     uint16_t geo_lat, geo_lon;        /* own geo in the 16-bit grid (5);
                                          (0,0) = none (yet) */
-    uint32_t tick;                    /* local time base: proof ticks (~56 s)
+    uint32_t tick;                    /* local time base: proof ticks (1 min)
                                          since start (4.4); starts at 1 */
     uint16_t dedup_seq;               /* FIFO insertion counter of the dedup cache (14) */
     uint8_t  tbl_dirty;               /* own-star content change pending (4.3) */

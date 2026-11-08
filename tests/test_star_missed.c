@@ -61,8 +61,8 @@ static void vrsw(mimeshi_node *n, uint8_t ch, uint64_t s, void (*done)(mimeshi_n
 static uint32_t vrrand(mimeshi_node *n) { (void)n; return 7u; }
 static bool vrcad(mimeshi_node *n, uint8_t ch) { (void)n; (void)ch; return true; }
 
-#define TICK_US 56000000ull
-#define INTERVAL_US (16ull * TICK_US)
+#define TICK_US 60000000ull
+#define INTERVAL_US (15ull * TICK_US)
 
 /* craft a catalogue-only round chunk from `owner` advertising one star */
 static uint16_t craft_catalogue(uint8_t *p, uint16_t owner, uint16_t star, uint8_t digest) {

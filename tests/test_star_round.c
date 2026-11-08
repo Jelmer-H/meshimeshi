@@ -69,10 +69,10 @@ static bool vrcad(mimeshi_node *n, uint8_t ch) { (void)n; (void)ch; return true;
 
 static uint16_t t_rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 
-/* One hour of simulated time. The round interval is 16 proof ticks of
- * ~56 s = 900 s; an hour holds 4 rounds (the own-star bound). */
-#define TICK_US 56000000ull
-#define INTERVAL_US (16ull * TICK_US)
+/* One hour of simulated time. The round interval is 15 proof ticks of
+ * 1 min = 900 s; an hour holds 4 rounds (the own-star bound). */
+#define TICK_US 60000000ull
+#define INTERVAL_US (15ull * TICK_US)
 #define HOUR_US (4ull * INTERVAL_US)
 
 int main(void) {

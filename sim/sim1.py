@@ -183,8 +183,8 @@ class StarStats:
     entries - the three areas of the round. Aggregates per node:
     rounds, content stars, catalogue entries, missed requests, and the
     byte split, plus the hard-bound check (max rounds per node per
-    interval of 16 proof ticks)."""
-    INTERVAL_US = 16 * 56000000          # 15 min (4.5 starting value)
+    interval of 15 proof ticks)."""
+    INTERVAL_US = 15 * 60000000          # 15 min (4.5 starting value; 1 tick = 1 min)
     def __init__(self):
         self.per_node = {}                # id -> dict of counters
         self.air_total = 0
@@ -227,7 +227,7 @@ class StarStats:
         for nid, d in self.per_node.items():
             times = sorted(d["times"])
             for a, b in zip(times, times[1:]):
-                if b - a < iv - 2 * 56000000:      # 2 ticks slack for jitter
+                if b - a < iv - 2 * 60000000:      # 2 ticks (2 min) slack for jitter
                     out.append((nid, a, b))
         return out
     def summary(self):
