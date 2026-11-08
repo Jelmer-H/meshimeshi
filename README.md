@@ -5,8 +5,9 @@ Protocol core in C for repeaters/companions + Python simulator. See
 
 ## Status (Oct 2026)
 
-- **Building block 1 complete**: hello (adaptive startup rounds + jitter;
-  after the startup phase the hello no longer exists), directional hello-acks
+- **Building block 1 complete**: discovery and first evidence without a
+  hello (4.5): accelerated full-spread star rounds for lonely nodes,
+  directional generalized hello-acks
   with snooping, symmetry status per neighbor (seen/confirmed), unicast
   with ack1/2/3, retries, budget, collision and capture model, GPS/height
   link budget.
@@ -33,7 +34,7 @@ Protocol core in C for repeaters/companions + Python simulator. See
 meshimeshi/
 ├── core/            # protocol core: platform-independent, no dynamic allocation
 │   ├── core.h       #   API + hardware interface (tx / timer / switch / RNG)
-│   └── core.c       #   hello, neighbor table, acks, unicast, budget, switch rule
+│   └── core.c       #   discovery (4.5), neighbor table, acks, unicast, budget, switch rule
 ├── sim/             # simulator (event-driven virtual radio, SF7/62.5 kHz)
 │   ├── sim1.py      #   platform layer (clock/radio/RNG) + link-test scenario
 │   └── meshsim.py   #   simpy engine + scenario registry (reuses sim1.py)
@@ -65,12 +66,9 @@ python3 sim/sim1.py                # link-test scenario, uses build/libmimeshi.s
 python3 -m venv .venv && .venv/bin/pip install simpy
 .venv/bin/python sim/meshsim.py --list          # available scenarios
 .venv/bin/python sim/meshsim.py link-test     # same run as sim1.py (engine check)
-.venv/bin/python sim/meshsim.py hello-interval -q
-.venv/bin/python sim/meshsim.py jitter-sweep   # hello sync vs jitter range (open point 3)
 .venv/bin/python sim/meshsim.py collision       # collision + capture (6 dB margin, design 14.1)
 .venv/bin/python sim/meshsim.py local-net    # 40 nodes from sim/nodes/*.csv (GPS+height)
 .venv/bin/python sim/meshsim.py local-net --nodes sim/nodes/utrecht40.csv --duration 8
-.venv/bin/python sim/meshsim.py hello-interval --jitter 5000000   # vary the jitter range
 ```
 
 ## Working rules (from design 13b)

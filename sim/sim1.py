@@ -405,14 +405,17 @@ class Node:
 # ---------------------------------------------------------------------------
 # C core via ctypes — the only protocol implementation (design 13b).
 # Struct layout verified against sizeof/offsetof of core.h
-# (neighbor 24, pending 256, mapnode 12, link 6, node 18528 B).
+# (neighbor 32, pending 256, mapnode 12, link 6, node 36792 B).
 # ---------------------------------------------------------------------------
 MC_MAX_NEIGHBORS, MC_MAX_PENDING, MC_MAX_DEDUP, MC_MAX_PAYLOAD = 64, 64, 128, 230
 
 class CNeighbor(ctypes.Structure):
     _fields_ = [("id", ctypes.c_uint16), ("quality", ctypes.c_uint8),
                 ("rev_quality", ctypes.c_uint8),
-                ("ack_try", ctypes.c_uint8), ("last_seen", ctypes.c_uint32),
+                ("ack_try", ctypes.c_uint8),      # courtesy counter (4.5)
+                ("ack_spacing", ctypes.c_uint16), # pace gate: current backoff spacing (4.5)
+                ("ack_next_tick", ctypes.c_uint32), # pace gate: earliest next ack tick (4.5)
+                ("last_seen", ctypes.c_uint32),
                 ("proven_age_us", ctypes.c_uint64), ("alive", ctypes.c_uint8),
                 ("sym", ctypes.c_uint8), ("adv_class", ctypes.c_uint8),
                 ("penalty", ctypes.c_uint8),
@@ -477,8 +480,8 @@ class CStarMiss(ctypes.Structure):
 CNode._fields_ = [
     ("id", ctypes.c_uint16), ("home_ch", ctypes.c_uint8), ("local_tbl_ctr", ctypes.c_uint16),
     ("nbr", CNeighbor * MC_MAX_NEIGHBORS), ("pend", CPending * MC_MAX_PENDING),
-    ("dedup", CDedup * MC_MAX_DEDUP), ("hello_interval_us", ctypes.c_uint64),
-    ("hello_jitter_us", ctypes.c_uint64),
+    ("dedup", CDedup * MC_MAX_DEDUP),
+    ("round_jitter_us", ctypes.c_uint64),   # random phase per scheduled own call (4.2)
     ("ka_idle", ctypes.c_uint8 * 3),   # keepalive counters per channel (4.1)
     ("proof_wait", ctypes.c_uint8 * 3),  # flush countdown per channel (4.2)
     ("geo_lat", ctypes.c_uint16), ("geo_lon", ctypes.c_uint16),  # own geo grid (5)
@@ -664,18 +667,20 @@ def main():
     out("=== Scenario 1: link test (2 nodes, SF7, 62.5 kHz) ===")
     a.core.start()
     radio.schedule(500_000, b.core.start)   # real nodes never start on the same
-    # microsecond; 0.5 s keeps the first rounds free of overlap so the
-    # unicast at 1.5 s can lean on a real neighbor table (overlap between
-    # rounds is measured by the sweeps below).
-    radio.run(until_us=1_500_000)           # first hello round + acks
+    # microsecond. Discovery rides the accelerated lonely star round
+    # (4.5): the first round comes within ~5 min (random phase), full
+    # spread; the generalized acks and the collective proof ack close
+    # both sides - so the unicasts wait for the first confirmed
+    # neighbour (~2 accelerated rounds).
+    radio.run(until_us=700_000_000)
 
-    out("\n--- unicast A -> B (A knows B from the hello round) ---")
+    out("\n--- unicast A -> B (A knows B from the accelerated round) ---")
     a.core.send_data(0x0101, "hello mesh", ack3=True)
-    radio.run(until_us=3_000_000)          # hello-ack from A shows B the map
+    radio.run(until_us=3_000_000)
 
-    out("\n--- unicast B -> A (after hello-ack: B knows A) ---")
+    out("\n--- unicast B -> A (after the exchanged evidence) ---")
     b.core.send_data(0x0100, "reply message", ack3=True)
-    radio.run(until_us=50_000_000)         # second hello rounds (30 s + jitter)
+    radio.run(until_us=50_000_000)
 
     out("\n=== Measurements ===")
     for c in range(N_CH):

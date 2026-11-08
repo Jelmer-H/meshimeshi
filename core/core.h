@@ -47,11 +47,17 @@ typedef struct {
     uint8_t  rev_quality;  /* quality the NEIGHBOUR measured on our signal
                               (its hello-ack/ack1 quality byte, 6.2);
                               0 = not yet known. EWMA-smoothed. */
-    uint8_t  ack_try;      /* counter per neighbor (4.1): every identifying
-                              transmission of the neighbor counts; ack
-                              attempts at counter values 1, 2, 4, 8, 16,
-                              then on average 1 in 16; reset on
-                              confirmation or renewed contact */
+    uint8_t  ack_try;      /* courtesy counter per neighbor (4.5): after
+                              the own confirmation two more acks, then
+                              silence; reset on confirmation; not read
+                              for unconfirmed links */
+    uint16_t ack_spacing;   /* pace gate (4.5): the current backoff spacing
+                              in proof ticks; doubles after each ack that
+                              does not close the three-way, cap
+                              MC_ACK_BACKOFF_CAP_TICKS (24 h); 0 = fresh */
+    uint32_t ack_next_tick; /* pace gate (4.5): the earliest proof tick at
+                              which the next generalized ack may go out;
+                              not read for confirmed links */
     uint32_t last_seen;
     uint64_t proven_age_us;  /* age of the reverse-direction evidence
                                ("last proven", 4.2): refreshed on a hello-ack
@@ -246,8 +252,8 @@ struct mimeshi_node {
     mimeshi_neighbor nbr[MC_MAX_NEIGHBORS];
     mimeshi_pending  pend[MC_MAX_PENDING];
     mimeshi_dedup    dedup[MC_MAX_DEDUP];
-    uint64_t hello_interval_us;       /* adaptive: 30 s -> 1 h */
-    uint64_t hello_jitter_us;         /* random phase per round; 0 = no jitter.
+    uint64_t round_jitter_us;         /* random phase per scheduled own call
+                                         (proof list, 4.2); 0 = no jitter.
                                          Default MC_HELLO_JITTER_US; the
                                          simulation can set it before mimeshi_start */
     uint8_t  ka_idle[MC_N_CHANNELS];  /* silence counter per channel in
@@ -268,10 +274,10 @@ struct mimeshi_node {
     uint16_t dedup_seq;               /* FIFO insertion counter of the dedup cache (14) */
     uint8_t  tbl_dirty;               /* own-star content change pending (4.3) */
     uint8_t  star_round_sched;        /* star-round timer running (4.3) */
-    uint8_t  proof_ack_pend;          /* three-way closure (4.2): this hello
-                                         round collected hello-acks - the
-                                         collective PROOF_ACK fires at the
-                                         end of the ack window */
+    uint8_t  proof_ack_pend;          /* three-way closure (4.2): the current
+                                         star round collected generalized
+                                         acks - the collective PROOF_ACK
+                                         fires at the end of the ack window */
     uint8_t  proof_ack_best_rq;       /* the strongest received rq of the current
                                          round (4.2, the two-sided threshold):
                                          the PROOF_ACK fires only when this
@@ -351,10 +357,10 @@ void mimeshi_set_trace(mimeshi_node *n, uint8_t on);
  * the exclusion list, the candidate plan and the chosen hop. JSONL. */
 void mimeshi_set_hoptrace(mimeshi_node *n, void *file);
 
-/* First hello round immediately, then startup rounds with random phase
- * (jitter). After the startup phase the hello no longer exists:
- * channel liveness is carried by traffic plus the proof list with the
- * keepalive role (4.1, 4.2). */
+/* Starts the cadences: the star round (4.3, accelerated while the node
+ * has no confirmed neighbour, 4.5), the proof tick (keepalive and
+ * symmetry flush, 4.1/4.2) and the staggered proof-list moments. The
+ * hello no longer exists (4.5). */
 void mimeshi_start(mimeshi_node *n);
 
 /* Unicast to dst. 0 = accepted, -1 = dst not in the map and no
