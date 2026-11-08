@@ -305,10 +305,13 @@ struct mimeshi_node {
                                         the own home channel */
     mimeshi_star_miss star_miss[MC_STAR_MISS_MAX];  /* missed-list (4.5):
                                          bounded, damped, per neighbour */
-    uint8_t  star_own_ctr;            /* star rounds since the own star last
-                                         traveled in full; the guaranteed
-                                         own-star round fires when this
-                                         reaches the hour bound (4.5) */
+    uint8_t  star_own_ctr;            /* home-channel rotation rounds since
+                                         the own star last traveled in full;
+                                         the guaranteed own-star round fires
+                                         when this reaches 2 home rounds
+                                         (~45 min at the 15-min starting
+                                         value) - the once-per-hour bound of
+                                         4.5 stays honoured as a lower bound */
     uint8_t  star_tick;               /* heartbeat tick of the own star (4.5):
                                          +1 at every guaranteed own-star
                                          round; rides in the age byte and
@@ -386,8 +389,15 @@ void mimeshi_rx(mimeshi_node *n, uint8_t channel, int8_t rssi_db,
  * per direction), SORTED by peer id - the canonical byte form of 4.5.
  * age_off_out (optional) receives the offset of the age byte (the
  * heartbeat tick lives there). Returns the length, 0 = star unknown or
- * maxlen too small. */
-uint16_t mimeshi_star_serialize(const mimeshi_node *n, uint16_t center,
+ * maxlen too small.
+ *
+ * NOT const: serialising PUBLISHES. The own star's entry byte and the
+ * own direct-neighbour link bytes pass through the hysteresis of 4.3
+ * (adv_byte_hyst) on the way out, so the call updates adv_q / adv_class
+ * of the node - the published form is stored exactly once, at the
+ * moment it goes on air. Callers that must not publish need a snapshot
+ * without this side effect (none exist today). */
+uint16_t mimeshi_star_serialize(mimeshi_node *n, uint16_t center,
                                uint8_t *buf, uint16_t maxlen,
                                uint16_t *age_off_out);
 

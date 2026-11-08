@@ -96,7 +96,10 @@ static const uint32_t PLAN_PASS_MS[3] = { 800, 1200, 1800 };  /* escalating per 
 static uint64_t t_ack_us(void)        { return 78000ull; }   /* ack1/ack2: 7 B */
 static uint64_t t_hello_us(void)      { return 62000ull; }   /* hello: 3 B (6.3) */
 static uint64_t t_hack_us(void)       { return 70000ull; }   /* hello-ack: 5 B (6.2) */
-static uint64_t t_proof_us(uint8_t n) { (void)n; return 70000ull; }  /* proof list: 3+2n B, n<=17 -> 37 B max; one class (4.2) */
+static uint64_t t_proof_us(void) { return 70000ull; }  /* proof list: 3+2n B,
+                                                       n<=17 -> 37 B max; one
+                                                       airtime class covers them
+                                                       all (4.2) */
 static uint64_t t_data_us(uint16_t l) { return l <= 40 ? 173000ull : l <= 150 ? 459000ull : 869000ull; }
 
 /* ---------------- packet types and formats ----------------
@@ -113,7 +116,7 @@ static uint64_t t_data_us(uint16_t l) { return l <= 40 ? 173000ull : l <= 150 ? 
  *                     Reactionless keepalive + symmetry flush; an empty list
  *                     is the minimal keepalive beacon (type + node-id).
  *   PROOF_ACK   3 B   type, node-id(2) = the hello sender (4.2, Oct 2026).
- *                     The collectieve derde stap van de three-way: once per
+ *                     The collective third step of the three-way: once per
  *                     hello round, scheduled at the ack window's end, the
  *                     sender confirms ALL received hello-acks at once. A
  *                     responder that acked that round and hears this packet
@@ -149,14 +152,14 @@ enum {
                              the bridge node toward an unknown destination */
 #define F_WAYPOINT_GEO 0x40 /* waypoint geo present (10.2, decided Oct 2026): 4 B
                               after the dest geo (or after the fixed header when
-                              no dest geo). The traveling koers of the best
+                              no dest geo). The traveling heading of the best
                               bridge the chain has seen - never a required
                               destination: hops route toward its ZONE with
                               locally routable steps. A forwarder replaces it
                               only when its own bridge candidate lies strictly
                               closer to the destination (better-than, 5%
                               margin). The destination in the own graph always
-                              wins over the koers. */
+                              wins over the heading. */
 
 #define F_NEG_ACK2 0x40   /* next hop could not forward (7.2) */
 
@@ -439,7 +442,7 @@ static void proof_send(mimeshi_node *n, uint8_t c) {
             cnt++;
         }
     }
-    bound_send(n, c, p, (uint16_t)(3 + 2 * cnt), t_proof_us(cnt));
+    bound_send(n, c, p, (uint16_t)(3 + 2 * cnt), t_proof_us());
     ka_called(n, c);            /* own call: keepalive counter of c resets (4.1) */
 }
 
@@ -892,6 +895,28 @@ static uint16_t lnk_owner(uint16_t x, uint16_t y) {
     return lnk_pair_bit(x, y) ? a : b;
 }
 
+/* Canonical epilogue of a serialised star: sort the collected links by
+ * peer id (the canonical form of 4.3 - deterministic bytes independent of
+ * internal table order), check the byte budget, and pack the link area
+ * after the 9-byte entry. Returns the total star length, or 0 when the
+ * links do not fit maxlen. */
+static uint16_t star_pack_links(uint8_t *buf, uint16_t maxlen,
+                                uint16_t *ids, uint8_t *qc, uint16_t cnt) {
+    for (uint16_t i = 1; i < cnt; i++) {         /* insertion sort by peer id */
+        uint16_t id = ids[i]; uint8_t q = qc[i];
+        uint16_t j = i;
+        while (j > 0 && ids[j-1] > id) { ids[j] = ids[j-1]; qc[j] = qc[j-1]; j--; }
+        ids[j] = id; qc[j] = q;
+    }
+    if (9 + 3 * cnt > maxlen) return 0;          /* does not fit */
+    buf[8] = (uint8_t)cnt;                       /* link count, chunk entry layout (4.3) */
+    for (uint16_t i = 0; i < cnt; i++) {
+        wr16(buf + 9 + 3 * i, ids[i]);
+        buf[9 + 3 * i + 2] = qc[i];
+    }
+    return (uint16_t)(9 + 3 * cnt);
+}
+
 /* Serialise the star of node `center` as known by n - storage as
  * received (4.3): the entry (id, both quality classes, tick, geo) and
  * every link OWNED by center, reproduced exactly as the origin
@@ -906,10 +931,10 @@ static uint16_t lnk_owner(uint16_t x, uint16_t y) {
  * lives there, 4.3); the age byte itself is written but excluded from
  * the content hash (mimeshi_star_content_hash). Returns the total
  * length, or 0 if the star does not exist or does not fit maxlen. */
-uint16_t mimeshi_star_serialize(const mimeshi_node *n, uint16_t center,
+uint16_t mimeshi_star_serialize(mimeshi_node *n, uint16_t center,
                                uint8_t *buf, uint16_t maxlen,
                                uint16_t *age_off_out) {
-    mimeshi_mapnode *m = map_find((mimeshi_node *)n, center);
+    mimeshi_mapnode *m = map_find(n, center);
     if (!m) return 0;
     if (maxlen < 9) return 0;
 
@@ -971,7 +996,7 @@ uint16_t mimeshi_star_serialize(const mimeshi_node *n, uint16_t center,
          * (4.3): a >= 2-step class move re-publishes, sub-threshold
          * EWMA movement does not. */
         for (int i = 0; i < MC_MAX_NEIGHBORS && cnt < MC_STAR_MAX_LINKS; i++) {
-            mimeshi_neighbor *pnb = &((mimeshi_node *)n)->nbr[i];
+            mimeshi_neighbor *pnb = &n->nbr[i];
             if (!pnb->alive || !pnb->sym) continue;
             if (lnk_owner(n->id, pnb->id) != n->id) continue;   /* owned share */
             uint8_t fresh = (uint8_t)((adv_class_of(pnb->quality) << 4)
@@ -981,19 +1006,7 @@ uint16_t mimeshi_star_serialize(const mimeshi_node *n, uint16_t center,
             qc[cnt] = pnb->adv_class;
             cnt++;
         }
-        for (uint16_t i = 1; i < cnt; i++) {         /* insertion sort by peer id */
-            uint16_t id = ids[i]; uint8_t q = qc[i];
-            uint16_t j = i;
-            while (j > 0 && ids[j-1] > id) { ids[j] = ids[j-1]; qc[j] = qc[j-1]; j--; }
-            ids[j] = id; qc[j] = q;
-        }
-        if (9 + 3 * cnt > maxlen) return 0;          /* does not fit */
-        buf[8] = (uint8_t)cnt;                       /* link count, chunk entry layout (4.3) */
-        for (uint16_t i = 0; i < cnt; i++) {
-            wr16(buf + 9 + 3 * i, ids[i]);
-            buf[9 + 3 * i + 2] = qc[i];
-        }
-        return (uint16_t)(9 + 3 * cnt);
+        return star_pack_links(buf, maxlen, ids, qc, cnt);
     }
     for (int i = 0; i < MC_MAX_LINKS && cnt < MC_STAR_MAX_LINKS; i++) {
         if (!n->lnk[i].alive) continue;
@@ -1002,27 +1015,15 @@ uint16_t mimeshi_star_serialize(const mimeshi_node *n, uint16_t center,
         else if (n->lnk[i].b == center) peer = n->lnk[i].a;
         else continue;
         if (lnk_owner(center, peer) != center) continue;   /* owned share (4.3) */
-        if (map_find((mimeshi_node *)n, peer) == 0) continue;  /* link endpoints are map nodes */
-        uint8_t cf = lnk_class((mimeshi_node *)n, center, peer);
+        if (map_find(n, peer) == 0) continue;  /* link endpoints are map nodes */
+        uint8_t cf = lnk_class(n, center, peer);
         if (cf == 0xFF) continue;
-        uint8_t cr = lnk_class((mimeshi_node *)n, peer, center);
+        uint8_t cr = lnk_class(n, peer, center);
         ids[cnt] = peer;
         qc[cnt] = (uint8_t)((cf << 4) | (cr == 0xFF ? 0 : cr));
         cnt++;
     }
-    for (uint16_t i = 1; i < cnt; i++) {         /* insertion sort by peer id */
-        uint16_t id = ids[i]; uint8_t q = qc[i];
-        uint16_t j = i;
-        while (j > 0 && ids[j-1] > id) { ids[j] = ids[j-1]; qc[j] = qc[j-1]; j--; }
-        ids[j] = id; qc[j] = q;
-    }
-    if (9 + 3 * cnt > maxlen) return 0;          /* does not fit */
-    buf[8] = (uint8_t)cnt;                       /* link count, chunk entry layout (4.3) */
-    for (uint16_t i = 0; i < cnt; i++) {
-        wr16(buf + 9 + 3 * i, ids[i]);
-        buf[9 + 3 * i + 2] = qc[i];
-    }
-    return (uint16_t)(9 + 3 * cnt);
+    return star_pack_links(buf, maxlen, ids, qc, cnt);
 }
 
 /* 1-byte content hash over the canonical star bytes EXCLUDING the age
@@ -1158,7 +1159,7 @@ static uint8_t star_fwd_useful(mimeshi_node *n, uint16_t center) {
         if (d < my_dist) my_dist = d;
     }
     if (my_dist == 0x7FFFFFFF) return 1;       /* we are not on the graph of the
-                                                  star: our buren are unknown
+                                                  star: our neighbours are unknown
                                                   territory - forward */
 
     /* useful iff at least one neighbour lies STRICTLY farther */
@@ -1359,8 +1360,6 @@ static uint8_t star_round_send(mimeshi_node *n) {
             len += 3; cat_cnt++;
         }
     }
-    (void)cat_cnt;
-    if (cat_cnt > 255) cat_cnt = 255;
     p[3] = (uint8_t)cat_cnt;               /* catalogue count in the header:
                                               the receiver knows where the
                                               catalogue ends and the missed
@@ -1376,8 +1375,6 @@ static uint8_t star_round_send(mimeshi_node *n) {
      * damping lives per entry: tries++ here, dropped after 2. */
     {
         uint16_t off = len;
-        uint16_t moff = off;                    /* patch the count later */
-        (void)moff;
         uint8_t carried_miss = 0;
         for (uint8_t i = 0; i < MC_STAR_MISS_MAX; i++) {
             if (!n->star_miss[i].alive) continue;
@@ -1859,7 +1856,12 @@ static uint16_t route_next_hop_ex(mimeshi_node *n, uint16_t dst,
 static uint16_t route_next_hop_ex_prev(mimeshi_node *n, uint16_t dst,
                                   const uint16_t *excl, uint8_t excl_cnt,
                                   uint16_t prev) {
-    (void)prev;    /* the neighbourhood rule is removed; prev stays for the API */
+    (void)prev;    /* the prev-neighbourhood rule is removed (Oct 2026, the
+                       6670 lesson - see the virtual-start comment below); prev
+                       itself is excluded via the excl array, which every
+                       caller fills (schedule_candidates puts it in first). The
+                       parameter stays so the call sites that know prev read
+                       clearly. */
     if (dst == n->id) return n->id;
     int di = r_idx(n, dst);
     /* A direct neighbour is NOT its own first hop by definition: its
@@ -1881,7 +1883,7 @@ static uint16_t route_next_hop_ex_prev(mimeshi_node *n, uint16_t dst,
     for (int i = 0; i < MC_MAP_NODES; i++) { r_dist[i] = MC_DIST_INF; r_prev[i] = 0xFFFF; r_done[i] = 0; }
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {           /* own edges (virtual start) */
         mimeshi_neighbor *nb = &n->nbr[i];
-        /* ONE TRUTH (decided Oct 2026, the doorgeef-cirkel finding):
+        /* ONE TRUTH (decided Oct 2026, the forwarding-loop finding):
          * the virtual start admits CONFIRMED (sym) neighbours and
          * prices the own edge with the AUTHORITATIVE link class from
          * the star - the same information every neighbour holds in
@@ -1980,15 +1982,16 @@ static uint16_t route_next_hop_geo_prev(mimeshi_node *n, uint16_t dst,
                                   uint16_t lat, uint16_t lon,
                                   const uint16_t *excl, uint8_t excl_cnt,
                                   uint16_t prev) {
-    (void)prev;    /* the neighbourhood rule is removed */
+    (void)prev;    /* the prev-neighbourhood rule is removed; prev is excluded
+                       via the excl array by the callers (schedule_candidates) */
     uint16_t nh = route_next_hop_ex_prev(n, dst, excl, excl_cnt, prev);
     if (nh) return nh;
     if (!lat && !lon) return 0;               /* no geo: no flood (10.2) */
     uint16_t bridge = route_bridge_node(n, lat, lon, excl, excl_cnt);
     if (!bridge) return 0;
-    /* the route TOWARD the bridge honours the prev-neighbourhood rule
-     * too: the first step must not dive straight back into prev's
-     * calculation space (10.2) */
+    /* the route toward the bridge goes through the same computation as
+     * the direct route (prev itself is excluded via the excl array,
+     * 10.2); the old prev-neighbourhood rule is gone */
     return route_next_hop_ex_prev(n, bridge, excl, excl_cnt, prev);
 }
 
@@ -2553,7 +2556,7 @@ static void schedule_fail(mimeshi_node *n, mimeshi_pending *p) {
  * moment of submission. Assumption: the platform layer delivers the
  * transmission quickly (queue short); if the switch takes longer, the
  * timeout fires too early and the attempt counts as failed. */
-/* T_ack2 timeout (7.3, fixed 15 s): the next hop received (ack1 came)
+/* T_ack2 timeout (7.3, fixed 8 s): the next hop received (ack1 came)
  * but its own forwarding stayed silent beyond every series. The
  * silence counts as a failed series toward this hop: 6 units off the
  * budget, then the 7.4 structure takes over - next-best hop if
@@ -2693,18 +2696,18 @@ int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uin
     p->src = n->id; p->dst = dst; p->prev_hop = n->id; p->next_hop = nh;
     uint8_t *k = p->pkt;
     bool geo = (dest_lat || dest_lon);
-    /* Waypoint (10.2): an out-of-graph send attaches the koers - the geo
+    /* Waypoint (10.2): an out-of-graph send attaches the heading - the geo
      * of the chosen bridge candidate - so the hops route toward its zone
      * with locally routable steps instead of every hop re-inventing a
      * bridge from possibly worse knowledge (the plateau finding: pools
      * held candidates at 11 km median from the destination, but no hop
      * could ROUTE to them - toward the zone, every step is local). */
-    /* Waypoint retired (Oct 2026): the koers was built against the
+    /* Waypoint retired (Oct 2026): the heading was built against the
      * collapsed-geo plateau - an artifact of the sim's broken longitude
      * encoding, fixed since. With a healthy two-dimensional geo space the
      * distance-first bridge rule alone navigates; the waypoint's extra
      * state did not pay for its complexity (the 1347 trace: re-aims on
-     * equal koersen, chains still leaving the arrival zone). The flag
+     * equal headings, chains still leaving the arrival zone). The flag
      * stays defined for format compatibility; nothing sets it. */
     k[0] = (uint8_t)(PKT_DATA | (ack3 ? F_ACK3_REQ : 0)
                      | (geo ? F_DEST_GEO : 0));
@@ -2804,7 +2807,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         break;
     }
     case PKT_PROOF_ACK: {
-        /* The collectieve derde stap (4.2, decided Oct 2026): the hello
+        /* The collective third step (4.2, decided Oct 2026): the hello
          * sender confirms all received hello-acks of its round at once.
          * Only a node that ACKED that round has an open agreement - for
          * it, this packet is the closure: our ack ARRIVED (the packet is
@@ -2908,7 +2911,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                     p->active = 0;
                 } else {
                     /* source: the hop is done; ack2 comes back on the
-                     * own home channel. T_ack2 (15 s) is the safety
+                     * own home channel. T_ack2 (8 s) is the safety
                      * net (7.3). Exception (decided Oct 2026, the
                      * one-hop closing piece): when the own next hop
                      * IS the final destination, its ack1 is the end
@@ -2982,7 +2985,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
          * from its goal. The delivery path below handles the dedup
          * (a second copy is ignored) and the ack1 goes to the actual
          * sender, exactly as a directly addressed delivery would.
-         * This closes the doorgeef-cirkel: the last stretch becomes
+         * This closes the forwarding loop: the last stretch becomes
          * 'any transmission the destination happens to hear'. */
         if (dst == n->id && rd16(pkt + 10) != n->id) {
             /* fall through into the delivery processing below: the
