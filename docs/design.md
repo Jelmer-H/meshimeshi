@@ -330,6 +330,36 @@ The solution is the **proof list**: a small packet with the node IDs of neighbou
 
 **What falls away with the replacement:** travelled age on air; the age byte as an age carrier (it is the tick now); F_NEG negative deltas; the "2 × T_active for remote entries" blind spot (replaced by the liveness axis, which is earlier and targeted).
 
+### 4.5 Hello removal: discovery by the star round, confirmation by the generalized ack (proposal, Oct 2026)
+
+**Status: proposal, not implemented. The hello of 4.1 stays in place until this section is measured.**
+
+**Motivation.** The hello's remaining function — discovery of nodes that appear in nobody's table, plus the first evidence round — is too small a function to justify its own packet type, its own round machinery (adaptive interval, jitter, three-channel sweep, ack window) and the prominent place it takes in 4.1 and building block 1. The same two jobs can be carried by parts that must exist anyway: the star round (presence) and the generalized hello ack (evidence). One finding forces the generalized ack regardless of this proposal: after the startup phase there is NO confirmation path for a "seen" neighbour — the proof list flushes only confirmed neighbours, the own star carries only confirmed links, and a hello ack fires only on a hello — so a neighbourship that lapses (bad weather, ~4 h of silence, full expiry) never comes back on nodes that do not restart. The generalized ack closes that hole; with it in place the hello is redundant.
+
+**The three changes:**
+
+1. **The hello is dropped.** PKT_HELLO and the startup phase of 4.1 disappear. The keepalive role is already carried by the proof list (4.1); the discovery role moves to the accelerated star round below; the evidence role moves to the generalized ack. The adaptive-startup idea (doubling) survives in the two new ladders: the lonely-node interval and the ack backoff.
+
+2. **Accelerated star round for lonely nodes (replaces the startup rounds).** A node with zero confirmed neighbours star-rounds on a fast interval (starting value: 5 min) and in FULL SPREAD: all three channels per round, in the fixed order, then home. The rotation of 4.3 applies only once the node is integrated. Random phase and jitter stay (the star timer already has them): two nodes that start simultaneously (regional power outage) must not keep synchronous rounds. On the first confirmed neighbour the node falls back to the normal 15-min rotation; the own-star mutation path (`tbl_dirty`) pushes that confirmation immediately. Cost: a lonely star is small (header + entry, no links), so three transmissions of the 173 ms airtime class per 5 min is negligible, and the state is temporary by construction.
+
+3. **The generalized hello ack (section 2, decided Oct 2026 — under this proposal the only confirmation path for new and lapsed links).** Trigger: every identifying transmission of a neighbour (star round, proof list, data as prev_hop, hello-ack, ack1, ack2 — the list of 4.1/4.2), not only the hello. Format unchanged: the directional 6 B ack with the rq byte (6.2). Three gates (section 2), with the pace gate REPLACED:
+   - **Need:** the link is at "seen" rather than "confirmed symmetric", or a courtesy ack is pending. Unchanged.
+   - **Quality gate:** below `MC_SYM_QUALITY_MIN` no ack at all, from the first transmission on. Unchanged.
+   - **Spacing:** the RSSI slot + jitter in the response window. Unchanged.
+   - **Pace (replaces the transmission counter): time-based doubling backoff per neighbour.** One field per neighbour: the earliest next ack time. After each ack that does not close the three-way, the spacing doubles: 1, 2, 4, 8, 16, 32 min, 1, 2, 4, 8, 16 h, cap 24 h. The brake is thereby independent of the neighbour's transmission volume: a busy hub that keeps transmitting cannot pull more ack attempts out of a one-way link than one per day at the cap. Reset rules: a closed three-way clears the field; an entry that expires (`T_expire`, 4.4) starts at the bottom again — a link that truly disappeared and returns recovers fast, while a permanently one-way link holds the cap. Courtesy: after the own confirmation two more acks at short spacing, then silence (the existing courtesy rule, carried in the same field).
+
+**The proof ack stays (4.2 — unchanged purpose, re-anchored trigger).** Its role is not the hello's: it closes the RESPONDER's side of the three-way agreement (sym = 1 at the responder only on its reception), and it does so collectively — one packet confirms all responders of one round. Only the anchor changes: "once per hello round at the end of the ack window" becomes "once per round that collected acks" — with star-round triggers, once per accelerated or normal star round in which at least one ack arrived. The collective property is the airtime argument and survives the hello untouched.
+
+**Known trade-offs (accepted in the proposal):**
+
+- A repaired asymmetric link waits up to 24 h for its confirmation: snooping sees "seen" and fresh quality immediately, but the closure rides the backoff ladder. The link was unroutable anyway; the cap IS the re-test.
+- Ack delivery is best-effort. Unlike the hello round there is no guaranteed listen window at the sender: after a rotation transmission the sender is home almost immediately, but an ack can miss. Harmless — an ack is uncounted (no retry machinery), and the neighbour's next transmission is the next chance. A newcomer's discovery latency is therefore "a few accelerated rounds", not "one round".
+- Two mutually unknown nodes that both still have confirmed neighbours elsewhere never trigger each other's accelerated rounds; their confirmation rides the normal cadence (star rounds every 15 min plus the generalized ack). That is the common newcomer case and it is fast enough; the acceleration exists for the outage case.
+
+**What falls away:** PKT_HELLO, the startup phase of 4.1 (adaptive rounds, three-channel sweep, the ack window as a hello concept), the transmission counter with its powers-of-two test and the 1-in-16 drip, section 6.3. **What stays:** the hello-ack (as the generalized ack, format unchanged), the proof ack (re-anchored), the proof list, the quality gate, the RSSI spacing, the courtesy rule, the jitter.
+
+**To measure before this replaces 4.1 (scenario 6e):** discovery latency of newcomers (accelerated star round vs. hello startup), ack load per channel under a mass reboot (the ladder's damping vs. the old counter), confirmation latency of lapsed links after weather events (previously: never), and the proof-ack behaviour per star round (does one collective proof per round still bound the ack airtime, or does the star cadence need its own cap).
+
 
 ## 5. Geo encoding
 
