@@ -633,7 +633,7 @@ def star_rest(mk, jitter):
             out(f"victim's star present at {present}/{len(nodes)-1} nodes, "
                 f"tick min..max {min(ticks)}..{max(ticks)}, "
                 f"eff age avg {sum(ages)/len(ages):.0f} ticks "
-                f"(max {max(ages)}, eviction at {2*771})")
+                f"(max {max(ages)}, eviction at {2*720})")
         else:
             out("victim's star present nowhere (evicted everywhere)")
 

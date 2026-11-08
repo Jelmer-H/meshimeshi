@@ -253,7 +253,7 @@ The solution is the **proof list**: a small packet with the node IDs of neighbou
 
 **The heartbeat tick.** The tick byte of a star is the origin's heartbeat: the origin increments it at every guaranteed own-star round (once per hour, starting values below), and the tick rides along in the star form, hop by hop, through the catalogue. Every star thereby has network-wide liveness, separate from the local death detection of direct neighbours (4.4). Wrap at 256 is harmless within the k-window: ticks compare modulo 256.
 
-**The round (one packet type: STAR_ROUND).** Every node broadcasts at most one chunk per interval (starting value: 15 min = 16 proof ticks) — **channel rotation with a backlog override (decided, Oct 2026, from the scenario-6 airtime measurement)**:
+**The round (one packet type: STAR_ROUND).** Every node broadcasts at most one chunk per interval (starting value: 15 min = 15 proof ticks of 1 min) — **channel rotation with a backlog override (decided, Oct 2026, from the scenario-6 airtime measurement)**:
 
 - **Rotation at rest.** A round with thin content (no backlog: the queue fits) transmits on ONE channel: the rotation channel `(home + round_counter) mod 3`, so a node cycles home → home+1 → home+2 and back. The neighbours at home on that channel receive the full round; the resting overhead (header, catalogue, heartbeat) is paid once per interval instead of three times — measured (utrecht40, 24 h rest): 2.3% per channel → ~0.8%, below the old cadence's 0.9%. Fewer transmissions also mean less home deafness (the node is away from its own channel at most one interval in three) and fewer collisions (per channel only the third of the nodes whose rotation it is).
 - **Full spread under backlog.** A round whose content area is full — or whose queue did not fit — transmits on ALL THREE channels, exactly as the original cadence: a backlog drains at today's speed, because under backlog every channel's throughput counts. The rule is local (does anything remain queued after packing?) and needs no measurement.
@@ -302,7 +302,7 @@ The solution is the **proof list**: a small packet with the node IDs of neighbou
 
 **Status: decided in design (Oct 2026), replacing the old 4.4. Fully implemented and measured (scenario 6c, Oct 2026): local ageing, last_seen for direct neighbours, and the tick-liveness axis below (star_tick_seen, de-weight at half the threshold, eviction at ~6 h of tick stall). Measured utrecht40 48 h with one node silenced at t=24 h: the tick stalls everywhere at the silencing moment, the de-weight starts at ~4.8 h, and the dead origin's star is gone from ALL 39 nodes by ~6 h after silence (0/39 present at t=30 h) - versus the old 4.4 arm which kept the dead node in 37/39 maps after 24 h of silence, and the pre-liveness star arm which showed it falsely fresh (eff age ~2 ticks) forever through echo matches. Freshness and liveness are now truly independent axes.**
 
-**The principle: age is local, confirmation resets it.** Under the star round, no age travels on air (the tick byte is liveness, not age). Freshness is purely local: every confirmation — content received, or a derivable catalogue match — sets `arrived_tick = now`. Effective age = `tick − arrived_tick`, in proof ticks (~56 s). This is cleaner than the old sum of travelled age plus local ticks (one clock, not two), and it removes any dependence on senders counting honestly.
+**The principle: age is local, confirmation resets it.** Under the star round, no age travels on air (the tick byte is liveness, not age). Freshness is purely local: every confirmation — content received, or a derivable catalogue match — sets `arrived_tick = now`. Effective age = `tick − arrived_tick`, in proof ticks (1 min each). This is cleaner than the old sum of travelled age plus local ticks (one clock, not two), and it removes any dependence on senders counting honestly.
 
 **Three axes of expiry.**
 
@@ -655,7 +655,7 @@ Every hop recomputes: as soon as the destination (or a node that knows it) enter
 - **Negative ack2 from the neighbour** (itself reached, forwarding failed): no penalty — the link works, the problem lies deeper; the route computation of the neighbour already applies its own penalty there.
 - **Successful ack1**: penalty −1 per success, floor 0. Recovery is thereby driven by ordinary traffic; a separate probe (open point 15) is only needed for links without traffic.
 - The penalty is applied at route computation (10.2) as a cost increase on the own edge toward that neighbour, proportional to the counter: a small integer multiplier on the ETX cost of the link.
-- **Hysteresis:** the route computation applies the penalty only from penalty ≥ 2, so a single missed ack1 (one collision) does not yet push traffic away; and a penalised link is only probed again for routing after a minimum waiting time (order of magnitude one proof-tick, ~1 min) since the last failure. Both parameters are firmware constants and simulation parameters.
+- **Hysteresis:** the route computation applies the penalty only from penalty ≥ 2, so a single missed ack1 (one collision) does not yet push traffic away; and a penalised link is only probed again for routing after a minimum waiting time (one proof-tick, 1 min) since the last failure. Both parameters are firmware constants and simulation parameters.
 
 **Status:** worked out (mechanism decided, parameters open). Implementation follows with the routing core.
 
@@ -738,7 +738,7 @@ Every hop recomputes: as soon as the destination (or a node that knows it) enter
 - **Geo calculations with integers** where possible, using the 16-bit values from section 5. The east-west axis scales with cos(latitude). Within a region that is a constant, so a fixed fraction suffices (for example 154/250 ≈ cos 52° for the Netherlands).
 - **Random numbers** from the hardware RNG for backoff and jitter.
 - **One radio abstraction** for SX126x and SX127x. The modem parameters are the same.
-- **Time** via a local counter and a hardware timer. No clock is needed.
+- **Time** via a local counter and a hardware timer. No clock is needed: the proof tick is the time base — **one tick = 1 minute** (`MC_KEEPALIVE_TICK_US` = 60 s), so every tick count in this document reads directly in minutes (60 ticks = 1 h, 15 ticks = 15 min, 240 ticks = 4 h). The tick never travels on air; only differences and the star heartbeat tick (4.3) do, so per-node drift is irrelevant.
 - **Bounded known graph:** the number of nodes is capped, so that the Gabriel calculation, the kNN radius and route computation stay within the computing budget.
 
 **Status:** budgets decided. Open: whether a BLE companion on the same chip competes with the protocol for RAM.
