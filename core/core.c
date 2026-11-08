@@ -895,6 +895,28 @@ static uint16_t lnk_owner(uint16_t x, uint16_t y) {
     return lnk_pair_bit(x, y) ? a : b;
 }
 
+/* Canonical epilogue of a serialised star: sort the collected links by
+ * peer id (the canonical form of 4.3 - deterministic bytes independent of
+ * internal table order), check the byte budget, and pack the link area
+ * after the 9-byte entry. Returns the total star length, or 0 when the
+ * links do not fit maxlen. */
+static uint16_t star_pack_links(uint8_t *buf, uint16_t maxlen,
+                                uint16_t *ids, uint8_t *qc, uint16_t cnt) {
+    for (uint16_t i = 1; i < cnt; i++) {         /* insertion sort by peer id */
+        uint16_t id = ids[i]; uint8_t q = qc[i];
+        uint16_t j = i;
+        while (j > 0 && ids[j-1] > id) { ids[j] = ids[j-1]; qc[j] = qc[j-1]; j--; }
+        ids[j] = id; qc[j] = q;
+    }
+    if (9 + 3 * cnt > maxlen) return 0;          /* does not fit */
+    buf[8] = (uint8_t)cnt;                       /* link count, chunk entry layout (4.3) */
+    for (uint16_t i = 0; i < cnt; i++) {
+        wr16(buf + 9 + 3 * i, ids[i]);
+        buf[9 + 3 * i + 2] = qc[i];
+    }
+    return (uint16_t)(9 + 3 * cnt);
+}
+
 /* Serialise the star of node `center` as known by n - storage as
  * received (4.3): the entry (id, both quality classes, tick, geo) and
  * every link OWNED by center, reproduced exactly as the origin
@@ -984,19 +1006,7 @@ uint16_t mimeshi_star_serialize(const mimeshi_node *n, uint16_t center,
             qc[cnt] = pnb->adv_class;
             cnt++;
         }
-        for (uint16_t i = 1; i < cnt; i++) {         /* insertion sort by peer id */
-            uint16_t id = ids[i]; uint8_t q = qc[i];
-            uint16_t j = i;
-            while (j > 0 && ids[j-1] > id) { ids[j] = ids[j-1]; qc[j] = qc[j-1]; j--; }
-            ids[j] = id; qc[j] = q;
-        }
-        if (9 + 3 * cnt > maxlen) return 0;          /* does not fit */
-        buf[8] = (uint8_t)cnt;                       /* link count, chunk entry layout (4.3) */
-        for (uint16_t i = 0; i < cnt; i++) {
-            wr16(buf + 9 + 3 * i, ids[i]);
-            buf[9 + 3 * i + 2] = qc[i];
-        }
-        return (uint16_t)(9 + 3 * cnt);
+        return star_pack_links(buf, maxlen, ids, qc, cnt);
     }
     for (int i = 0; i < MC_MAX_LINKS && cnt < MC_STAR_MAX_LINKS; i++) {
         if (!n->lnk[i].alive) continue;
@@ -1013,19 +1023,7 @@ uint16_t mimeshi_star_serialize(const mimeshi_node *n, uint16_t center,
         qc[cnt] = (uint8_t)((cf << 4) | (cr == 0xFF ? 0 : cr));
         cnt++;
     }
-    for (uint16_t i = 1; i < cnt; i++) {         /* insertion sort by peer id */
-        uint16_t id = ids[i]; uint8_t q = qc[i];
-        uint16_t j = i;
-        while (j > 0 && ids[j-1] > id) { ids[j] = ids[j-1]; qc[j] = qc[j-1]; j--; }
-        ids[j] = id; qc[j] = q;
-    }
-    if (9 + 3 * cnt > maxlen) return 0;          /* does not fit */
-    buf[8] = (uint8_t)cnt;                       /* link count, chunk entry layout (4.3) */
-    for (uint16_t i = 0; i < cnt; i++) {
-        wr16(buf + 9 + 3 * i, ids[i]);
-        buf[9 + 3 * i + 2] = qc[i];
-    }
-    return (uint16_t)(9 + 3 * cnt);
+    return star_pack_links(buf, maxlen, ids, qc, cnt);
 }
 
 /* 1-byte content hash over the canonical star bytes EXCLUDING the age
