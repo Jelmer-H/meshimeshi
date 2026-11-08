@@ -96,7 +96,10 @@ static const uint32_t PLAN_PASS_MS[3] = { 800, 1200, 1800 };  /* escalating per 
 static uint64_t t_ack_us(void)        { return 78000ull; }   /* ack1/ack2: 7 B */
 static uint64_t t_hello_us(void)      { return 62000ull; }   /* hello: 3 B (6.3) */
 static uint64_t t_hack_us(void)       { return 70000ull; }   /* hello-ack: 5 B (6.2) */
-static uint64_t t_proof_us(uint8_t n) { (void)n; return 70000ull; }  /* proof list: 3+2n B, n<=17 -> 37 B max; one class (4.2) */
+static uint64_t t_proof_us(void) { return 70000ull; }  /* proof list: 3+2n B,
+                                                       n<=17 -> 37 B max; one
+                                                       airtime class covers them
+                                                       all (4.2) */
 static uint64_t t_data_us(uint16_t l) { return l <= 40 ? 173000ull : l <= 150 ? 459000ull : 869000ull; }
 
 /* ---------------- packet types and formats ----------------
@@ -439,7 +442,7 @@ static void proof_send(mimeshi_node *n, uint8_t c) {
             cnt++;
         }
     }
-    bound_send(n, c, p, (uint16_t)(3 + 2 * cnt), t_proof_us(cnt));
+    bound_send(n, c, p, (uint16_t)(3 + 2 * cnt), t_proof_us());
     ka_called(n, c);            /* own call: keepalive counter of c resets (4.1) */
 }
 
@@ -1855,7 +1858,12 @@ static uint16_t route_next_hop_ex(mimeshi_node *n, uint16_t dst,
 static uint16_t route_next_hop_ex_prev(mimeshi_node *n, uint16_t dst,
                                   const uint16_t *excl, uint8_t excl_cnt,
                                   uint16_t prev) {
-    (void)prev;    /* the neighbourhood rule is removed; prev stays for the API */
+    (void)prev;    /* the prev-neighbourhood rule is removed (Oct 2026, the
+                       6670 lesson - see the virtual-start comment below); prev
+                       itself is excluded via the excl array, which every
+                       caller fills (schedule_candidates puts it in first). The
+                       parameter stays so the call sites that know prev read
+                       clearly. */
     if (dst == n->id) return n->id;
     int di = r_idx(n, dst);
     /* A direct neighbour is NOT its own first hop by definition: its
@@ -1976,15 +1984,16 @@ static uint16_t route_next_hop_geo_prev(mimeshi_node *n, uint16_t dst,
                                   uint16_t lat, uint16_t lon,
                                   const uint16_t *excl, uint8_t excl_cnt,
                                   uint16_t prev) {
-    (void)prev;    /* the neighbourhood rule is removed */
+    (void)prev;    /* the prev-neighbourhood rule is removed; prev is excluded
+                       via the excl array by the callers (schedule_candidates) */
     uint16_t nh = route_next_hop_ex_prev(n, dst, excl, excl_cnt, prev);
     if (nh) return nh;
     if (!lat && !lon) return 0;               /* no geo: no flood (10.2) */
     uint16_t bridge = route_bridge_node(n, lat, lon, excl, excl_cnt);
     if (!bridge) return 0;
-    /* the route TOWARD the bridge honours the prev-neighbourhood rule
-     * too: the first step must not dive straight back into prev's
-     * calculation space (10.2) */
+    /* the route toward the bridge goes through the same computation as
+     * the direct route (prev itself is excluded via the excl array,
+     * 10.2); the old prev-neighbourhood rule is gone */
     return route_next_hop_ex_prev(n, bridge, excl, excl_cnt, prev);
 }
 
