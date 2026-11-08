@@ -1359,8 +1359,6 @@ static uint8_t star_round_send(mimeshi_node *n) {
             len += 3; cat_cnt++;
         }
     }
-    (void)cat_cnt;
-    if (cat_cnt > 255) cat_cnt = 255;
     p[3] = (uint8_t)cat_cnt;               /* catalogue count in the header:
                                               the receiver knows where the
                                               catalogue ends and the missed
@@ -1376,8 +1374,6 @@ static uint8_t star_round_send(mimeshi_node *n) {
      * damping lives per entry: tries++ here, dropped after 2. */
     {
         uint16_t off = len;
-        uint16_t moff = off;                    /* patch the count later */
-        (void)moff;
         uint8_t carried_miss = 0;
         for (uint8_t i = 0; i < MC_STAR_MISS_MAX; i++) {
             if (!n->star_miss[i].alive) continue;
@@ -2553,7 +2549,7 @@ static void schedule_fail(mimeshi_node *n, mimeshi_pending *p) {
  * moment of submission. Assumption: the platform layer delivers the
  * transmission quickly (queue short); if the switch takes longer, the
  * timeout fires too early and the attempt counts as failed. */
-/* T_ack2 timeout (7.3, fixed 15 s): the next hop received (ack1 came)
+/* T_ack2 timeout (7.3, fixed 8 s): the next hop received (ack1 came)
  * but its own forwarding stayed silent beyond every series. The
  * silence counts as a failed series toward this hop: 6 units off the
  * budget, then the 7.4 structure takes over - next-best hop if
@@ -2908,7 +2904,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                     p->active = 0;
                 } else {
                     /* source: the hop is done; ack2 comes back on the
-                     * own home channel. T_ack2 (15 s) is the safety
+                     * own home channel. T_ack2 (8 s) is the safety
                      * net (7.3). Exception (decided Oct 2026, the
                      * one-hop closing piece): when the own next hop
                      * IS the final destination, its ack1 is the end
