@@ -931,10 +931,10 @@ static uint16_t star_pack_links(uint8_t *buf, uint16_t maxlen,
  * lives there, 4.3); the age byte itself is written but excluded from
  * the content hash (mimeshi_star_content_hash). Returns the total
  * length, or 0 if the star does not exist or does not fit maxlen. */
-uint16_t mimeshi_star_serialize(const mimeshi_node *n, uint16_t center,
+uint16_t mimeshi_star_serialize(mimeshi_node *n, uint16_t center,
                                uint8_t *buf, uint16_t maxlen,
                                uint16_t *age_off_out) {
-    mimeshi_mapnode *m = map_find((mimeshi_node *)n, center);
+    mimeshi_mapnode *m = map_find(n, center);
     if (!m) return 0;
     if (maxlen < 9) return 0;
 
@@ -996,7 +996,7 @@ uint16_t mimeshi_star_serialize(const mimeshi_node *n, uint16_t center,
          * (4.3): a >= 2-step class move re-publishes, sub-threshold
          * EWMA movement does not. */
         for (int i = 0; i < MC_MAX_NEIGHBORS && cnt < MC_STAR_MAX_LINKS; i++) {
-            mimeshi_neighbor *pnb = &((mimeshi_node *)n)->nbr[i];
+            mimeshi_neighbor *pnb = &n->nbr[i];
             if (!pnb->alive || !pnb->sym) continue;
             if (lnk_owner(n->id, pnb->id) != n->id) continue;   /* owned share */
             uint8_t fresh = (uint8_t)((adv_class_of(pnb->quality) << 4)
@@ -1015,10 +1015,10 @@ uint16_t mimeshi_star_serialize(const mimeshi_node *n, uint16_t center,
         else if (n->lnk[i].b == center) peer = n->lnk[i].a;
         else continue;
         if (lnk_owner(center, peer) != center) continue;   /* owned share (4.3) */
-        if (map_find((mimeshi_node *)n, peer) == 0) continue;  /* link endpoints are map nodes */
-        uint8_t cf = lnk_class((mimeshi_node *)n, center, peer);
+        if (map_find(n, peer) == 0) continue;  /* link endpoints are map nodes */
+        uint8_t cf = lnk_class(n, center, peer);
         if (cf == 0xFF) continue;
-        uint8_t cr = lnk_class((mimeshi_node *)n, peer, center);
+        uint8_t cr = lnk_class(n, peer, center);
         ids[cnt] = peer;
         qc[cnt] = (uint8_t)((cf << 4) | (cr == 0xFF ? 0 : cr));
         cnt++;

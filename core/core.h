@@ -389,8 +389,15 @@ void mimeshi_rx(mimeshi_node *n, uint8_t channel, int8_t rssi_db,
  * per direction), SORTED by peer id - the canonical byte form of 4.5.
  * age_off_out (optional) receives the offset of the age byte (the
  * heartbeat tick lives there). Returns the length, 0 = star unknown or
- * maxlen too small. */
-uint16_t mimeshi_star_serialize(const mimeshi_node *n, uint16_t center,
+ * maxlen too small.
+ *
+ * NOT const: serialising PUBLISHES. The own star's entry byte and the
+ * own direct-neighbour link bytes pass through the hysteresis of 4.3
+ * (adv_byte_hyst) on the way out, so the call updates adv_q / adv_class
+ * of the node - the published form is stored exactly once, at the
+ * moment it goes on air. Callers that must not publish need a snapshot
+ * without this side effect (none exist today). */
+uint16_t mimeshi_star_serialize(mimeshi_node *n, uint16_t center,
                                uint8_t *buf, uint16_t maxlen,
                                uint16_t *age_off_out);
 
