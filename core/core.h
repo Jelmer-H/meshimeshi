@@ -305,10 +305,13 @@ struct mimeshi_node {
                                         the own home channel */
     mimeshi_star_miss star_miss[MC_STAR_MISS_MAX];  /* missed-list (4.5):
                                          bounded, damped, per neighbour */
-    uint8_t  star_own_ctr;            /* star rounds since the own star last
-                                         traveled in full; the guaranteed
-                                         own-star round fires when this
-                                         reaches the hour bound (4.5) */
+    uint8_t  star_own_ctr;            /* home-channel rotation rounds since
+                                         the own star last traveled in full;
+                                         the guaranteed own-star round fires
+                                         when this reaches 2 home rounds
+                                         (~45 min at the 15-min starting
+                                         value) - the once-per-hour bound of
+                                         4.5 stays honoured as a lower bound */
     uint8_t  star_tick;               /* heartbeat tick of the own star (4.5):
                                          +1 at every guaranteed own-star
                                          round; rides in the age byte and
