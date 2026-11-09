@@ -322,6 +322,17 @@ struct mimeshi_node {
                                          +1 at every guaranteed own-star
                                          round; rides in the age byte and
                                          drives the derivable digest */
+    uint8_t  star_lonely_ctr;        /* lonely ladder (4.5): the spacing of the
+                                         NEXT accelerated round in proof ticks;
+                                         0 = fresh (starts at MC_STAR_LONELY_TICKS),
+                                         doubles per round without a confirmed
+                                         neighbour up to the normal cadence; the
+                                         first confirmation resets it (lazily,
+                                         in the round tick). The brake of the
+                                         acceleration: an isolated node must not
+                                         hammer full spread forever (measured:
+                                         5 isolated nodes, 7347 bound violations
+                                         over 120 h at 480 nodes). */
     mimeshi_mapnode map[MC_MAP_NODES];  /* 2-hop map (10.1) */
     mimeshi_link   lnk[MC_MAX_LINKS];  /* links between map nodes (4.3) */
     void    *hoptrace;                /* hop-decision trace FILE* (deep

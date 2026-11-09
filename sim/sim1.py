@@ -498,6 +498,7 @@ CNode._fields_ = [
     ("star_miss", CStarMiss * 12),           # missed list (4.3, MC_STAR_MISS_MAX)
     ("star_own_ctr", ctypes.c_uint8),         # home rounds since the last own-star carry (4.3)
     ("star_tick", ctypes.c_uint8),            # own-star heartbeat tick (4.3)
+    ("star_lonely_ctr", ctypes.c_uint8),     # lonely ladder spacing (4.5)
     ("map", CMapNode * MC_MAP_NODES),   # 2-hop map (10.1)
     ("lnk", CLink * MC_MAX_LINKS),      # link store (4.3)
     ("hoptrace", ctypes.c_void_p),             # hop-decision trace FILE* (deep forensics)

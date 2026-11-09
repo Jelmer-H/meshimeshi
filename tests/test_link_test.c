@@ -134,6 +134,18 @@ int main(void) {
     assert(hello_seen == 0);                 /* the hello is gone */
     assert(star_cnt_A[0] >= 1 && star_cnt_A[1] >= 1 && star_cnt_A[2] >= 1);
     assert(star_cnt_B[0] >= 1 && star_cnt_B[1] >= 1 && star_cnt_B[2] >= 1);
+    /* Assert 1b (4.5): the lonely ladder doubles per unconfirmed round:
+     * gap 1 = 5 ticks (~281 s, round 2 at ~394 s), gap 2 = 10 ticks
+     * (~562 s, round 3 at ~956 s), then the 16-tick cap. Nothing has
+     * confirmed yet, so both nodes ride the whole ladder. */
+    pump_until(1600000000);
+    assert(star_cnt_A[0] == 3 && star_cnt_A[1] == 3 && star_cnt_A[2] == 3);
+    assert(star_cnt_B[0] == 3 && star_cnt_B[1] == 3 && star_cnt_B[2] == 3);
+    assert(A.star_lonely_ctr == 16);         /* at the cap: the normal cadence
+                                                (MC_STAR_ROUND_TICKS lives in core.c) */
+    /* B confirms A (below): the ladder resets lazily in the round tick -
+     * B's next round runs at the normal cadence again. Checked after
+     * the confirmation via the internal field. */
 
     /* Assert 2: refuse a unicast to an unknown destination (10.2: no flooding). */
     assert(mimeshi_send_data(&A, 0x0BEE, (const uint8_t *)"x", 1, false, 0, 0) == -1);
@@ -169,6 +181,16 @@ int main(void) {
         for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
             if (B.nbr[i].alive && B.nbr[i].id == 0x0102) sym = B.nbr[i].sym;
         assert(sym == 1);                     /* confirmed via the hello-ack */
+        /* the lonely ladder reset is lazy: it happens in B's next round
+         * tick (MC_STAR_ROUND_TICKS after round 3, ~1856 s). Pump there
+         * and check the reset plus the normal cadence. */
+        pump_until(2000000000);              /* past B's first integrated round */
+        assert(B.star_lonely_ctr == 0);      /* integrated: ladder reset */
+        /* integrated rounds rotate ONE channel per round (4.3), so count
+         * the total over the channels, not one */
+        int b_after = star_cnt_B[0] + star_cnt_B[1] + star_cnt_B[2];
+        pump_until(2900000000);              /* ~900 s further: exactly the normal cadence */
+        assert(star_cnt_B[0] + star_cnt_B[1] + star_cnt_B[2] == b_after + 1);
     }
 
     /* Assert 2b: CAD (2). A bound transmission asks

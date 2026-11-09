@@ -1682,7 +1682,9 @@ chunk_rx_mode(n, rssi, pkt, cend, 1);   /* entries only: the catalogue and
 /* Lonely node (4.5): no confirmed neighbour. Drives the accelerated
  * full-spread star round - the replacement of the old startup hello
  * rounds. A fresh node is always lonely; the first confirmation ends
- * the acceleration (the normal rotation takes over). */
+ * the acceleration (the normal rotation takes over). The cadence
+ * itself doubles per unconfirmed round (star_lonely_ctr, 4.5) so the
+ * acceleration decays even without confirmation. */
 static int node_lonely(mimeshi_node *n) {
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
         if (n->nbr[i].alive && n->nbr[i].sym) return 0;
@@ -1708,14 +1710,33 @@ static void star_round_tick(mimeshi_node *n, void *ud) {
         n->timer(n, MC_HELLO_ACK_WIN_US + MC_HELLO_ACK_JITTER_US + t_ack_us(),
                  proof_ack_fire, 0);
     }
-    uint32_t iv = node_lonely(n) ? MC_STAR_LONELY_TICKS : MC_STAR_ROUND_TICKS;
-    if (n->star_backlog) {
-        uint8_t quiet = 1;
-        for (uint8_t c = 0; c < MC_N_CHANNELS; c++)
-            if (n->ka_idle[c] < MC_STAR_QUIET_TICKS) { quiet = 0; break; }
-        if (quiet && iv / 2 >= MC_STAR_FLOOR_TICKS) iv /= 2;
+    /* lonely ladder (4.5): the acceleration is the discovery mechanism,
+     * but it needs the old hello's doubling brake - a node that keeps
+     * failing to confirm (the startup storm, or an isolated node whose
+     * links never clear the quality gate) must not hammer full spread
+     * at the top rate forever. The spacing doubles per round without a
+     * confirmed neighbour, up to the normal cadence; the first
+     * confirmation resets it. Measured without the brake: 5 isolated
+     * nodes produced 7347 bound violations over 120 h at 480 nodes. */
+    uint32_t iv;
+    if (node_lonely(n)) {
+        if (n->star_lonely_ctr == 0) n->star_lonely_ctr = MC_STAR_LONELY_TICKS;
+        iv = n->star_lonely_ctr;
+        if (n->star_lonely_ctr < MC_STAR_ROUND_TICKS) {
+            uint16_t d = (uint16_t)(n->star_lonely_ctr * 2);
+            n->star_lonely_ctr = (uint8_t)(d > MC_STAR_ROUND_TICKS
+                                           ? MC_STAR_ROUND_TICKS : d);
+        }
+    } else {
+        n->star_lonely_ctr = 0;      /* integrated: the ladder is done */
+        iv = MC_STAR_ROUND_TICKS;
+        if (n->star_backlog) {
+            uint8_t quiet = 1;
+            for (uint8_t c = 0; c < MC_N_CHANNELS; c++)
+                if (n->ka_idle[c] < MC_STAR_QUIET_TICKS) { quiet = 0; break; }
+            if (quiet && iv / 2 >= MC_STAR_FLOOR_TICKS) iv /= 2;
+        }
     }
-    if (node_lonely(n) && iv < MC_STAR_LONELY_TICKS) iv = MC_STAR_LONELY_TICKS;
     n->timer(n, iv * MC_KEEPALIVE_TICK_US
              + (n->rand(n) % MC_KEEPALIVE_TICK_US), star_round_tick, 0);
 }
