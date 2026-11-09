@@ -8,16 +8,20 @@
  *
  * This test uses a mini event queue instead of the Python simulator:
  * it tests the core stand-alone, the simulator remains the second
- * opinion. Since the keepalive-hello replacement (4.1/4.2) it also
- * verifies that:
- *  - the hello is 3 bytes (no state version, 4.1/6.3) and only exists
- *    during the startup phase;
- *  - the hello-ack is 5 bytes (6.2);
- *  - after the startup phase exactly one proof list follows per silent
+ * opinion. Since the hello removal (4.5) it also verifies that:
+ *  - no node transmits a hello anymore; a node without confirmed
+ *    neighbours (lonely) star-rounds accelerated (~5 min) and in full
+ *    spread over all three channels - the discovery replacement;
+ *  - a legacy hello is still processed as an identifying transmission
+ *    of the sender: liveness, quality, "seen", generalized ack;
+ *  - the generalized ack (6 B, 6.2) obeys the quality gate and the
+ *    time-based doubling backoff (the pace gate, 4.5);
+ *  - after the acceleration exactly one proof list follows per silent
  *    channel per hour (keepalive role, 4.1/4.2), an own call on a
  *    channel resets only that counter;
  *  - a proof list in which we appear refreshes the reverse evidence
- *    (sym stays confirmed, 4.2) and is reactionless.
+ *    (sym stays confirmed, 4.2); its content stays reactionless, but
+ *    the sender's link state may spend the courtesy budget (4.5).
  */
 #include <stdio.h>
 #include <string.h>
@@ -55,8 +59,12 @@ static int cad_tx_after_free;    /* tx count right after the "free" answer */
 static int cad_at_last_ack1 = -1; /* cad_calls when the last ack1 went out */
 static uint8_t last_type, last_ch;
 static uint16_t last_len;
-static int hello_cnt_A[3], hello_cnt_B[3];   /* hellos per channel per node */
+static int hello_cnt_A[3], hello_cnt_B[3];   /* hellos per channel per node (must stay 0) */
+static int star_cnt_A[3], star_cnt_B[3];     /* star rounds per channel per node */
 static int hack_cnt_A;                        /* hello-acks sent by A (type 2) */
+static int hack_A_to(uint16_t to);            /* hello-acks sent by A addressed to `to` */
+static int hack_cnt_A_dst; static uint16_t hack_A_dst_id;
+static int hack_A_to(uint16_t to) { return (to == hack_A_dst_id) ? hack_cnt_A_dst : 0; }
 static int proof_cnt_A[3];                   /* proof lists per channel (A) */
 
 static bool vrcad(mimeshi_node *n, uint8_t ch) {
@@ -71,12 +79,22 @@ static void vrtx(mimeshi_node *n, uint8_t ch, const uint8_t *pkt, uint16_t len, 
     (void)air;
     tx_count++; last_type = pkt[0]; last_ch = ch; last_len = len;
     if ((pkt[0] & 0x0F) == 6) { ack1_seen++; cad_at_last_ack1 = cad_calls; }  /* PKT_ACK1: direct reply, no CAD (7.1) */
-    if ((pkt[0] & 0x0F) == 1) {              /* PKT_HELLO */
+    if ((pkt[0] & 0x0F) == 1) {              /* PKT_HELLO: dropped as a sent type (4.5) */
         hello_seen++;
         if (n->id == 0x0102) { hello_cnt_A[ch]++; assert(len == 3); }
         else if (n->id == 0x0100) { hello_cnt_B[ch]++; assert(len == 3); }
     }
-    if ((pkt[0] & 0x0F) == 2 && n->id == 0x0102) hack_cnt_A++;   /* hello-ack from A */
+    if ((pkt[0] & 0x0F) == 10) {             /* PKT_STAR_ROUND */
+        if (n->id == 0x0102) star_cnt_A[ch]++;
+        else if (n->id == 0x0100) star_cnt_B[ch]++;
+    }
+    if ((pkt[0] & 0x0F) == 2 && n->id == 0x0102) {   /* hello-ack from A */
+        hack_cnt_A++;
+        if (len >= 5) {
+            uint16_t dst = (uint16_t)(pkt[1] | (pkt[2] << 8));
+            if (dst == hack_A_dst_id) hack_cnt_A_dst++;
+        }
+    }
     if ((pkt[0] & 0x0F) == 3) {              /* PKT_PROOF */
         proof_seen++;
         if (n->id == 0x0102) proof_cnt_A[ch]++;
@@ -106,10 +124,28 @@ int main(void) {
     mimeshi_start(&A);
     mimeshi_start(&B);
 
-    /* Assert 1: the hello round transmits on all three channels (3 per
-     * node), and the hello is 3 B (no state version, 6.3). */
-    pump_until(1000000);
-    assert(hello_seen == 6);
+    /* Assert 1 (4.5): no hello exists anymore. A fresh node is lonely
+     * (no confirmed neighbour): its first star round comes within the
+     * accelerated interval (random phase, here 42 % 5 = 2 ticks =
+     * ~112 s) and in FULL SPREAD - one transmission on each of the
+     * three channels, the discovery replacement of the old hello
+     * round. */
+    pump_until(200000000);
+    assert(hello_seen == 0);                 /* the hello is gone */
+    assert(star_cnt_A[0] >= 1 && star_cnt_A[1] >= 1 && star_cnt_A[2] >= 1);
+    assert(star_cnt_B[0] >= 1 && star_cnt_B[1] >= 1 && star_cnt_B[2] >= 1);
+    /* Assert 1b (4.5): the lonely ladder doubles per unconfirmed round:
+     * gap 1 = 5 ticks (300 s, round 2 at ~420 s), gap 2 = 10 ticks
+     * (600 s, round 3 at ~1020 s), then the 15-tick cap. Nothing has
+     * confirmed yet, so both nodes ride the whole ladder. */
+    pump_until(1600000000);
+    assert(star_cnt_A[0] == 3 && star_cnt_A[1] == 3 && star_cnt_A[2] == 3);
+    assert(star_cnt_B[0] == 3 && star_cnt_B[1] == 3 && star_cnt_B[2] == 3);
+    assert(A.star_lonely_ctr == 15);         /* at the cap: the normal cadence
+                                                (MC_STAR_ROUND_TICKS lives in core.c) */
+    /* B confirms A (below): the ladder resets lazily in the round tick -
+     * B's next round runs at the normal cadence again. Checked after
+     * the confirmation via the internal field. */
 
     /* Assert 2: refuse a unicast to an unknown destination (10.2: no flooding). */
     assert(mimeshi_send_data(&A, 0x0BEE, (const uint8_t *)"x", 1, false, 0, 0) == -1);
@@ -121,7 +157,8 @@ int main(void) {
     mimeshi_rx(&A, 0, -55, helloB, 3);
     uint8_t helloA[3] = { 1, 0x02, 0x01 };       /* PKT_HELLO from 0x0102 */
     mimeshi_rx(&B, 1, -60, helloA, 3);
-    pump_until(1000000);
+    pump_until(now + 5000000);      /* past the ack window: the generalized
+                                       acks of both sides have fired */
 
     /* Assert 4: a neighbor learned via hello stands at "seen": one
      * direction, symmetry not yet proven (4.2). B knew A from the
@@ -144,6 +181,16 @@ int main(void) {
         for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
             if (B.nbr[i].alive && B.nbr[i].id == 0x0102) sym = B.nbr[i].sym;
         assert(sym == 1);                     /* confirmed via the hello-ack */
+        /* the lonely ladder reset is lazy: it happens in B's next round
+         * tick (MC_STAR_ROUND_TICKS after round 3, ~1920 s). Pump there
+         * and check the reset plus the normal cadence. */
+        pump_until(2000000000);              /* past B's first integrated round */
+        assert(B.star_lonely_ctr == 0);      /* integrated: ladder reset */
+        /* integrated rounds rotate ONE channel per round (4.3), so count
+         * the total over the channels, not one */
+        int b_after = star_cnt_B[0] + star_cnt_B[1] + star_cnt_B[2];
+        pump_until(2900000000);              /* ~900 s further: exactly the normal cadence */
+        assert(star_cnt_B[0] + star_cnt_B[1] + star_cnt_B[2] == b_after + 1);
     }
 
     /* Assert 2b: CAD (2). A bound transmission asks
@@ -153,9 +200,11 @@ int main(void) {
         int before_data_tx = 0;
         for (int i = 0; i < MC_MAX_PENDING; i++)
             if (B.pend[i].active && (B.pend[i].pkt[0] & 0x0F) == 5) before_data_tx++;
+        cad_calls = 0; cad_busy_cycles = 0;     /* clean slate: the earlier
+                                                   generalized acks are done */
         cad_busy_left = 2;                       /* channel twice busy, then free */
         assert(mimeshi_send_data(&B, 0x0102, (const uint8_t *)"cad test", 8, false, 0, 0) == 0);
-        pump_until(1000000);
+        pump_until(now + 1000000);
         assert(cad_busy_cycles == 2);            /* 2x waited with backoff */
         int data_tx = 0;
         for (int i = 0; i < MC_MAX_PENDING; i++)
@@ -310,12 +359,61 @@ int main(void) {
         nb->proven_age_us = MC_T_SYM_US - 1;   /* nearly expired (internal field) */
         /* proof list from B on A's home channel 0, naming A */
         uint8_t proof[5] = { 3, 0x00,0x01, 0x02,0x01 };
+        hack_A_dst_id = 0x0100;
+        int acks = hack_A_to(0x0100);
         mimeshi_rx(&A, 0, -70, proof, 5);
         assert(nb->sym == 1 && nb->proven_age_us == 0);   /* refreshed, still confirmed */
-        /* and no ack/reaction was scheduled for it: no tx of type 2 followed */
-        int before = tx_count;
+        /* the CONTENT is reactionless (no reply to the flush), but the
+         * sender's link state may spend the courtesy budget (4.5):
+         * at most two more acks after the own confirmation, then
+         * silence - repeated lists from a confirmed neighbour must
+         * not produce unbounded ack traffic. */
         pump_until(now + 5000000);
-        (void)before;
+        int courtesy_acks = hack_A_to(0x0100) - acks;
+        assert(courtesy_acks >= 0 && courtesy_acks <= 3);
+        for (int i = 0; i < 3; i++) {          /* three more lists: the budget
+                                                  (ack_try cap 3, 4.5) is spent */
+            mimeshi_rx(&A, 0, -70, proof, 5);
+            pump_until(now + 5000000);
+        }
+        int spent = hack_A_to(0x0100) - acks;
+        assert(spent <= 3);                     /* nothing beyond the courtesy budget */
+        mimeshi_rx(&A, 0, -70, proof, 5);       /* one more: silence */
+        pump_until(now + 5000000);
+        assert(hack_A_to(0x0100) - acks == spent);
+    }
+
+    /* Assert 8 (4.5): the pace gate is a time-based doubling backoff.
+     * A "seen" neighbour (never confirmed) gets one generalized ack,
+     * then the next waits twice as long - on the proof-tick time base
+     * (1 min): ack, blocked within the same tick, free again one tick
+     * later, blocked for two ticks, and so on. The brake is time, not
+     * a transmission counter: injecting in quick succession must not
+     * pull more acks out. */
+    {
+        hack_A_dst_id = 0x0110;               /* home 2; stays forever "seen" */
+        uint8_t helloX[3] = { 1, 0x10, 0x01 };   /* PKT_HELLO from 0x0110 */
+        int a0 = hack_A_to(0x0110);
+        mimeshi_rx(&A, 2, -60, helloX, 3);    /* identifying transmission 1 */
+        pump_until(now + 5000000);
+        assert(hack_A_to(0x0110) == a0 + 1);  /* first contact: ack */
+        mimeshi_rx(&A, 2, -60, helloX, 3);    /* same tick: backoff blocks */
+        pump_until(now + 5000000);
+        assert(hack_A_to(0x0110) == a0 + 1);
+        pump_until(now + 60000000);           /* one proof tick further */
+        mimeshi_rx(&A, 2, -60, helloX, 3);
+        pump_until(now + 5000000);
+        assert(hack_A_to(0x0110) == a0 + 2);  /* spacing doubled to 1 tick */
+        mimeshi_rx(&A, 2, -60, helloX, 3);    /* next wait: 2 ticks */
+        pump_until(now + 5000000);
+        assert(hack_A_to(0x0110) == a0 + 2);
+        pump_until(now + 120000000);          /* two proof ticks further */
+        mimeshi_rx(&A, 2, -60, helloX, 3);
+        pump_until(now + 5000000);
+        assert(hack_A_to(0x0110) == a0 + 3);  /* spacing doubled to 2 ticks */
+        mimeshi_rx(&A, 2, -60, helloX, 3);    /* next wait: 4 ticks */
+        pump_until(now + 5000000);
+        assert(hack_A_to(0x0110) == a0 + 3);
     }
 
     printf("link-test: OK (tx=%d, hellos=%d, proofs=%d, switches=%d)\n",

@@ -43,7 +43,11 @@
 /* ---------------- configuration (firmware constants) ----------------
  * Values and status live in the design document; change them there first
  * (working rule: design -> core -> ctest + sim1.py grow along). */
-#define MC_HELLO_START_US  30000000ull     /* 30 s after startup (4.1) */
+#define MC_ACK_BACKOFF_CAP_TICKS 1440u     /* pace cap (4.5): 24 h in proof ticks
+                                              (1 tick = 1 min) */
+#define MC_STAR_LONELY_TICKS 5u            /* accelerated round interval while the
+                                              node has no confirmed neighbour (4.5):
+                                              5 min, full spread */
 #define MC_MIN_US          60000000ull     /* 1 minute in us - the human time unit */
 #define MC_KEEPALIVE_TICK_US MC_MIN_US      /* the time base without a clock: 1 tick = 1 min */
 #define MC_KEEPALIVE_TICKS 60u             /* silence ticks = T_keepalive = 1 h (4.1) */
@@ -92,10 +96,11 @@ static const uint32_t PLAN_PASS_MS[3] = { 800, 1200, 1800 };  /* escalating per 
  * Fixed values from the table in 14.1. The core passes the airtime to
  * tx() so the platform layer can schedule the transmit window; the
  * functions are deliberately simple (three classes) instead of an exact
- * LoRa airtime formula. hello: 3 B, hello-ack/proof list: 5 B and 3+2n B
- * (6.2); ack1/ack2: 7 B. */
+ * LoRa airtime formula. 3 B packets (proof ack, and the legacy hello,
+ * 6.3): 62 ms; hello-ack/proof list: 5-6 B and 3+2n B (6.2); ack1/ack2:
+ * 7-8 B. */
 static uint64_t t_ack_us(void)        { return 78000ull; }   /* ack1/ack2: 7 B */
-static uint64_t t_hello_us(void)      { return 62000ull; }   /* hello: 3 B (6.3) */
+static uint64_t t_hello_us(void)      { return 62000ull; }   /* 3 B packets (6.3) */
 static uint64_t t_hack_us(void)       { return 70000ull; }   /* hello-ack: 5 B (6.2) */
 static uint64_t t_proof_us(void) { return 70000ull; }  /* proof list: 3+2n B,
                                                        n<=17 -> 37 B max; one
@@ -107,19 +112,22 @@ static uint64_t t_data_us(uint16_t l) { return l <= 40 ? 173000ull : l <= 150 ? 
  * Type byte: low nibble = type, high nibble = flags (6.1). All
  * multi-byte fields little-endian (rd16/wr16). Layouts:
  *
- *   HELLO       3 B   type, node-id(2)  (4.1, 6.3). Startup only: after the
- *                     adaptive phase the hello no longer exists; the state
- *                     version is dropped (no pull anymore, 4.3).
- *   HELLO_ACK   5 B   type, destination-id(2) = hello sender,
- *                     sender-id(2) — directional: the address makes the ack
- *                     an exact symmetry proof (5.1 ms symbol time incl.; 2, 4.2)
+ *   HELLO       3 B   type, node-id(2)  (6.3). DROPPED as a sent type
+ *                     (4.5): no node sends it anymore. A received packet
+ *                     of this type is still processed as an identifying
+ *                     transmission of the sender (liveness, quality,
+ *                     generalized ack).
+ *   HELLO_ACK   6 B   type, destination-id(2) = the acked sender,
+ *                     sender-id(2), rq(1) — directional: the address makes
+ *                     the ack an exact symmetry proof (6.2; 2, 4.2, 4.5)
  *   PROOF       3+2n B type, node-id(2), n x neighbour-id(2), n <= 17 (4.2).
  *                     Reactionless keepalive + symmetry flush; an empty list
  *                     is the minimal keepalive beacon (type + node-id).
- *   PROOF_ACK   3 B   type, node-id(2) = the hello sender (4.2, Oct 2026).
- *                     The collective third step of the three-way: once per
- *                     hello round, scheduled at the ack window's end, the
- *                     sender confirms ALL received hello-acks at once. A
+ *   PROOF_ACK   3 B   type, node-id(2) = the acked round's sender (4.2,
+ *                     re-anchored by 4.5). The collective third step of the
+ *                     three-way: once per round that collected acks,
+ *                     scheduled at the ack window's end, the
+ *                     sender confirms ALL received acks at once. A
  *                     responder that acked that round and hears this packet
  *                     closes its side of the symmetry agreement (sym = 1 on
  *                     this received evidence - the neighbour's own quality
@@ -138,8 +146,9 @@ static uint64_t t_data_us(uint16_t l) { return l <= 40 ? 173000ull : l <= 150 ? 
 enum {
     PKT_HELLO = 1, PKT_HELLO_ACK, PKT_PROOF, PKT_TABLE_CHUNK,
     PKT_DATA, PKT_ACK1, PKT_ACK2, PKT_ACK3, PKT_FAIL_RPT
-    /* The three-way closure (4.2, decided Oct 2026): the hello sender's
-     * COLLECTIVE confirmation, one packet per hello round after the ack
+    /* The three-way closure (4.2, decided Oct 2026, re-anchored by 4.5):
+     * the acked round sender's
+     * COLLECTIVE confirmation, one packet per round after the ack
      * window - every responder of that round learns 'my ack arrived,
      * my direction works, the sender's symmetry conclusion is drawn'
      * in one airtime. Wire value 11: appended after PKT_STAR_ROUND (10,
@@ -171,12 +180,12 @@ static void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v
 /* ---------------- keepalive counters (4.1) ----------------
  * Per channel the node counts how many keepalive ticks have passed since
  * it last "called" there itself — an identifying transmission on that
- * channel (hello, hello-ack, ack1, ack2, data as prev_hop, ack3, soon
- * pull traffic). ANN and FULL are anonymous and therefore do NOT reset.
+ * channel (hello-ack, ack1, ack2, data as prev_hop, ack3, star round,
+ * proof list). ANN and FULL are anonymous and therefore do NOT reset.
  * Every own call sets the counter of that channel to 0; after
- * MC_KEEPALIVE_TICKS of silence exactly one hello follows on that
- * channel (ka_tick). The core has no clock: the tick timer IS the time
- * base. */
+ * MC_KEEPALIVE_TICKS of silence exactly one proof list follows on that
+ * channel (the keepalive, 4.2). The core has no clock: the tick timer
+ * IS the time base. */
 static void ka_called(mimeshi_node *n, uint8_t ch) {
     if (ch < MC_N_CHANNELS) n->ka_idle[ch] = 0;
 }
@@ -244,6 +253,7 @@ static mimeshi_neighbor *nbr_add(mimeshi_node *n, uint16_t id) {
         if (!n->nbr[i].alive) {
             n->nbr[i].alive = 1; n->nbr[i].id = id;
             n->nbr[i].sym = 0; n->nbr[i].ack_try = 0;
+            n->nbr[i].ack_spacing = 0; n->nbr[i].ack_next_tick = 0;
             n->local_tbl_ctr++;
             return &n->nbr[i];
         }
@@ -335,86 +345,31 @@ static void bound_send(mimeshi_node *n, uint8_t ch, const uint8_t *pkt, uint16_t
     printf("[core] node %u: bound-pool full, transmission dropped (counter %u)\n", n->id, bctx_drops);
 }
 
-/* ---------------- hello (4.1) ---------------- */
+/* ---------------- discovery and first evidence (4.5) ---------------- */
 
-/* One hello round: the same 3 B packet on all three channels, in fixed
- * order. Reasons (2): neighbors sit randomly on all home channels, and
- * the fixed order gives responders a predictable moment when the sender
- * is listening on its own channel again — their hello-acks go there.
- * Startup only (4.1). Cost: 3 x 3 B with adaptive interval. */
-static void proof_ack_fire(mimeshi_node *n, void *ud);
-
-static void hello_round(mimeshi_node *n) {
-    uint8_t p[3] = { PKT_HELLO, 0, 0 };
-    wr16(p + 1, n->id);
-    for (uint8_t c = 0; c < MC_N_CHANNELS; c++) {          /* fixed order */
-        bound_send(n, c, p, 3, t_hello_us());
-        ka_called(n, c);                                   /* own call on c (4.1) */
-    }
-    /* after the round the node is home; hello-acks arrive there (within the window) */
-
-    /* The three-way closure (4.2, decided Oct 2026): one COLLECTIVE
-     * PROOF_ACK per hello round, at the end of the ack window - but
-     * ONLY when the round actually collected hello-acks (a silent
-     * round has no agreement to close and no airtime to spend). Every
-     * responder of THIS round hears one small packet instead of N
-     * individual confirmations: 'my ack arrived, my direction works,
-     * the sender drew its symmetry conclusion'. The responder-side
-     * bookkeeping (acked_round on the neighbor) makes the packet
-     * exact: only nodes that actually acked this round treat it as
-     * their closure - a non-responder has no open agreement and
-     * ignores it. Airtime: 3 B per ACKED round, versus 3 B per
-     * responder. */
-    if (n->proof_ack_pend) {
-        n->proof_ack_pend = 0;
-        /* the responders' side of the two-sided threshold is already
-         * enforced by their own ack gates (an ack implies a reception
-         * above the gate); our side is enforced per responder by their
-         * reception of THIS packet (weakly received = they ignore it).
-         * The round's acks are therefore all the evidence needed -
-         * the collective PROOF_ACK fires and every responder that
-         * receives it strongly closes its side. */
-        n->proof_ack_best_rq = 0;
-        n->timer(n, MC_HELLO_ACK_WIN_US + MC_HELLO_ACK_JITTER_US + t_ack_us(),
-                 proof_ack_fire, 0);
-    }
-}
-
+/* Collective proof ack (4.2, re-anchored by 4.5): one 3 B packet per
+ * round that collected generalized acks, fired at the end of the ack
+ * window. The responders sit on their home channels - the closure
+ * reaches them there. Every responder of THIS round hears one small
+ * packet instead of N individual confirmations; the responder-side
+ * bookkeeping (acked_round on the neighbor) makes it exact: only
+ * nodes that actually acked treat it as their closure. */
 static void proof_ack_fire(mimeshi_node *n, void *ud) {
     (void)ud;
     uint8_t p[3] = { PKT_PROOF_ACK, 0, 0 };
     wr16(p + 1, n->id);
-    for (uint8_t c = 0; c < MC_N_CHANNELS; c++) {          /* the responders
-        sit on their home channels - the closure reaches them there */
-        bound_send(n, c, p, 3, t_hello_us());             /* 3 B: hello airtime */
+    for (uint8_t c = 0; c < MC_N_CHANNELS; c++) {
+        bound_send(n, c, p, 3, t_hello_us());             /* 3 B airtime */
         ka_called(n, c);
     }
 }
 
-/* Random phase per round. Without jitter the following holds (4.1): nodes
- * that start up simultaneously (e.g. after a power outage) keep exactly
- * synchronous rounds — the intervals double in sync — and never hear
- * each other, because during its own round a node is away from home.
- * Range in hello_jitter_us so the simulation can measure it per
- * scenario (open point 3). */
-static uint64_t hello_jitter(mimeshi_node *n) {
-    return n->hello_jitter_us ? (n->rand(n) % n->hello_jitter_us) : 0;
-}
-
-/* Run a round, double the interval (30 s -> 60 s -> ... -> 1 h) and
- * schedule the next round. The doubling is per (4.1): nodes that have
- * been present longer disturb less. The jitter sits on the timer, not
- * on the round itself. At the maximum (1 h) the startup phase stops
- * (4.1): this tick no longer sends a round and no longer schedules
- * one — from now on the hello only survives as per-channel keepalive
- * (ka_tick below). */
-static void hello_tick(mimeshi_node *n, void *ud) {
-    (void)ud;
-    if (n->hello_interval_us >= MC_HELLO_MAX_US) return;
-    hello_round(n);
-    n->hello_interval_us *= 2;
-    if (n->hello_interval_us > MC_HELLO_MAX_US) n->hello_interval_us = MC_HELLO_MAX_US;
-    n->timer(n, n->hello_interval_us + hello_jitter(n), hello_tick, 0);
+/* Random phase per scheduled own call. Without jitter, nodes that
+ * start up simultaneously (e.g. after a power outage) keep exactly
+ * synchronous proof moments (4.1). Range in round_jitter_us so the
+ * simulation can vary it per scenario. */
+static uint64_t round_jitter(mimeshi_node *n) {
+    return n->round_jitter_us ? (n->rand(n) % n->round_jitter_us) : 0;
 }
 
 /* Proof list for channel c (4.2): type, node-id, then the ids of the
@@ -1178,6 +1133,8 @@ static uint8_t star_fwd_useful(mimeshi_node *n, uint16_t center) {
 
 /* Build and send one star-round chunk (4.5). Return value: number of
  * content stars carried (0 = the chunk still went out, catalogue-only). */
+static int node_lonely(mimeshi_node *n);
+
 static uint8_t star_round_send(mimeshi_node *n) {
     uint8_t p[230];
     uint16_t len = 10;
@@ -1417,7 +1374,11 @@ static uint8_t star_round_send(mimeshi_node *n) {
      * round sets all three carried bits in one blow. */
     {
         int backlog = (queued_left > 0) || (carried >= 8);
-        uint8_t mask = backlog ? 7u : (uint8_t)(1u << rot_ch);
+        /* lonely nodes spread in full (4.5): the accelerated round is the
+         * discovery mechanism - neighbours on all home channels must hear
+         * it, exactly like the old startup hello round */
+        int spread = backlog || node_lonely(n);
+        uint8_t mask = spread ? 7u : (uint8_t)(1u << rot_ch);
         for (uint8_t c = 0; c < MC_N_CHANNELS; c++) {
             if (!(mask & (1u << c))) continue;
             bound_send(n, c, p, len, t_data_us(len));
@@ -1510,6 +1471,8 @@ static void star_miss_clear(mimeshi_node *n, uint16_t star) {
             n->star_miss[i].alive = 0;
 }
 
+static void hello_ack_wait(mimeshi_node *n, uint16_t from, int8_t rssi);
+
 static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t len) {
     if (len < 10) return;
     uint16_t owner = rd16(pkt + 1);      /* the advertiser: miss requests address it */
@@ -1525,7 +1488,16 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
      * routing graph lost edges the knowledge graph still had. */
     if (owner != n->id) {
         mimeshi_neighbor *onb = nbr_find(n, owner);
-        if (onb) onb->last_seen = 0;
+        if (!onb && quality_ok(quality_of(rssi)))
+            onb = nbr_add(n, owner);      /* discovery (4.5): a strongly heard
+                                             round is the identifying
+                                             transmission of a new neighbour;
+                                             weak receptions add nothing */
+        if (onb) {
+            onb->last_seen = 0;
+            onb->quality = quality_of(rssi);
+        }
+        hello_ack_wait(n, owner, rssi);   /* generalized ack trigger (4.5) */
     }
 
     /* --- content area: chunk entry layout, processed via chunk_rx ---
@@ -1709,18 +1681,63 @@ chunk_rx_mode(n, rssi, pkt, cend, 1);   /* entries only: the catalogue and
  * the full interval stands, and the acceleration self-clears at rest
  * (no backlog, no shortening). The hard bound is untouched - the round
  * still sends at most one chunk, just sooner. */
+/* Lonely node (4.5): no confirmed neighbour. Drives the accelerated
+ * full-spread star round - the replacement of the old startup hello
+ * rounds. A fresh node is always lonely; the first confirmation ends
+ * the acceleration (the normal rotation takes over). The cadence
+ * itself doubles per unconfirmed round (star_lonely_ctr, 4.5) so the
+ * acceleration decays even without confirmation. */
+static int node_lonely(mimeshi_node *n) {
+    for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
+        if (n->nbr[i].alive && n->nbr[i].sym) return 0;
+    return 1;
+}
+
 static void star_round_tick(mimeshi_node *n, void *ud) {
     (void)ud;
     n->star_round_sched = 0;
     if (n->tbl_dirty) { n->tbl_dirty = 0; }       /* the round carries mutations (4.3) */
     star_round_send(n);
     n->star_round_sched = 1;
-    uint32_t iv = MC_STAR_ROUND_TICKS;
-    if (n->star_backlog) {
-        uint8_t quiet = 1;
-        for (uint8_t c = 0; c < MC_N_CHANNELS; c++)
-            if (n->ka_idle[c] < MC_STAR_QUIET_TICKS) { quiet = 0; break; }
-        if (quiet && iv / 2 >= MC_STAR_FLOOR_TICKS) iv /= 2;
+    /* Three-way closure, re-anchored (4.5): the star round is the
+     * identifying transmission that collects the generalized acks; at
+     * the end of the ack window one COLLECTIVE proof ack confirms all
+     * responders of this round - but only when acks actually arrived
+     * (a silent round has no agreement to close and no airtime to
+     * spend). Acks arriving after the window stay pending and close
+     * with the next round. */
+    if (n->proof_ack_pend) {
+        n->proof_ack_pend = 0;
+        n->proof_ack_best_rq = 0;
+        n->timer(n, MC_HELLO_ACK_WIN_US + MC_HELLO_ACK_JITTER_US + t_ack_us(),
+                 proof_ack_fire, 0);
+    }
+    /* lonely ladder (4.5): the acceleration is the discovery mechanism,
+     * but it needs the old hello's doubling brake - a node that keeps
+     * failing to confirm (the startup storm, or an isolated node whose
+     * links never clear the quality gate) must not hammer full spread
+     * at the top rate forever. The spacing doubles per round without a
+     * confirmed neighbour, up to the normal cadence; the first
+     * confirmation resets it. Measured without the brake: 5 isolated
+     * nodes produced 7347 bound violations over 120 h at 480 nodes. */
+    uint32_t iv;
+    if (node_lonely(n)) {
+        if (n->star_lonely_ctr == 0) n->star_lonely_ctr = MC_STAR_LONELY_TICKS;
+        iv = n->star_lonely_ctr;
+        if (n->star_lonely_ctr < MC_STAR_ROUND_TICKS) {
+            uint16_t d = (uint16_t)(n->star_lonely_ctr * 2);
+            n->star_lonely_ctr = (uint8_t)(d > MC_STAR_ROUND_TICKS
+                                           ? MC_STAR_ROUND_TICKS : d);
+        }
+    } else {
+        n->star_lonely_ctr = 0;      /* integrated: the ladder is done */
+        iv = MC_STAR_ROUND_TICKS;
+        if (n->star_backlog) {
+            uint8_t quiet = 1;
+            for (uint8_t c = 0; c < MC_N_CHANNELS; c++)
+                if (n->ka_idle[c] < MC_STAR_QUIET_TICKS) { quiet = 0; break; }
+            if (quiet && iv / 2 >= MC_STAR_FLOOR_TICKS) iv /= 2;
+        }
     }
     n->timer(n, iv * MC_KEEPALIVE_TICK_US
              + (n->rand(n) % MC_KEEPALIVE_TICK_US), star_round_tick, 0);
@@ -2301,23 +2318,23 @@ static void proof_tick(mimeshi_node *n, void *ud) {
         if (due) {
             n->ka_idle[c] = 0;              /* reset on scheduling: one packet, no storm */
             n->proof_wait[c] = MC_KEEPALIVE_TICKS;        /* cap: next slot after 1 h */
-            n->timer(n, hello_jitter(n), proof_fire, (void *)(size_t)c);
+            n->timer(n, round_jitter(n), proof_fire, (void *)(size_t)c);
         } else n->proof_wait[c]--;
     }
     n->timer(n, MC_KEEPALIVE_TICK_US, proof_tick, 0);
 }
 
-/* Deliver a hello-ack on the HOME channel of the hello sender (2): the
- * sender is there after its round and catches all answers within the
- * response window. One exchange, then home.
+/* Deliver a hello-ack on the HOME channel of the acked sender (2): the
+ * sender sits there outside its own exchanges and catches answers
+ * within the response window. One exchange, then home.
  *
- * Directional format (5 B): the destination is the hello sender. Only
- * because of that does the ack prove symmetry — the responder received
- * OUR hello (its ack is a reaction to it) and its ack reached us
- * (4.2, 10.1). That is the proof channel of the hello process:
- * available before the first unicast. Eavesdroppers process the sender
- * as a minimal hello ("seen"); the state version is dropped (4.3: no
- * pull anymore). */
+ * Directional format (6 B, 6.2): the destination is the acked sender.
+ * Only because of that does the ack prove symmetry — the responder
+ * received OUR identifying transmission (its ack is a reaction to it)
+ * and its ack reached us (4.2, 10.1). That is the proof channel of the
+ * generalized ack (4.5): available before the first unicast.
+ * Eavesdroppers process the sender as "seen" at most; the state
+ * version is dropped (4.3: no pull anymore). */
 /* Pending hello-ack between wait and fire: the measured quality of the
  * hello travels along to the fire moment (no extra airtime). */
 #define MC_MAX_PENDING_HACKS 8
@@ -2387,28 +2404,35 @@ static void hello_ack_fire(mimeshi_node *n, void *ud) {
  * without a third chance.
  */
 static void hello_ack_wait(mimeshi_node *n, uint16_t from, int8_t rssi) {
-    /* Quality gate (10.1), same threshold as the confirmation: a hello
-     * below it can never become a routing link (our confirmation would
-     * be blocked by the gate, the neighbour's too), so an ack on it is
-     * pure airtime -- and around boundary links it feeds the ack
-     * storm the on-demand scheme is there to prevent. The counter does
-     * not count this transmission: a weak hello is not evidence of a
-     * usable link. */
+    /* Generalized ack gate (4.5): called for every identifying
+     * transmission of a neighbour. Quality gate (10.1), same threshold
+     * as the confirmation: a reception below it can never become a
+     * routing link, so an ack on it is pure airtime -- and around
+     * boundary links it feeds the ack storm the pace gate prevents. */
     if (!quality_ok(quality_of(rssi))) return;
     mimeshi_neighbor *nb = nbr_find(n, from);
-    int ack = 1;                                 /* unknown sender: always ack */
     if (nb) {
         if (nb->sym) {
             if (nb->ack_try >= 3) return;       /* courtesy used up (after 2) */
             nb->ack_try++;
         } else {
-            if (nb->ack_try < 255) nb->ack_try++;   /* counter per neighbor */
-            uint32_t c = nb->ack_try;
-            ack = c <= 16 && (c & (c - 1)) == 0;    /* attempts at counter value 1,2,4,8,16 */
-            if (!ack && c > 16) ack = (n->rand(n) % 16u) == 0;  /* drip: on average 1 in 16 transmissions */
+            /* time-based doubling backoff (4.5): the brake is independent
+             * of the neighbour's transmission volume. After each ack that
+             * does not close the three-way the spacing doubles, up to the
+             * 24 h cap - a permanently one-way link costs one ack per day
+             * at most, whatever the neighbour transmits. The fields are
+             * not read for confirmed links, so no confirmation-site reset
+             * is needed; an expired entry starts fresh (nbr_add). */
+            if (n->tick < nb->ack_next_tick) return;
+            uint16_t sp = nb->ack_spacing ? nb->ack_spacing : 1;
+            nb->ack_next_tick = n->tick + sp;
+            if (sp < MC_ACK_BACKOFF_CAP_TICKS) {
+                sp = (uint16_t)(sp * 2);
+                if (sp > MC_ACK_BACKOFF_CAP_TICKS) sp = MC_ACK_BACKOFF_CAP_TICKS;
+            }
+            nb->ack_spacing = sp;
         }
     }
-    if (!ack) return;
     int norm = (rssi + 128) > 255 ? 255 : (rssi + 128);   /* 0..255 */
     uint32_t span = (uint32_t)(MC_HELLO_ACK_WIN_US - MC_HELLO_ACK_JITTER_US
                              - t_ack_us() - MC_S_SWITCH_US);
@@ -2754,7 +2778,8 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         break;
     }
     case PKT_HELLO_ACK: {
-        n->proof_ack_pend = 1;                 /* this round collected acks (4.2) */
+        uint16_t dst0 = rd16(pkt + 1);
+        if (dst0 == n->id) n->proof_ack_pend = 1;   /* OUR round collected an ack (4.2) */
         /* Directional ack (5 B): destination = the original hello
          * sender.
          *  - Addressed to US: the responder received our hello and
@@ -2805,6 +2830,10 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                 nb->sym = 1; nb->ack_try = 0;          /* confirmed symmetric (4.2, 10.1) */
             }
         }
+        /* no generalized ack on a received ack (4.5): the exchange
+         * closes via the collective proof ack - and acking an ack
+         * would ping-pong forever, because every received ack resets
+         * the receiver's courtesy counter */
         break;
     }
     case PKT_PROOF_ACK: {
@@ -2865,6 +2894,10 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                 }
             }
         }
+        hello_ack_wait(n, from, rssi);       /* generalized ack trigger (4.5):
+                                                the list itself stays reactionless
+                                                for its CONTENT - the sender's
+                                                link state is the ack reason */
         break;
     }
     case PKT_ACK1: {
@@ -2881,6 +2914,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
          * hello-ack proves no symmetry — unaddressed on a shared home
          * channel. */
         uint16_t msg_id = rd16(pkt + 1);
+        hello_ack_wait(n, rd16(pkt + 5), rssi);   /* generalized ack trigger (4.5) */
         for (int i = 0; i < MC_MAX_PENDING; i++) {
             mimeshi_pending *p = &n->pend[i];
             if (p->active && p->msg_id == msg_id && !p->acked1) {
@@ -2943,6 +2977,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
          * travels along (byte 7, 7.4): weigh the own alternatives
          * against what is left, stop when it is gone. */
         uint16_t msg_id = rd16(pkt + 1);
+        hello_ack_wait(n, rd16(pkt + 5), rssi);   /* generalized ack trigger (4.5) */
         for (int i = 0; i < MC_MAX_PENDING; i++) {
             mimeshi_pending *p = &n->pend[i];
             if (p->active && p->acked1 && p->msg_id == msg_id) {
@@ -3122,17 +3157,17 @@ void mimeshi_set_hoptrace(mimeshi_node *n, void *file) { n->hoptrace = file; }
 /* ---------------- init/start ---------------- */
 
 /* Zeroing + filling in the callbacks. The home channel follows from the
- * id (id mod 3, 2). hello_jitter_us gets the firmware default; the
- * simulator may change it before mimeshi_start() to measure the range
- * (open point 3). The node struct lives in core.h so callers can
+ * id (id mod 3, 2). round_jitter_us gets the firmware default; the
+ * simulator may change it before mimeshi_start() to vary the range.
+ * The node struct lives in core.h so callers can
  * reserve it statically — hence the zeroing here. */
 void mimeshi_init(mimeshi_node *n, uint16_t id, mimeshi_tx_fn tx, mimeshi_timer_fn timer,
                 mimeshi_switch_fn sw, mimeshi_rand_fn rnd,
                 mimeshi_channel_free_fn cad, void *user) {
     memset(n, 0, sizeof(*n));
     n->id = id; n->home_ch = (uint8_t)(id % MC_N_CHANNELS);
-    n->local_tbl_ctr = 1; n->hello_interval_us = MC_HELLO_START_US;
-    n->hello_jitter_us = MC_HELLO_JITTER_US;
+    n->local_tbl_ctr = 1;
+    n->round_jitter_us = MC_HELLO_JITTER_US;
     n->tx = tx; n->timer = timer; n->switch_ch = sw; n->rand = rnd; n->user = user;
     n->channel_free = cad;
 }
@@ -3158,17 +3193,18 @@ void mimeshi_set_geo(mimeshi_node *n, uint16_t lat, uint16_t lon) {
 }
 
 void mimeshi_start(mimeshi_node *n) {
-    hello_round(n);
     proof_stagger(n);
-    /* random phase: prevents synchronous rounds on simultaneous startup (4.1) */
-    n->timer(n, n->hello_interval_us + hello_jitter(n), hello_tick, 0);
     /* proof tick: time base for keepalive + symmetry flush (4.1, 4.2) */
     n->timer(n, MC_KEEPALIVE_TICK_US, proof_tick, 0);
-    /* star round (4.3): the uniform convergence cadence - the first
-     * round after a random phase so simultaneous boots do not sync. */
+    /* star round (4.3, 4.5): the uniform convergence cadence AND the
+     * discovery mechanism. A fresh node is lonely (no confirmed
+     * neighbour), so the first round rides the accelerated interval:
+     * a random phase within it prevents synchronous rounds on
+     * simultaneous startup - the old hello jitter, now on the star
+     * round (4.1). */
     n->star_own_ctr = 0;
     n->star_tick = 0;
     n->star_round_sched = 1;
-    n->timer(n, (n->rand(n) % MC_STAR_ROUND_TICKS) * MC_KEEPALIVE_TICK_US,
+    n->timer(n, (n->rand(n) % MC_STAR_LONELY_TICKS) * MC_KEEPALIVE_TICK_US,
              star_round_tick, 0);
 }

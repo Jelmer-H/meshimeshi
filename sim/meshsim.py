@@ -13,7 +13,7 @@ Scenarios are registered with @scenario("name") and run with:
   .venv/bin/python sim/meshsim.py <name> [-q] [--jitter US]
 New scenarios: add a function with an (mk, jitter) signature, where
 mk(node) builds the C protocol core (CCore; there is no other core) and
-jitter is the max hello phase jitter in microseconds (None = core value).
+jitter is the max random phase per scheduled own call in microseconds (None = core value).
 """
 import argparse, ctypes, math, os, sys
 
@@ -82,10 +82,11 @@ def out(*a):
     print(*a, flush=True)
 
 def set_jitter(core, jitter_us):
-    """Sets the max hello phase jitter on the core (before start). None or
-    a negative value leaves the core value in place (MC_HELLO_JITTER_US = 1 s)."""
+    """Sets the max random phase per scheduled own call on the core (before
+    start). None or a negative value leaves the core value in place
+    (MC_HELLO_JITTER_US = 1 s)."""
     if jitter_us is not None and jitter_us >= 0:
-        core.mn.hello_jitter_us = jitter_us
+        core.mn.round_jitter_us = jitter_us
     return core
 
 def report(radio):
@@ -236,9 +237,13 @@ def star_line(mk, jitter):
     out(f"(aggregate: content stars total {st.summary()['content']}, "
         f"rounds {st.summary()['rounds']}, missed requests {st.summary()['missed']})")
 
-@scenario("link-test", "2 nodes: hellos, unicast A->B and B->A with ack1/ack2/ack3")
+@scenario("link-test", "2 nodes: discovery, unicast A->B and B->A with ack1/ack2/ack3")
 def link_test(mk, jitter):
-    """Same scenario as sim1.py: also serves as the equivalence check of the engines."""
+    """Same scenario as sim1.py: also serves as the equivalence check of the
+    engines. Discovery rides the accelerated lonely star round (4.5): the
+    first round comes within ~5 min (random phase), full spread, the
+    generalized acks and the collective proof ack close both sides - so
+    the unicasts wait for the first confirmed neighbour."""
     radio = Radio()
     a = Node(radio, 0x0100)   # home channel 1
     b = Node(radio, 0x0101)   # home channel 2
@@ -246,53 +251,28 @@ def link_test(mk, jitter):
 
     a.core.start()
     radio.schedule(500_000, b.core.start)   # start offset: no overlap between
-    radio.run(until_us=1_500_000)           # the first rounds (see sim1.py)
+    radio.run(until_us=700_000_000)         # the first rounds (see sim1.py);
+                                            # ~2 accelerated rounds: discovery
+                                            # + generalized acks + proof ack
 
-    out("\n--- unicast A -> B (A knows B from the hello round) ---")
+    out("\n--- unicast A -> B (A knows B from the accelerated round) ---")
     a.core.send_data(0x0101, "hello mesh", ack3=True)
-    radio.run(until_us=3_000_000)          # hello-ack from A shows B the map
+    radio.run(until_us=3_000_000)
 
-    out("\n--- unicast B -> A (after hello-ack: B knows A) ---")
+    out("\n--- unicast B -> A (after the exchanged evidence) ---")
     b.core.send_data(0x0100, "reply message", ack3=True)
-    radio.run(until_us=50_000_000)         # second hello rounds (30 s + jitter)
+    radio.run(until_us=50_000_000)
     report(radio)
-
-@scenario("hello-interval", "2 nodes, 95 s: adaptive hello interval 30 s -> 60 s -> ...")
-def hello_interval(mk, jitter):
-    radio = Radio()
-    a = Node(radio, 0x0100)
-    b = Node(radio, 0x0101)
-    a.core = set_jitter(mk(a), jitter); b.core = set_jitter(mk(b), jitter)
-    a.core.start()
-    radio.schedule(500_000, b.core.start)
-    radio.run(until_us=95_000_000)         # rounds 2 (30 s) and 3 (60 s) + jitter
-    report(radio)
-
-@scenario("jitter-sweep", "2 nodes, 1000 s: round sync against the jitter range (open point 3)")
-def jitter_sweep(mk, _jitter):
-    """Measures per jitter range how many hellos a node hears and misses
-    from the other (own round / away from home). Preparation for scenario 2;
-    the CLI jitter stands outside this, the sweep determines it itself."""
-    out(f"{'jitter':>9s} {'A hears':>8s} {'A misses':>8s} {'B hears':>8s} {'B misses':>8s}")
-    for j in (0, 100_000, 500_000, 1_000_000, 5_000_000):
-        radio = Radio()
-        a = Node(radio, 0x0100); b = Node(radio, 0x0101)
-        a.core = set_jitter(mk(a), j); b.core = set_jitter(mk(b), j)
-        a.core.start()
-        radio.schedule(137_000, b.core.start)
-        radio.run(until_us=1_000_000_000) # rounds up to ~930 s (30-60-120-240-480 s)
-        out(f"{j/1e6:>9.3f} {a.hello_rx:>8d} {a.hello_missed:>8d} "
-            f"{b.hello_rx:>8d} {b.hello_missed:>8d}")
 
 @scenario("newcomer", "stable R1/R2 + newcomer at 5 s: who proves symmetry and when")
 def newcomer(mk, jitter):
-    """Demonstrates the proof asymmetry after startup (4.2/4.3): the
-    newcomer N gets its symmetry proofs within seconds (acks on its own
-    round, addressed to it); the responders R1/R2 then still have N as
-    "seen". Their reverse-direction proof only comes via the hello
-    process — N acks their round 2 at ~30 s — or later via the startup
-    pull (4.3, building block 2). N only exists from t=5 s, so round 1
-    of R1/R2 is genuinely missed."""
+    """Demonstrates the discovery timeline of 4.5: the newcomer N
+    star-rounds accelerated and in full spread; the responders
+    generalize-ack its rounds and their collective proof ack closes N's
+    side, while N's own star (naming them, once confirmed) closes
+    theirs. The first accelerated round comes within ~5 min (random
+    phase), so the checkpoints sit at 300/600/900 s. N only exists from
+    t=5 s, so the first rounds of R1/R2 are genuinely missed."""
     radio = Radio()
     r1 = Node(radio, 0x0100)   # home 1
     r2 = Node(radio, 0x0101)   # home 2
@@ -316,10 +296,10 @@ def newcomer(mk, jitter):
     r1.core.start()
     radio.schedule(500_000, r2.core.start)
     radio.schedule(5_000_000, start_newcomer)
-    radio.schedule(10_000_000, lambda: symstatus("t=10 s, after acks on the newcomer"))
-    radio.schedule(40_000_000, lambda: symstatus("t=40 s, after round 2 (hello process)"))
-    radio.schedule(100_000_000, lambda: symstatus("t=100 s, after round 3"))
-    radio.run(until_us=100_000_000)
+    radio.schedule(300_000_000, lambda: symstatus("t=300 s, after the first accelerated rounds"))
+    radio.schedule(600_000_000, lambda: symstatus("t=600 s, after the second wave"))
+    radio.schedule(900_000_000, lambda: symstatus("t=900 s, steady"))
+    radio.run(until_us=900_000_000)
     report(radio)
 
 
@@ -329,9 +309,9 @@ def newcomer_traffic(mk, jitter):
     from 4.1): the whole net runs with unicast load; a newcomer with
     its own links joins at --join-at seconds and has to discover the
     net under that load. Measures per newcomer: the time to the first
-    confirmed symmetric neighbor (startup hellos + hello-acks), the
-    time to full confirmation, how much of the running load it missed
-    (missed hellos), and whether its arrival disturbs the running
+    confirmed symmetric neighbor (accelerated star rounds +
+    generalized acks, 4.5), the time to full confirmation, how much of
+    the running load it missed, and whether its arrival disturbs the running
     delivery (ratio before/after). CLI: --nodes --duration --rate
     --payload --join-at (seconds, default 5400 = 1.5 h)."""
     nodes_list = load_nodes_csv(_ARGS.nodes)
