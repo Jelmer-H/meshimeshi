@@ -43,13 +43,15 @@
 /* ---------------- configuration (firmware constants) ----------------
  * Values and status live in the design document; change them there first
  * (working rule: design -> core -> ctest + sim1.py grow along). */
-#define MC_ACK_BACKOFF_CAP_TICKS 1536u     /* pace cap (4.5): 24 h in proof ticks */
+#define MC_ACK_BACKOFF_CAP_TICKS 1440u     /* pace cap (4.5): 24 h in proof ticks
+                                              (1 tick = 1 min) */
 #define MC_STAR_LONELY_TICKS 5u            /* accelerated round interval while the
                                               node has no confirmed neighbour (4.5):
-                                              ~5 min, full spread */
-#define MC_HELLO_MAX_US    3600000000ull   /* 1 h stable (4.1); = T_keepalive */
-#define MC_KEEPALIVE_TICKS 64u             /* silence ticks = T_keepalive (4.1) */
-#define MC_KEEPALIVE_TICK_US (MC_HELLO_MAX_US / MC_KEEPALIVE_TICKS)  /* ~56 s: the time base without a clock */
+                                              5 min, full spread */
+#define MC_MIN_US          60000000ull     /* 1 minute in us - the human time unit */
+#define MC_KEEPALIVE_TICK_US MC_MIN_US      /* the time base without a clock: 1 tick = 1 min */
+#define MC_KEEPALIVE_TICKS 60u             /* silence ticks = T_keepalive = 1 h (4.1) */
+#define MC_HELLO_MAX_US    (MC_KEEPALIVE_TICKS * MC_KEEPALIVE_TICK_US)  /* 1 h stable (4.1); = T_keepalive */
 #define MC_HELLO_JITTER_US 1000000ull      /* random phase per round (4.1, open point 3) */
 #define MC_HELLO_ACK_WIN_US 3000000ull     /* max response time hello-acks: 3 s (2) */
 #define MC_HELLO_ACK_JITTER_US (MC_HELLO_ACK_WIN_US / 16u)  /* ~187 ms, > t_ack + S (2) */
@@ -413,7 +415,7 @@ static void proof_fire(mimeshi_node *n, void *ud) {
  * restarts at MC_KEEPALIVE_TICKS (= 1 h) on every fire: that is the cap,
  * one proof list per channel per hour maximum.
  */
-#define MC_PROOF_ROT_TICKS (MC_KEEPALIVE_TICKS / MC_N_CHANNELS)  /* 20 min in ticks (4.2) */
+#define MC_PROOF_ROT_TICKS (MC_KEEPALIVE_TICKS / MC_N_CHANNELS)  /* 20 min = 20 ticks (4.2) */
 
 /* ---------------- 2-hop map and link store (4.3, 10.1) --------
  * The map holds every node we know: direct neighbours (alive in the
@@ -422,7 +424,7 @@ static void proof_fire(mimeshi_node *n, void *ud) {
  * class). Both are bounded (13.2): full = the entry is dropped with a
  * message, never silently. */
 
-/* Effective age of a map entry in full proof ticks (~56 s each),
+/* Effective age of a map entry in full proof ticks (1 min each),
  * uncapped for internal comparisons (4.4); on air the age byte caps at
  * 255 (~4 h) - anything older advertises simply as expired. */
 static uint32_t map_age_ticks(mimeshi_node *n, mimeshi_mapnode *m) {
@@ -1012,21 +1014,21 @@ uint8_t mimeshi_star_digest(uint8_t content_hash, uint8_t tick) {
  * advance (1..k_max), 0 for an exact same-tick match, or -1 when no
  * k fits (real content change, or a star we do not have). */
 /* ---- star round (4.5, proposal): the uniform convergence cadence --- */
-/* One chunk per interval (starting value 15 min = 16 proof ticks of
- * ~56 s), all three channels like the re-share round. Content first
+/* One chunk per interval (starting value 15 min = 15 proof ticks of
+ * 1 min), all three channels like the re-share round. Content first
  * (stars that changed since they were last forwarded, nearest hops
  * first, the own star at the front), catalogue in the remaining space
  * ((node id, digest) at 3 B per star). Hard bound: never more than
  * one chunk per node per interval, whatever happens (4.5). The own
  * star travels in full at least once per hour regardless of its
  * queue position (4.5): the guaranteed own-star round. */
-#define MC_STAR_ROUND_TICKS   16u    /* 15 min interval in proof ticks */
+#define MC_STAR_ROUND_TICKS   15u    /* 15 min interval in proof ticks (1 min each) */
 #define MC_STAR_FLOOR_TICKS    5u     /* quiet-hour floor: 5 min (6e) - the interval
                                        may shorten to this when there is work and
                                        the channels are quiet */
 #define MC_STAR_QUIET_TICKS    4u     /* a channel is quiet for the acceleration
                                        gate when its ka_idle counter stands at
-                                       4+ proof ticks (~4 min without any own
+                                       4+ proof ticks (4 min without any own
                                        identifying reception, 6e) */
 #define MC_STAR_ROUNDS_PER_H  4u     /* 60 min / 15 min: own-star bound */
 #define MC_STAR_CAT_RESERVE   30u     /* catalogue bytes reserved per round (4.5):
@@ -1424,9 +1426,9 @@ static uint8_t star_round_send(mimeshi_node *n) {
  * saw riding in the star's age byte - stored per map entry.
  */
 #define MC_STAR_K_MAX 8u        /* tick-lag window (4.3, starting value) */
-#define MC_STAR_DEAD_TICKS 385u  /* liveness threshold (4.4): a star whose origin
-                                   tick has not advanced for ~6 h of proof ticks
-                                   is dead - de-weighted at half, evicted at the
+#define MC_STAR_DEAD_TICKS 360u  /* liveness threshold (4.4): a star whose origin
+                                   tick has not advanced for 6 h of 1-min proof
+                                   ticks is dead - de-weighted at half, evicted at the
                                    threshold, whatever the forwarded copies say */
 
 static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
@@ -1784,7 +1786,7 @@ static const uint16_t mc_etx_class[8] = {
 };
 
 /* Age multiplier on an edge endpoint: follows the effective age of the
- * map entry (4.4), in proof ticks (~56 s). Returns 2 = 1.5x, 3 = 3x. */
+ * map entry (4.4), in proof ticks (1 min). Returns 2 = 1.5x, 3 = 3x. */
 static uint16_t route_age_mult(uint32_t age) {
     if (age >= MC_T_ACTIVE_TICKS) return 3;
     if (age >= MC_T_ACTIVE_TICKS / 2) return 2;
@@ -2285,7 +2287,7 @@ static void nbr_expire(mimeshi_node *n) {
 
 static void proof_tick(mimeshi_node *n, void *ud) {
     (void)ud;
-    n->tick++;                                 /* local time base, ~56 s per tick (4.4) */
+    n->tick++;                                 /* local time base, 1 min per tick (4.4) */
     nbr_expire(n);                             /* death detection (4.4) */
     /* map aging (4.4): an entry nobody has refreshed anymore dies at
      * 2 x T_active (~24 h) - after that it is stale beyond every

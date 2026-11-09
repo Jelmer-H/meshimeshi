@@ -135,13 +135,13 @@ int main(void) {
     assert(star_cnt_A[0] >= 1 && star_cnt_A[1] >= 1 && star_cnt_A[2] >= 1);
     assert(star_cnt_B[0] >= 1 && star_cnt_B[1] >= 1 && star_cnt_B[2] >= 1);
     /* Assert 1b (4.5): the lonely ladder doubles per unconfirmed round:
-     * gap 1 = 5 ticks (~281 s, round 2 at ~394 s), gap 2 = 10 ticks
-     * (~562 s, round 3 at ~956 s), then the 16-tick cap. Nothing has
+     * gap 1 = 5 ticks (300 s, round 2 at ~420 s), gap 2 = 10 ticks
+     * (600 s, round 3 at ~1020 s), then the 15-tick cap. Nothing has
      * confirmed yet, so both nodes ride the whole ladder. */
     pump_until(1600000000);
     assert(star_cnt_A[0] == 3 && star_cnt_A[1] == 3 && star_cnt_A[2] == 3);
     assert(star_cnt_B[0] == 3 && star_cnt_B[1] == 3 && star_cnt_B[2] == 3);
-    assert(A.star_lonely_ctr == 16);         /* at the cap: the normal cadence
+    assert(A.star_lonely_ctr == 15);         /* at the cap: the normal cadence
                                                 (MC_STAR_ROUND_TICKS lives in core.c) */
     /* B confirms A (below): the ladder resets lazily in the round tick -
      * B's next round runs at the normal cadence again. Checked after
@@ -182,7 +182,7 @@ int main(void) {
             if (B.nbr[i].alive && B.nbr[i].id == 0x0102) sym = B.nbr[i].sym;
         assert(sym == 1);                     /* confirmed via the hello-ack */
         /* the lonely ladder reset is lazy: it happens in B's next round
-         * tick (MC_STAR_ROUND_TICKS after round 3, ~1856 s). Pump there
+         * tick (MC_STAR_ROUND_TICKS after round 3, ~1920 s). Pump there
          * and check the reset plus the normal cadence. */
         pump_until(2000000000);              /* past B's first integrated round */
         assert(B.star_lonely_ctr == 0);      /* integrated: ladder reset */
@@ -386,7 +386,7 @@ int main(void) {
     /* Assert 8 (4.5): the pace gate is a time-based doubling backoff.
      * A "seen" neighbour (never confirmed) gets one generalized ack,
      * then the next waits twice as long - on the proof-tick time base
-     * (~56 s): ack, blocked within the same tick, free again one tick
+     * (1 min): ack, blocked within the same tick, free again one tick
      * later, blocked for two ticks, and so on. The brake is time, not
      * a transmission counter: injecting in quick succession must not
      * pull more acks out. */

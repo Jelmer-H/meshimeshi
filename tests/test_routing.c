@@ -334,11 +334,11 @@ int main(void) {
     }
 
     /* Test 3: age multiplier (10.2). Let proof ticks pass so every
-     * entry ages above half of T_active (~6 h = 385 ticks of ~56 s);
+     * entry ages above half of T_active (6 h = 360 ticks of 1 min);
      * then refresh ONLY D's path (fresh age). C's entries stay old:
      * the C-route costs 1.5x and D wins. */
-    mimeshi_start(&A);                       /* starts the proof tick (~56 s) */
-    pump_until(400 * 60000000ull);            /* ~6.3 h: C and D entries now stale */
+    mimeshi_start(&A);                       /* starts the proof tick (1 min) */
+    pump_until(400 * 60000000ull);            /* 400 ticks = 6.7 h: C and D entries now stale */
     /* D comes back as a confirmed neighbour the way the protocol does
      * it: a hello ack addressed to us (4.2) - neighbour freshness is
      * the hello/ack/traffic path, not a star reception. C stays
