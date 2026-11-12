@@ -33,8 +33,19 @@ Protocol core in C for repeaters/companions + Python simulator. See
 ```
 meshimeshi/
 ├── core/            # protocol core: platform-independent, no dynamic allocation
-│   ├── core.h       #   API + hardware interface (tx / timer / switch / RNG)
-│   └── core.c       #   discovery (5.3), neighbor table, acks, unicast, budget, switch rule
+│   ├── core.h       #   public API + hardware interface (tx / timer / switch / RNG)
+│   ├── internal.h   #   module map + cross-module declarations (internal)
+│   ├── config.h     #   firmware constants, airtime classes (internal)
+│   ├── pkt.h        #   packet types/formats (internal)
+│   ├── nbr.c        #   neighbor table, quality model, dedup (5.1/5.2)
+│   ├── bound.c      #   exchange: bound pool + switch rule (2)
+│   ├── proof.c      #   discovery evidence: proof lists, hello-ack, tick (5.2/5.3)
+│   ├── map.c        #   2-hop map (constellation), link store, chunks (6.1/6.2)
+│   ├── star.c       #   star canonicalisation, digests, beat match (5.3)
+│   ├── star_round.c #   the uniform convergence cadence (5.3)
+│   ├── route.c      #   ETX route computation, bridge rule (7.1/10.2)
+│   ├── unicast.c    #   unicast + acks, attempt schedule (7/8)
+│   └── core.c       #   reception dispatch, init/start (public entry points)
 ├── sim/             # simulator (event-driven virtual radio, SF7/62.5 kHz)
 │   ├── sim1.py      #   platform layer (clock/radio/RNG) + link-test scenario
 │   └── meshsim.py   #   simpy engine + scenario registry (reuses sim1.py)
@@ -54,8 +65,8 @@ cmake --build build
 ctest --test-dir build            # link test on the C core
 
 # or without cmake:
-gcc -O2 -fPIC -shared -DMC_BOUND_POOL=8192 core/core.c -o build/libmimeshi.so -I.
-gcc -O2 -Wall -Wextra -Werror -I. tests/test_link_test.c core/core.c -o build/test_link_test
+gcc -O2 -fPIC -shared -DMC_BOUND_POOL=8192 core/*.c -o build/libmimeshi.so -I.
+gcc -O2 -Wall -Wextra -Werror -I. tests/test_link_test.c core/*.c -o build/test_link_test
 # (the pool flag: the simulator shares the C core between all nodes of the
 #  scenario; firmware builds without it and gets the compact pool)
 
