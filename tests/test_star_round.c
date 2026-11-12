@@ -1,18 +1,18 @@
 /*
- * test_star_round.c — the uniform star round (4.5, step 3: sender side).
+ * test_star_round.c — the uniform star round (5.3, step 3: sender side).
  *
  * Three nodes in a line (A - B - C) on the mini virtual radio. The
  * star round is enabled only on B, so the test observes exactly what
  * the round of ONE node does, without cross-talk of the others:
  *
  *  - hard bound: at most one star-round chunk per interval per node,
- *    on all three channels per round (the 4.5 constructive bound);
+ *    on all three channels per round (the 5.3 constructive bound);
  *  - content priority: the own star travels first; mutations are
  *    carried by the next round (no separate delta path needed);
  *  - own-star guarantee: within one hour of rounds the own star has
  *    traveled in full at least once, even when nothing changed;
- *  - heartbeat tick: the own star's age byte advances at the
- *    guaranteed own-star round (the tick of 4.5);
+ *  - beat: the own star's age byte advances at the
+ *    guaranteed own-star round (the tick of 5.3);
  *  - catalogue: the remaining space carries (node id, digest) pairs.
  */
 #include <stdio.h>
@@ -69,7 +69,7 @@ static bool vrcad(mimeshi_node *n, uint8_t ch) { (void)n; (void)ch; return true;
 
 static uint16_t t_rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 
-/* One hour of simulated time. The round interval is 15 proof ticks of
+/* One hour of simulated time. The round interval is 15 ticks of
  * 1 min = 900 s; an hour holds 4 rounds (the own-star bound). */
 #define TICK_US 60000000ull
 #define INTERVAL_US (15ull * TICK_US)
@@ -164,7 +164,7 @@ int main(void) {
     }
     assert(own_star_seen >= 2);                  /* the own star: the guaranteed
                                                    home-channel round fires ~1x per
-                                                   hour (4.3 rotation coupling) */
+                                                   hour (6.1 rotation coupling) */
     assert(catalogue_seen > 0);                  /* the catalogue rides along */
 
     /* own-star guarantee: within each hour of rounds the own star
@@ -184,9 +184,9 @@ int main(void) {
         assert(in_hour);                         /* guaranteed own-star round */
     }
 
-    /* heartbeat tick: the own star's age byte in the LAST round it
+    /* beat: the own star's age byte in the LAST round it
      * appeared in is >= the one in the FIRST - it advances per
-     * guaranteed own-star round (4.5). */
+     * guaranteed own-star round (5.3). */
     {
         int first = -1, last = -1;
         for (int k = 0; k < star_rec_n; k++) {
@@ -201,21 +201,21 @@ int main(void) {
             }
         }
         assert(first >= 0 && last >= 0);
-        uint8_t tick_first = 0, tick_last = 0;
+        uint8_t beat_first = 0, beat_last = 0;
         uint16_t off = 10;
         for (uint8_t e = 0; e < star_rec[first].pkt[4]; e++) {
-            if (t_rd16(star_rec[first].pkt + off) == 0x0101) tick_first = star_rec[first].pkt[off + 3];
+            if (t_rd16(star_rec[first].pkt + off) == 0x0101) beat_first = star_rec[first].pkt[off + 3];
             off += 9 + 3 * star_rec[first].pkt[off + 8];
         }
         off = 10;
         for (uint8_t e = 0; e < star_rec[last].pkt[4]; e++) {
-            if (t_rd16(star_rec[last].pkt + off) == 0x0101) tick_last = star_rec[last].pkt[off + 3];
+            if (t_rd16(star_rec[last].pkt + off) == 0x0101) beat_last = star_rec[last].pkt[off + 3];
             off += 9 + 3 * star_rec[last].pkt[off + 8];
         }
-        assert(tick_last > tick_first);          /* the tick advances */
+        assert(beat_last > beat_first);          /* the beat advances */
     }
 
-    /* content-hash queue (4.5): the far star 0x0301 never changes
+    /* content-hash queue (5.3): the far star 0x0301 never changes
      * after its first carry - it must travel as CONTENT exactly once
      * per channel, never again; its later presence is catalogue only. */
     {
@@ -232,7 +232,7 @@ int main(void) {
         assert(far_content == 3);              /* once, on each of the 3 channels */
     }
 
-    /* catalogue reserve (4.5): a heavy content backlog must not push
+    /* catalogue reserve (5.3): a heavy content backlog must not push
      * the catalogue out of the chunk - the last 30 B stay free for
      * (id, digest) entries, the heartbeat of the resting map. Fill B's
      * queue with far stars (many changed stars, thick backlog) and

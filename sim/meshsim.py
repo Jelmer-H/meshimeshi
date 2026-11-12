@@ -32,8 +32,8 @@ class Radio:  # simpy version of the virtual radio; interface equal to sim1.Radi
         self.nodes = {}        # id -> Node
         self.airtime = [0]*N_CH
         self.hello_air = [0]*N_CH   # airtime of hellos (type 1) per channel
-        self.star_air = [0]*N_CH    # airtime of star rounds (type 10) per channel (4.5)
-        self.star_stats = StarStats()  # star-round measurement (4.5, scenario 6)
+        self.star_air = [0]*N_CH    # airtime of star rounds (type 10) per channel (5.3)
+        self.star_stats = StarStats()  # star-round measurement (5.3, scenario 6)
         self.ack_air = [0]*N_CH     # airtime of hello-acks (type 2) per channel
         self.duty = DutyLedger()
         self.wire = Wire()
@@ -103,12 +103,12 @@ def report(radio):
             + (f", confirmed symmetric {sym}" if sym is not None else ""))
 
 def star_report(radio):
-    """Star-round measurements (4.5, scenario 6): per-node round counts,
+    """Star-round measurements (5.3, scenario 6): per-node round counts,
     the three areas (content stars / catalogue entries / missed requests),
     airtime per channel and the hard-bound check."""
     st = radio.star_stats
     s = st.summary()
-    out("\n=== Star-round measurements (4.5) ===")
+    out("\n=== Star-round measurements (5.3) ===")
     out(f"nodes with rounds: {s['nodes']}, rounds: {s['rounds']}, "
         f"content stars: {s['content']}, catalogue entries: {s['catalogue']}, "
         f"missed requests: {s['missed']}")
@@ -120,7 +120,7 @@ def star_report(radio):
         out(f"  node {v[0]:#06x}: rounds at {v[1]/1e6:.1f}s and {v[2]/1e6:.1f}s")
 
 @scenario("star-round", "2 nodes with the star round enabled: first rounds, "
-                        "own star, catalogue and heartbeat tick (4.5, 6a warm-up)")
+                        "own star, catalogue and beat (5.3, 6a warm-up)")
 def star_round(mk, jitter):
     radio = Radio()
     a = Node(radio, 0x0100)
@@ -140,16 +140,16 @@ def star_round(mk, jitter):
 
 @scenario("star-line", "10 nodes in a line, 4 km spacing, only adjacent "
                        "neighbours audible: tick propagation, remote liveness "
-                       "and duplicate work over 9 hops (4.5, 6a multi-hop)")
+                       "and duplicate work over 9 hops (5.3, 6a multi-hop)")
 def star_line(mk, jitter):
-    """Scenario 6a multi-hop (4.5). A line of 10 nodes at 10 m height,
+    """Scenario 6a multi-hop (5.3). A line of 10 nodes at 10 m height,
     4 km apart: adjacent pairs at ~-107 dBm (well above the -110
     threshold), two hops (8 km) at ~-113 dBm - inaudible. So every node
     has exactly one symmetric neighbour on each side (ends: one).
 
     Measures over ~6 simulated hours (with the 15-min round: ample
     room for a tick of node 0's own star to reach node 9 in 9 hops):
-      - tick propagation: the star_tick of node 0's star as seen by
+      - tick propagation: the star_beat of node 0's star as seen by
         every node, hop by hop (expect: latest tick, within the
         k-window, arrived within ~hop x interval);
       - remote liveness: the effective age of node 0's star everywhere
@@ -240,7 +240,7 @@ def star_line(mk, jitter):
 @scenario("link-test", "2 nodes: discovery, unicast A->B and B->A with ack1/ack2/ack3")
 def link_test(mk, jitter):
     """Same scenario as sim1.py: also serves as the equivalence check of the
-    engines. Discovery rides the accelerated lonely star round (4.5): the
+    engines. Discovery rides the accelerated lonely star round (5.3): the
     first round comes within ~5 min (random phase), full spread, the
     generalized acks and the collective proof ack close both sides - so
     the unicasts wait for the first confirmed neighbour."""
@@ -266,7 +266,7 @@ def link_test(mk, jitter):
 
 @scenario("newcomer", "stable R1/R2 + newcomer at 5 s: who proves symmetry and when")
 def newcomer(mk, jitter):
-    """Demonstrates the discovery timeline of 4.5: the newcomer N
+    """Demonstrates the discovery timeline of 5.3: the newcomer N
     star-rounds accelerated and in full spread; the responders
     generalize-ack its rounds and their collective proof ack closes N's
     side, while N's own star (naming them, once confirmed) closes
@@ -305,12 +305,12 @@ def newcomer(mk, jitter):
 
 @scenario("newcomer-traffic", "local-net + traffic: newcomer joins a loaded running network")
 def newcomer_traffic(mk, jitter):
-    """Variant on the traffic scenario (14.1 scenario 2, plus the risk
-    from 4.1): the whole net runs with unicast load; a newcomer with
+    """Variant on the traffic scenario (12.1 scenario 2, plus the risk
+    from 5.1): the whole net runs with unicast load; a newcomer with
     its own links joins at --join-at seconds and has to discover the
     net under that load. Measures per newcomer: the time to the first
     confirmed symmetric neighbor (accelerated star rounds +
-    generalized acks, 4.5), the time to full confirmation, how much of
+    generalized acks, 5.3), the time to full confirmation, how much of
     the running load it missed, and whether its arrival disturbs the running
     delivery (ratio before/after). CLI: --nodes --duration --rate
     --payload --join-at (seconds, default 5400 = 1.5 h)."""
@@ -438,7 +438,7 @@ def grid_geo(lat, lon):
     every node in the NL world) to 65535: geo-greedy then navigated on
     latitude alone - longitude differences were invisible (dist2 saw
     dlon=0 for every pair). Found via the 6162 forensics: 111,444 of
-    122,777 dumped pool entries had lon=65535."""
+    122,777 dumped constellation entries had lon=65535."""
     la = int((lat + 90.0) / 180.0 * 65536)
     lo = int((lon + 180.0) / 360.0 * 65536)
     return max(1, min(65535, la)), max(1, min(65535, lo))
@@ -447,7 +447,7 @@ _ARGS = None   # CLI context for scenarios (local-net reads --nodes/--duration)
 
 @scenario("local-net", "GPS node list (position+height) -> link budget; hello/ack measurement")
 def local_net(mk, jitter):
-    """Design 14.1 scenario 2: 30-50 nodes at real density. Measures
+    """Design 12.1 scenario 2: 30-50 nodes at real density. Measures
     hello and ack airtime (startup vs stable), ack collisions, and the
     seen/confirmed ratio (symmetry), plus duty cycle (10%/hour)."""
     nodes_list = load_nodes_csv(_ARGS.nodes)
@@ -461,7 +461,7 @@ def local_net(mk, jitter):
     for i, nd in enumerate(nodes_list):
         kn = Node(radio, nd['id'])
         kn.core = set_jitter(mk(kn), jitter)
-        kn.core.set_geo(*grid_geo(nd['lat'], nd['lon']))   # published geo (5, 4.3)
+        kn.core.set_geo(*grid_geo(nd['lat'], nd['lon']))   # published geo (5, 6.1)
         nodes.append(kn)
         radio.schedule(i * 250_000, kn.core.start)   # never start synchronously
     ids = [n['id'] for n in nodes_list]
@@ -485,7 +485,7 @@ def local_net(mk, jitter):
         f"average degree {sum(degree.values())/len(ids):.1f}, "
         f"min {min(degree.values())}, max {max(degree.values())}")
     phase = {}
-    def phase_border():   # after the startup rounds (last at ~1890 s); after that only keepalive (4.1)
+    def phase_border():   # after the startup rounds (last at ~1890 s); after that only keepalive (5.1)
         phase.update(air=radio.airtime[:], hello=radio.hello_air[:],
                      ack=radio.ack_air[:], t=radio.now)
     radio.schedule(3_700_000_000, phase_border)
@@ -527,7 +527,7 @@ def local_net(mk, jitter):
 
 @scenario("collision", "3 nodes: synchronous hellos collide; capture at >= 6 dB difference")
 def collision(mk, jitter):
-    """Power outage case (design 4.1): A and B share a home channel and
+    """Power outage case (design 5.1): A and B share a home channel and
     start exactly synchronously (jitter 0) — their hellos overlap on all
     three channels. Round 1: equal strength, so C loses both (collision).
     Round 2: B is >= 6 dB stronger at C, so C captures B's hello and
@@ -538,7 +538,7 @@ def collision(mk, jitter):
     c = Node(radio, 0x0103)   # home 1 — hears A and B on channel 1
     a.core = set_jitter(mk(a), 0); b.core = set_jitter(mk(b), 0)
     c.core = set_jitter(mk(c), jitter)
-    a.core.start(); b.core.start()   # exactly simultaneous: the 4.1 edge case
+    a.core.start(); b.core.start()   # exactly simultaneous: the 5.1 edge case
     radio.schedule(500_000, c.core.start)
     out("\n--- round 1: equal strength (default -60) -> collisions at C ---")
     radio.run(until_us=1_000_000)
@@ -549,21 +549,21 @@ def collision(mk, jitter):
     report(radio)
 
 
-@scenario("star-rest", "scenario 6c (4.3): utrecht40 at rest, one node silenced mid-run - "
-                         "rest behaviour, freshness and remote liveness (tick stall and death)")
+@scenario("star-rest", "scenario 6c (6.1): utrecht40 at rest, one node silenced mid-run - "
+                         "rest behaviour, freshness and remote liveness (beat stall and death)")
 def star_rest(mk, jitter):
-    """Design 4.3/4.4 scenario 6c. The uniform cadence at rest:
+    """Design 6.1/6.2 scenario 6c. The uniform cadence at rest:
       - rest behaviour: content drains to ~0, the catalogue carries
         the maintenance (fill measured per 6-h block via star_stats);
       - freshness: the effective age of the map entries must stay far
         from the 24 h eviction while the origins live;
-      - remote liveness (the piece the old 4.4 lacked): one node is
-        silenced at half-time; its star's tick stops advancing and the
-        liveness axis (star_tick_seen, 4.4) must degrade the star
+      - remote liveness (the piece the old 6.2 lacked): one node is
+        silenced at half-time; its star's beat stops advancing and the
+        liveness axis (star_beat_seen, 6.2) must degrade the star
         EVERYWHERE within the liveness threshold - first de-weighted,
         then evicted, at every hop distance, not just at the direct
         neighbours.
-    Reports per node: presence/tick/effective age of the silenced
+    Reports per node: presence/beat/effective age of the silenced
     node's star, at silencing time and every 6 h after."""
     nodes_list = load_nodes_csv(_ARGS.nodes)
     duration_h = _ARGS.duration if getattr(_ARGS, 'duration', None) else 48
@@ -643,8 +643,8 @@ def star_rest(mk, jitter):
 
 @scenario("traffic", "local-net + periodic unicast between confirmed symmetric neighbor pairs")
 def traffic(mk, jitter):
-    """Design 14.1 scenario 2 with workload: after the startup phase,
-    nodes send unicaasts to confirmed symmetric neighbors (10.1) at a
+    """Design 12.1 scenario 2 with workload: after the startup phase,
+    nodes send unicaasts to confirmed symmetric neighbors (6.3) at a
     fixed request rate. Measures delivery ratio, retries/airtime under
     load, collisions, home-deafness and duty against the 10% limit, and
     whether the resting load (proof lists) still fits next to it.
@@ -704,7 +704,7 @@ def traffic(mk, jitter):
     payload = bytes(range(payload_b % 221))[:payload_b] if payload_b else b'x' * 8
 
     # traffic generator: every interval a random node sends to a random
-    # confirmed symmetric neighbor (10.1); skipped if none yet (startup).
+    # confirmed symmetric neighbor (6.3); skipped if none yet (startup).
     # The last interval before the end of the run stays free: a send at
     # the very end would get no transmit window inside the simulated
     # time and show up as a false loss.
@@ -904,20 +904,20 @@ def star_islands(mk, jitter):
     # position tells the story)
     star_report(radio)
 
-@scenario("star-recover", "recovery test: pool pressure, then a mass death frees the "
-                          "pool - do the tabooed stars come back in?")
+@scenario("star-recover", "recovery test: constellation pressure, then a mass death frees the "
+                          "constellation - do the tabooed stars come back in?")
 def star_recover(mk, jitter):
-    """The free-slot taboo policy (4.3), the recovery measurement: two
-    25-node islands with MC_MAP_NODES small enough for permanent pool
+    """The free-slot taboo policy (6.1), the recovery measurement: two
+    25-node islands with MC_MAP_NODES small enough for permanent constellation
     pressure (the --so build decides), all B-island stars tabooed at
     island A. At half time, HALF of island B dies (links cut): the
     liveness axis evicts them network-wide within ~6 h... for this
-    test the probe is short, so we die-and-shrink the pool faster:
-    the death frees pool slots at A (the dead stars' entries leave
-    the pool within the liveness threshold). Once >= 4 slots free,
+    test the probe is short, so we die-and-shrink the constellation faster:
+    the death frees constellation slots at A (the dead stars' entries leave
+    the constellation within the liveness threshold). Once >= 4 slots free,
     the taboo flushes and A re-learns the SURVIVING B stars. The
     probes measure: A's knowledge of the surviving B nodes before,
-    right after the death (pool still draining), and after recovery."""
+    right after the death (constellation still draining), and after recovery."""
     N_PER = 25
     duration_h = _ARGS.duration if getattr(_ARGS, 'duration', None) else 10
     duration_us = duration_h * 3_600_000_000
@@ -1052,7 +1052,7 @@ def star_scale(mk, jitter):
     node_geo = {n['id']: grid_geo(n['lat'], n['lon']) for n in nodes_list}
     payload = b'x' * 20
     # delivery split: IN-GRAPH (destination in the source's map) vs
-    # OUT-OF-GRAPH (the bridge-node rule, 10.2: destination geo from
+    # OUT-OF-GRAPH (the bridge-node rule, 7.1: destination geo from
     # the client, route toward the nearest known node) - the geo-based
     # delivery question of the scale run
     att_in = [0]; dlv_in = [0]; att_out = [0]; dlv_out = [0]; refused = [0]
@@ -1104,7 +1104,7 @@ def star_scale(mk, jitter):
     # produces lives entirely in the node structs (map, links, neighbor
     # table, dedup - all C memory) plus the wire. A checkpoint captures
     # exactly that; a resume rebuilds the world in seconds. The protocol
-    # timers restart fresh (proof ticks, star rounds rebuild within one
+    # timers restart fresh (ticks, star rounds rebuild within one
     # cycle) - the KNOWLEDGE is the warmup product and it survives.
     import pickle as _pickle
     _checkpoint = getattr(_ARGS, 'checkpoint', None)
@@ -1237,12 +1237,12 @@ def star_scale(mk, jitter):
     if ai: out(f"unicast IN-GRAPH: attempts {ai}, delivered {di} ({100*di/ai:.1f}%)")
     if ao: out(f"unicast OUT-OF-GRAPH (geo/bridge): attempts {ao}, delivered {do_} "
                f"({100*do_/ao:.1f}%)")
-    # map pool occupancy: MC_MAP_NODES is 256, the world is 480 - how full,
+    # constellation constellation occupancy: MC_MAP_NODES is 256, the world is 480 - how full,
     # and how many nodes run AT the cap (eviction pressure)
-    pools = sorted(kn.core.map_size() for kn in nodes)
-    at_cap = sum(1 for p in pools if p >= 256)
-    out(f"map pool: avg {sum(pools)/len(pools):.1f}/256, p50 {pools[len(pools)//2]}, "
-        f"max {pools[-1]}, at the 256 cap: {at_cap}/{len(nodes)}")
+    constellations = sorted(kn.core.map_size() for kn in nodes)
+    at_cap = sum(1 for p in constellations if p >= 256)
+    out(f"constellation constellation: avg {sum(constellations)/len(constellations):.1f}/256, p50 {constellations[len(constellations)//2]}, "
+        f"max {constellations[-1]}, at the 256 cap: {at_cap}/{len(nodes)}")
     out(f"refused (destination not in the graph yet / no slot): {refused[0]} "
         f"({100*refused[0]/max(ai+ao+refused[0],1):.1f}% of offers)")
     # LOCAL occupancy: the channel is shared per receiver (a packet
@@ -1265,10 +1265,10 @@ def star_scale(mk, jitter):
     out(f"ghost entries: {ghosts}")
     star_report(radio)
 
-@scenario("star-dense", "scenario 6f (4.3): dense-cluster stress - 64 fully meshed "
+@scenario("star-dense", "scenario 6f (6.1): dense-cluster stress - 64 fully meshed "
                           "nodes on one home channel, the shared-channel bound")
 def star_dense(mk, jitter):
-    """Design 4.3 scenario 6f. The per-node hard bound (one chunk per
+    """Design 6.1 scenario 6f. The per-node hard bound (one chunk per
     interval) is NOT a per-channel bound: a dense single-channel
     cluster measures the AGGREGATE channel occupancy. 64 nodes, all
     mutually in range (a fully meshed tower cluster), all at home on
@@ -1381,10 +1381,10 @@ def star_dense(mk, jitter):
         f"links avg {sum(links)/len(links):.1f}, ghost entries: {ghosts}")
     star_report(radio)
 
-@scenario("star-quiet", "scenario 6e (4.3): quiet-hour acceleration - a backlog "
+@scenario("star-quiet", "scenario 6e (6.1): quiet-hour acceleration - a backlog "
                           "drains at up to 3x speed in quiet hours, day/night profile")
 def star_quiet(mk, jitter):
-    """Design 4.3 scenario 6e. Day/night traffic profile on utrecht40:
+    """Design 6.1 scenario 6e. Day/night traffic profile on utrecht40:
       - day (traffic on): a unicast every --interval s keeps the
         channels busy - the acceleration gate must stay closed;
       - night (quiet): no unicast; just before the night starts, a
@@ -1398,7 +1398,7 @@ def star_quiet(mk, jitter):
         duty share criterion).
     The star_stats rounds counter gives the round rate; the
     convergence measure is the time until all nodes see the mutated
-    stars' new form (tick advanced, hash changed, map fresh)."""
+    stars' new form (beat advanced, hash changed, map fresh)."""
     nodes_list = load_nodes_csv(_ARGS.nodes)
     duration_h = _ARGS.duration if getattr(_ARGS, 'duration', None) else 12
     duration_us = duration_h * 3_600_000_000
@@ -1500,10 +1500,10 @@ def star_quiet(mk, jitter):
         f"above limit: {sum(1 for u in usage.values() if u > 360_000_000)}")
     star_report(radio)
 
-@scenario("star-churn", "scenario 6d (4.3/4.4): churn - geo mutations, nodes "
+@scenario("star-churn", "scenario 6d (6.1/6.2): churn - geo mutations, nodes "
                            "joining and leaving, reboot/reincarnation, delivery under churn")
 def star_churn(mk, jitter):
-    """Design 4.3/4.4 scenario 6d. Churn on utrecht40:
+    """Design 6.1/6.2 scenario 6d. Churn on utrecht40:
       - geo mutations: --rate per hour, a random node moves (its own
         star's content hash changes - the pure mutation-convergence
         measurement: time until the new form is visible network-wide);
@@ -1765,7 +1765,7 @@ def load(mk, jitter):
             kn = rng.choice(nodes)
             dst = rng.choice(ids)
             if dst != kn.id:
-                # assumption (10.2): the end user supplies the correct
+                # assumption (7.1): the end user supplies the correct
                 # destination geo with the message - the bridge-node
                 # rule can route even outside the own graph
                 rc = kn.core.send_data(dst, bytes(payload), ack3=False, geo=node_geo[dst])
@@ -1861,7 +1861,7 @@ def main():
                     help='seconds between unicasts (load, default 10)')
     ap.add_argument('--graph-out', metavar='FILE.json',
                     help='after the run: dump the final graph state as JSON '
-                         '(nodes with positions, every node\'s link store and map pool) '
+                         '(nodes with positions, every node\'s link store and constellation constellation) '
                          'for the graph viewer (tools/graph.html)')
     ap.add_argument('--trace', action='store_true',
                     help='message tracing: every node logs its DATA sends/receives '
@@ -1927,12 +1927,12 @@ def main():
             for l in core.mn.lnk:
                 if l.alive:
                     links.append([int(l.a), int(l.b), int(l.q)])   # q = direction classes (hi<<4 | lo)
-            pool = []
+            constellation = []
             pmeta = {}
             for m in core.mn.map:
                 if m.alive:
-                    pool.append(int(m.id))
-                    pmeta[int(m.id)] = {'adv_q': int(m.adv_q), 'star_tick': int(m.star_tick),
+                    constellation.append(int(m.id))
+                    pmeta[int(m.id)] = {'adv_q': int(m.adv_q), 'star_beat': int(m.star_beat),
                                        'geo': [int(m.geo_lat), int(m.geo_lon)]}
             nbrs = []
             nmeta = {}
@@ -1942,7 +1942,7 @@ def main():
                     nmeta[int(nb.id)] = {'sym': int(nb.sym), 'quality': int(nb.quality),
                                         'penalty': int(nb.penalty)}
             out_nodes.append({
-                'id': int(kn.id), 'nbrs': nbrs, 'links': links, 'pool': pool,
+                'id': int(kn.id), 'nbrs': nbrs, 'links': links, 'constellation': constellation,
                 'pmeta': pmeta, 'nmeta': nmeta})
         geo = {}
         for line in open('sim/nodes/utrecht480.csv' if '480' in (_ARGS.nodes or '') else _ARGS.nodes):

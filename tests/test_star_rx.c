@@ -1,16 +1,16 @@
 /*
- * test_star_rx.c — star-round receiver (4.5, step 4: catalogue with
+ * test_star_rx.c — star-round receiver (5.3, step 4: catalogue with
  * derivable match).
  *
  * The smallest receiver behaviour of the star round: a node that
  * KNOWS a star hears a neighbour's catalogue entry for it. When the
- * digest is derivable (content unchanged, origin tick advanced), the
+ * digest is derivable (content unchanged, origin beat advanced), the
  * receiver confirms the knowledge without a single content byte:
  *
  *  - the travelled age of the star resets (arrived_tick = now): the
  *    knowledge is fresh again, exactly as if the content had been
  *    re-sent, at 3 bytes of airtime instead of ~20;
- *  - the star's tick advances to the derived value (the heartbeat);
+ *  - the star's beat advances to the derived value (the heartbeat);
  *  - a digest that fits NO tick in the window (real content change)
  *    does NOT reset anything - that is the missed-list path of the
  *    next step and must stay untouched here;
@@ -100,10 +100,10 @@ int main(void) {
     uint8_t age_before = m->age_ticks;
     printf("far star: age_ticks=%u arrived=%u\n", age_before, arrived_before);
     assert(age_before == 30);
-    /* The star arrived via a plain 4.3 chunk: no heartbeat tick yet
-     * (star_tick = 0, its meaning). Give it one, as a star-round
-     * carry would have: the origin's tick as it reached us. */
-    m->star_tick = 40;
+    /* The star arrived via a plain 6.1 chunk: no beat yet
+     * (star_beat = 0, its meaning). Give it one, as a star-round
+     * carry would have: the origin's beat as it reached us. */
+    m->star_beat = 40;
 
     /* let the local time base advance so the freshness reset is
      * provable: the star arrived at tick 0; at tick 5 a reset must
@@ -113,29 +113,29 @@ int main(void) {
     assert(m->arrived_tick == arrived_before);       /* untouched so far */
 
     /* A's catalogue: (0x0301, digest) derived from OUR copy: hash + age
-     * (the tick as it reached us) + 2 ticks of lag. */
+     * (the beat as it reached us) + 2 ticks of lag. */
     {
         uint8_t sbuf[MC_STAR_BUF];
         uint16_t sl = mimeshi_star_serialize(&B, 0x0301, sbuf, sizeof sbuf, 0);
         assert(sl > 0);
         uint8_t h = mimeshi_star_content_hash(sbuf, sl, 3);
-        uint8_t digest = mimeshi_star_digest(h, (uint8_t)(m->star_tick + 2));
+        uint8_t digest = mimeshi_star_digest(h, (uint8_t)(m->star_beat + 2));
         uint16_t ids[1] = { 0x0301 };
         uint8_t dig[1] = { digest };
         uint8_t p[230];
         uint16_t len = craft_catalogue(p, 0x0100, ids, dig, 1);
         mimeshi_rx(&B, 0, -60, p, len);
     }
-    /* derivable match (4.5): the HEARTBEAT TICK advanced by 2
+    /* derivable match (5.3): the HEARTBEAT TICK advanced by 2
      * (liveness) and the travelled age RESTARTED at 0 (freshness) -
-     * two separate fields now: age_ticks keeps its 4.4 routing
-     * meaning, star_tick is the origin's liveness. */
-    assert(m->star_tick == 42);                           /* heartbeat advanced */
+     * two separate fields now: age_ticks keeps its 6.2 routing
+     * meaning, star_beat is the origin's liveness. */
+    assert(m->star_beat == 42);                           /* heartbeat advanced */
     assert(m->age_ticks == 0);                            /* travelled age restarted */
     assert(m->arrived_tick == B.tick);                    /* fresh as of NOW, visibly moved */
     assert(m->arrived_tick != arrived_before);            /* the reset is real, not a no-op */
-    printf("after match: star_tick=%u age_ticks=%u arrived=%u\n",
-           m->star_tick, m->age_ticks, m->arrived_tick);
+    printf("after match: star_beat=%u age_ticks=%u arrived=%u\n",
+           m->star_beat, m->age_ticks, m->arrived_tick);
 
     /* a catalogue entry that fits NO tick (content changed upstream):
      * nothing may reset. */
@@ -149,7 +149,7 @@ int main(void) {
         mimeshi_rx(&B, 0, -60, p, len);
     }
     assert(m->age_ticks == age_stale);          /* untouched */
-    assert(m->star_tick == 42);                 /* the heartbeat also untouched */
+    assert(m->star_beat == 42);                 /* the heartbeat also untouched */
     assert(m->arrived_tick == arrived_stale);   /* untouched */
 
     /* a catalogue entry for a star B does not have: ignored, no crash,

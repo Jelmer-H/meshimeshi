@@ -1,5 +1,5 @@
 /*
- * test_star_prune.c — the graph pruning check (4.5).
+ * test_star_prune.c — the graph pruning check (5.3).
  *
  * Topology:   F --- A --- B --- C        (the line, star S = the star
  *                    \\                  of F, a far center reached
@@ -86,7 +86,7 @@ static void inject_star(mimeshi_node *n, uint16_t owner,
 }
 
 static void ack_neighbour(mimeshi_node *n, uint16_t from) {
-    /* 6 B with the rq byte (6.2): the three-way closure (4.2, Oct 2026)
+    /* 6 B with the rq byte (10.2): the three-way closure (5.2, Oct 2026)
      * gates symmetry on this received evidence - a realistic quality
      * (34 = quality_of(-60)) travels along */
     uint8_t ack[6] = { 2, (uint8_t)(n->id & 0xFF), (uint8_t)(n->id >> 8),
@@ -167,7 +167,7 @@ int main(void) {
         lnk_set_local(&B, 0x0105, 0x0104, 0x55);   /* D-C */
     }
 
-    mimeshi_start(&B);                        /* starts the round timer (4.3) */
+    mimeshi_start(&B);                        /* starts the round timer (6.1) */
     pump_until(INTERVAL_US);                  /* first round */
 
     /* 1. WITH C: F's star is carried (C lies strictly farther) */

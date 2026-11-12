@@ -20,7 +20,7 @@
     <span style="color:#4a9">● node</span>
     <span style="color:#d44">— fysieke link (buurtabel)</span>
     <span style="color:#46c">— link store (kennis)</span>
-    <span style="color:#fc0">— pool/kennis van geselecteerde node</span>
+    <span style="color:#fc0">— constellation/kennis van geselecteerde node</span>
   </div>
   <div id="stats"></div>
 </div>
@@ -75,18 +75,18 @@ function draw(){
     const [x1,y1]=px(n.id), [x2,y2]=px(b); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2);
   }
   ctx.stroke();
-  // pool van geselecteerde node - geel
+  // constellation van geselecteerde node - geel
   if (sel && byId[sel]){
     ctx.strokeStyle = 'rgba(250,200,30,.9)'; ctx.lineWidth = 1.5;
     ctx.beginPath();
-    for (const p of byId[sel].pool){ const [x1,y1]=px(sel), [x2,y2]=px(p);
+    for (const p of byId[sel].constellation){ const [x1,y1]=px(sel), [x2,y2]=px(p);
       ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); }
     ctx.stroke();
   }
   // nodes
   for (const n of G.nodes){
     const [x,y] = px(n.id);
-    ctx.fillStyle = sel===n.id ? '#fff' : (sel && byId[sel].pool.includes(n.id) ? '#fc0' : '#4a9');
+    ctx.fillStyle = sel===n.id ? '#fff' : (sel && byId[sel].constellation.includes(n.id) ? '#fc0' : '#4a9');
     ctx.beginPath(); ctx.arc(x, y, sel===n.id?5:3, 0, 7); ctx.fill();
     if (zoom > 6) { ctx.fillStyle = '#888'; ctx.font = '10px monospace';
       ctx.fillText(n.id.toString(16), x+5, y-4); }
@@ -95,8 +95,8 @@ function draw(){
   const stats = document.getElementById('stats');
   if (sel && byId[sel]) stats.innerHTML =
     `<b>node ${sel.toString(16)}</b><br>buren: ${byId[sel].nbrs.length}` +
-    `<br>link store: ${byId[sel].links.length}<br>pool: ${byId[sel].pool.length}`;
-  else stats.innerHTML = `<b>${G.nodes.length} nodes</b> - klik een node voor zijn pool`;
+    `<br>link store: ${byId[sel].links.length}<br>constellation: ${byId[sel].constellation.length}`;
+  else stats.innerHTML = `<b>${G.nodes.length} nodes</b> - klik een node voor zijn constellation`;
 }
 
 cv.onclick = e => {
