@@ -4,7 +4,7 @@
  *
  * Building block 1 (link test): hello round, neighbor table, hello-acks with
  * RSSI spreading, unicast with ack1/ack2/ack3, retries, budget.
- * Forwarding, routing (10.2), T_ack2 window (7.3) and tablepull (4.3)
+ * Forwarding, routing (7.1), T_ack2 window (8.3) and tablepull (6.1)
  * are building block 2 — where that behavior is still missing it is noted.
  *
  * Architecture (13b): the core has no clock, radio or RNG. Everything
@@ -27,11 +27,11 @@
  *    (MC_S_SWITCH_US), transmit as soon as the radio is on channel. The
  *    core has no explicit "return home" call: the platform layer returns
  *    to the home channel by itself after the exchange (for data after
- *    the ack1 window on the exchange channel, 7.3). The simulator
+ *    the ack1 window on the exchange channel, 8.3). The simulator
  *    (sim/sim1.py, class Node) is the reference implementation of that
  *    platform contract.
  *  - Ack1 is the exception: it goes without a switch via tx() on the
- *    channel of the ongoing exchange, because the sender waits there (7.1).
+ *    channel of the ongoing exchange, because the sender waits there (8.1).
  *
  * Logging: the printf lines are intended for the link test and simulator.
  * Firmware can damp them; later they become a platform callback.
@@ -43,16 +43,16 @@
 /* ---------------- configuration (firmware constants) ----------------
  * Values and status live in the design document; change them there first
  * (working rule: design -> core -> ctest + sim1.py grow along). */
-#define MC_ACK_BACKOFF_CAP_TICKS 1440u     /* pace cap (4.5): 24 h in proof ticks
+#define MC_ACK_BACKOFF_CAP_TICKS 1440u     /* pace cap (5.3): 24 h in ticks
                                               (1 tick = 1 min) */
 #define MC_STAR_LONELY_TICKS 5u            /* accelerated round interval while the
-                                              node has no confirmed neighbour (4.5):
+                                              node has no confirmed neighbour (5.3):
                                               5 min, full spread */
 #define MC_MIN_US          60000000ull     /* 1 minute in us - the human time unit */
 #define MC_KEEPALIVE_TICK_US MC_MIN_US      /* the time base without a clock: 1 tick = 1 min */
-#define MC_KEEPALIVE_TICKS 60u             /* silence ticks = T_keepalive = 1 h (4.1) */
-#define MC_HELLO_MAX_US    (MC_KEEPALIVE_TICKS * MC_KEEPALIVE_TICK_US)  /* 1 h stable (4.1); = T_keepalive */
-#define MC_HELLO_JITTER_US 1000000ull      /* random phase per round (4.1, open point 3) */
+#define MC_KEEPALIVE_TICKS 60u             /* silence ticks = T_keepalive = 1 h (5.1) */
+#define MC_HELLO_MAX_US    (MC_KEEPALIVE_TICKS * MC_KEEPALIVE_TICK_US)  /* 1 h stable (5.1); = T_keepalive */
+#define MC_HELLO_JITTER_US 1000000ull      /* random phase per round (5.1, open point 3) */
 #define MC_HELLO_ACK_WIN_US 3000000ull     /* max response time hello-acks: 3 s (2) */
 #define MC_HELLO_ACK_JITTER_US (MC_HELLO_ACK_WIN_US / 16u)  /* ~187 ms, > t_ack + S (2) */
 #define MC_BUDGET_INIT     32              /* initial value budget byte (9) */
@@ -62,7 +62,7 @@
  * event - free when off. */
 #define MTRACE(n, ...) do { if ((n)->trace) { \
     printf("[msg] node %u: ", (n)->id); printf(__VA_ARGS__); } } while (0)
-/* ---------------- attempt schedule (7.4) -------------------------
+/* ---------------- attempt schedule (8.4) -------------------------
  * One schedule per hop, no rebuild. Waits: a small fixed gap inside a
  * pass over the candidates (the next attempt goes to a DIFFERENT
  * node), an escalating gap at each pass boundary (the same node comes
@@ -70,61 +70,61 @@
  * two nodes that collided once must not retry in lock-step. With 1
  * candidate every attempt is a boundary; the pass table then runs
  * 0.8, 1.2, 1.8 s. Worst case total (6 attempts, 3 candidates):
- * ~6 s incl. attempt times - inside T_ack2 = 8 s (7.3). */
+ * ~6 s incl. attempt times - inside T_ack2 = 8 s (8.3). */
 #define PLAN_INTRA_MS       400u           /* A->B within a pass (different node) */
 static const uint32_t PLAN_PASS_MS[3] = { 800, 1200, 1800 };  /* escalating per pass (same node) */
-#define MC_ACK1_MARGIN_US   80000ull       /* processing + margin on top of t_data + t_ack (7.3) */
+#define MC_ACK1_MARGIN_US   80000ull       /* processing + margin on top of t_data + t_ack (8.3) */
 #define MC_T_ACK2_US        8000000ull    /* ack2 timeout (7.3, revised Oct 2026): 8 s - the attempt
-                                   schedule of the next hop (7.4) completes in ~6 s worst case,
+                                   schedule of the next hop (8.4) completes in ~6 s worst case,
                                    so silence beyond 8 s means its forwarding truly stalled;
                                    measured against 15 s: fired 17x in 6h, all legitimate */
-#define MC_ACK2_BUDGET_PENALTY 6u           /* budget units charged on the T_ack2 timeout (7.3) */
-#define MC_S_SWITCH_US      5000ull        /* channel switch incl. settling (14.1) */
-#define MC_SYM_QUALITY_MIN  13u            /* symmetry requires this quality (10.1):
+#define MC_ACK2_BUDGET_PENALTY 6u           /* budget units charged on the T_ack2 timeout (8.3) */
+#define MC_S_SWITCH_US      5000ull        /* channel switch incl. settling (12.1) */
+#define MC_SYM_QUALITY_MIN  13u            /* symmetry requires this quality (6.3):
                                                ~-102 dBm (decided Oct 2026, measured:
                                                at 14 the scenario kept 2 of 40 nodes
                                                without any routable link and lost ~10%
                                                of the unicasts to refusals; at 13
                                                every node has at least one confirmed
                                                neighbour and delivery reaches 98.9%.
-                                               The retry series (7.4) absorb the
+                                               The retry series (8.4) absorb the
                                                weaker links' higher loss rate) */
 #define MC_CAD_BACKOFF_US   20000ull       /* CAD backoff: random 0..19 ms (2) */
 #define MC_CAD_MAX_TRIES    8u             /* ask at most 8x per transmission; then transmit anyway */
 
 /* ---------------- airtime (SF7, 62.5 kHz, CR4/5) ----------------
- * Fixed values from the table in 14.1. The core passes the airtime to
+ * Fixed values from the table in 12.1. The core passes the airtime to
  * tx() so the platform layer can schedule the transmit window; the
  * functions are deliberately simple (three classes) instead of an exact
  * LoRa airtime formula. 3 B packets (proof ack, and the legacy hello,
- * 6.3): 62 ms; hello-ack/proof list: 5-6 B and 3+2n B (6.2); ack1/ack2:
+ *): 62 ms; hello-ack/proof list: 5-6 B and 3+2n B (10.2); ack1/ack2:
  * 7-8 B. */
 static uint64_t t_ack_us(void)        { return 78000ull; }   /* ack1/ack2: 7 B */
-static uint64_t t_hello_us(void)      { return 62000ull; }   /* 3 B packets (6.3) */
-static uint64_t t_hack_us(void)       { return 70000ull; }   /* hello-ack: 5 B (6.2) */
+static uint64_t t_hello_us(void)      { return 62000ull; }   /* 3 B packets */
+static uint64_t t_hack_us(void)       { return 70000ull; }   /* hello-ack: 5 B (10.2) */
 static uint64_t t_proof_us(void) { return 70000ull; }  /* proof list: 3+2n B,
                                                        n<=17 -> 37 B max; one
                                                        airtime class covers them
-                                                       all (4.2) */
+                                                       all (5.2) */
 static uint64_t t_data_us(uint16_t l) { return l <= 40 ? 173000ull : l <= 150 ? 459000ull : 869000ull; }
 
 /* ---------------- packet types and formats ----------------
- * Type byte: low nibble = type, high nibble = flags (6.1). All
+ * Type byte: low nibble = type, high nibble = flags (10.1). All
  * multi-byte fields little-endian (rd16/wr16). Layouts:
  *
- *   HELLO       3 B   type, node-id(2)  (6.3). DROPPED as a sent type
- *                     (4.5): no node sends it anymore. A received packet
+ *   HELLO       3 B   type, node-id(2). DROPPED as a sent type
+ *                     (5.3): no node sends it anymore. A received packet
  *                     of this type is still processed as an identifying
  *                     transmission of the sender (liveness, quality,
  *                     generalized ack).
  *   HELLO_ACK   6 B   type, destination-id(2) = the acked sender,
  *                     sender-id(2), rq(1) — directional: the address makes
- *                     the ack an exact symmetry proof (6.2; 2, 4.2, 4.5)
- *   PROOF       3+2n B type, node-id(2), n x neighbour-id(2), n <= 17 (4.2).
+ *                     the ack an exact symmetry proof (6.2; 2, 5.2, 5.3)
+ *   PROOF       3+2n B type, node-id(2), n x neighbour-id(2), n <= 17 (5.2).
  *                     Reactionless keepalive + symmetry flush; an empty list
  *                     is the minimal keepalive beacon (type + node-id).
- *   PROOF_ACK   3 B   type, node-id(2) = the acked round's sender (4.2,
- *                     re-anchored by 4.5). The collective third step of the
+ *   PROOF_ACK   3 B   type, node-id(2) = the acked round's sender (5.2,
+ *                     re-anchored by 5.3). The collective third step of the
  *                     three-way: once per round that collected acks,
  *                     scheduled at the ack window's end, the
  *                     sender confirms ALL received acks at once. A
@@ -135,18 +135,18 @@ static uint64_t t_data_us(uint16_t l) { return l <= 40 ? 173000ull : l <= 150 ? 
  *   DATA      12+n B  type+F_ACK3_REQ+F_DEST_GEO, msg-id(2), source(2),
  *                     destination(2), previous-hop(2), budget(1, offset 9),
  *                     next-hop(2, offset 10), [dest geo 4 B when F_DEST_GEO,
- *                     offset 12 (5, 10.2)], payload(n)  (6.1)
- *   ACK1        7 B   type, msg-id(2), source of the message(2), sender(2) (6.2)
- *   ACK2        7 B   same as ACK1; F_NEG_ACK2 makes it negative       (6.2, 7.2)
+ *                     offset 12 (5, 7.1)], payload(n)  (10.1)
+ *   ACK1        7 B   type, msg-id(2), source of the message(2), sender(2) (10.2)
+ *   ACK2        7 B   same as ACK1; F_NEG_ACK2 makes it negative       (6.2, 8.2)
  *   ACK3       14 B   DATA format, payload 4 B: the original msg-id (6.2, 11)
  *
- * TABLE_PULL / TABLE_CHUNK (4.3) and FAIL_RPT (10.5) are reserved for
+ * TABLE_PULL / TABLE_CHUNK (6.1) and FAIL_RPT (8.6) are reserved for
  * their future function and are ignored at the moment.
  */
 enum {
     PKT_HELLO = 1, PKT_HELLO_ACK, PKT_PROOF, PKT_TABLE_CHUNK,
     PKT_DATA, PKT_ACK1, PKT_ACK2, PKT_ACK3, PKT_FAIL_RPT
-    /* The three-way closure (4.2, decided Oct 2026, re-anchored by 4.5):
+    /* The three-way closure (5.2, decided Oct 2026, re-anchored by 5.3):
      * the acked round sender's
      * COLLECTIVE confirmation, one packet per round after the ack
      * window - every responder of that round learns 'my ack arrived,
@@ -156,9 +156,9 @@ enum {
      * types are sacred (chunks are 4, data is 5, ack1 is 6, star round 10). */
 };
 #define PKT_PROOF_ACK 11
-#define F_ACK3_REQ 0x10   /* requested by the source of the message (11) */
+#define F_ACK3_REQ 0x10   /* requested by the source of the message (8.8) */
 #define F_DEST_GEO 0x20   /* destination geo present: 4 B after the fixed
-                             header (6.1, 10.2) - every hop can recompute
+                             header (6.1, 7.1) - every hop can recompute
                              the bridge node toward an unknown destination */
 #define F_WAYPOINT_GEO 0x40 /* waypoint geo present (10.2, decided Oct 2026): 4 B
                               after the dest geo (or after the fixed header when
@@ -171,20 +171,20 @@ enum {
                               margin). The destination in the own graph always
                               wins over the heading. */
 
-#define F_NEG_ACK2 0x40   /* next hop could not forward (7.2) */
+#define F_NEG_ACK2 0x40   /* next hop could not forward (8.2) */
 
-/* little-endian reading/writing of 16-bit fields (6.1) */
+/* little-endian reading/writing of 16-bit fields (10.1) */
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 
-/* ---------------- keepalive counters (4.1) ----------------
+/* ---------------- keepalive counters (5.1) ----------------
  * Per channel the node counts how many keepalive ticks have passed since
  * it last "called" there itself — an identifying transmission on that
  * channel (hello-ack, ack1, ack2, data as prev_hop, ack3, star round,
  * proof list). ANN and FULL are anonymous and therefore do NOT reset.
  * Every own call sets the counter of that channel to 0; after
  * MC_KEEPALIVE_TICKS of silence exactly one proof list follows on that
- * channel (the keepalive, 4.2). The core has no clock: the tick timer
+ * channel (the keepalive, 5.2). The core has no clock: the tick timer
  * IS the time base. */
 static void ka_called(mimeshi_node *n, uint8_t ch) {
     if (ch < MC_N_CHANNELS) n->ka_idle[ch] = 0;
@@ -199,13 +199,13 @@ static mimeshi_neighbor *nbr_find(mimeshi_node *n, uint16_t id) {
     return 0;
 }
 
-/* Quality byte from an RSSI measurement (4.2): halving of the normalized
+/* Quality byte from an RSSI measurement (5.2): halving of the normalized
  * RSSI leaves room for a future SNR component in the same byte. */
 static uint8_t quality_of(int8_t rssi) {
     return (uint8_t)(rssi < 0 ? (rssi + 128) >> 1 : 63);
 }
 
-/* Quality gate for symmetry confirmation (10.1): a link is used only
+/* Quality gate for symmetry confirmation (6.3): a link is used only
  * when it is above the quality threshold and works in both directions.
  * Each node can only measure the direction toward itself (the RSSI of
  * the received transmissions); the neighbour measures the opposite
@@ -214,11 +214,11 @@ static uint8_t quality_of(int8_t rssi) {
  * directions are above the threshold. */
 static bool quality_ok(uint8_t q) { return q >= MC_SYM_QUALITY_MIN; }
 
-/* Advertised quality class (4.3): the upper bits of the long-term
+/* Advertised quality class (6.1): the upper bits of the long-term
  * average, 3 bits (8 levels) in the prefix chunks. */
 static uint8_t adv_class_of(uint8_t q) { return (uint8_t)(q >> 3); }   /* 0..7 */
 
-/* Hysteresis on the advertised link byte of the own star (4.3): each
+/* Hysteresis on the advertised link byte of the own star (6.1): each
  * direction nibble moves only when the fresh class is >= 2 steps from
  * the last published one - sub-threshold EWMA movement leaves the
  * advertised form untouched, so the content hash of the own star
@@ -238,7 +238,7 @@ static uint8_t adv_byte_hyst(uint8_t published, uint8_t fresh) {
  * middle of the class, so route comparisons stay monotone. */
 static uint8_t quality_from_class(uint8_t cls) { return (uint8_t)((cls << 3) | 4); }
 
-/* EWMA on the long-term average (4.3): weight 1/32. */
+/* EWMA on the long-term average (6.1): weight 1/32. */
 static uint8_t quality_ewma(uint8_t stored, uint8_t fresh) {
     return (uint8_t)(((uint16_t)stored * 31u + fresh) / 32u);
 }
@@ -246,8 +246,8 @@ static uint8_t quality_ewma(uint8_t stored, uint8_t fresh) {
 
 /* Add a neighbor (from a hello, hello-ack or proof list). Full = return 0;
  * the caller continues without the neighbor. A new entry starts as "seen":
- * one direction, sym = 0 (4.2). The local table counter feeds push-window
- * bundling (4.3); it never goes on air. */
+ * one direction, sym = 0 (5.2). The local table counter feeds push-window
+ * bundling (6.1); it never goes on air. */
 static mimeshi_neighbor *nbr_add(mimeshi_node *n, uint16_t id) {
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
         if (!n->nbr[i].alive) {
@@ -268,7 +268,7 @@ static mimeshi_neighbor *nbr_add(mimeshi_node *n, uint16_t id) {
  * under load): the oldest entry is evicted and the fresh one takes its
  * place. "Receive anyway" after 128 messages turned dedup off
  * completely, and a routing ping-pong forwarded one message 166 times
- * (each FORWARD is a fresh pending, and the ack1 rule of 7.4 kept the
+ * (each FORWARD is a fresh pending, and the ack1 rule of 8.4 kept the
  * loop fed). The recent 128 (msg-id, source) pairs always block. */
 static bool dedup_fresh(mimeshi_node *n, uint16_t msg_id, uint16_t src) {
     for (int i = 0; i < MC_MAX_DEDUP; i++)
@@ -318,7 +318,7 @@ static void bound_fire(mimeshi_node *n, void *ud) {
      * anyway: a permanently busy channel must not block the node
      * forever (hello round, proof list). Ack1 never comes through here:
      * it is a direct reply and goes without a switch and without a
-     * check via tx() (7.1). Not RTS/CTS against hidden nodes (8). */
+     * check via tx() (8.1). Not RTS/CTS against hidden nodes (8). */
     if (n->channel_free && c->cad_tries < MC_CAD_MAX_TRIES &&
         !n->channel_free(n, c->ch)) {
         c->cad_tries++;
@@ -345,9 +345,9 @@ static void bound_send(mimeshi_node *n, uint8_t ch, const uint8_t *pkt, uint16_t
     printf("[core] node %u: bound-pool full, transmission dropped (counter %u)\n", n->id, bctx_drops);
 }
 
-/* ---------------- discovery and first evidence (4.5) ---------------- */
+/* ---------------- discovery and first evidence (5.3) ---------------- */
 
-/* Collective proof ack (4.2, re-anchored by 4.5): one 3 B packet per
+/* Collective proof ack (5.2, re-anchored by 5.3): one 3 B packet per
  * round that collected generalized acks, fired at the end of the ack
  * window. The responders sit on their home channels - the closure
  * reaches them there. Every responder of THIS round hears one small
@@ -366,20 +366,20 @@ static void proof_ack_fire(mimeshi_node *n, void *ud) {
 
 /* Random phase per scheduled own call. Without jitter, nodes that
  * start up simultaneously (e.g. after a power outage) keep exactly
- * synchronous proof moments (4.1). Range in round_jitter_us so the
+ * synchronous proof moments (5.1). Range in round_jitter_us so the
  * simulation can vary it per scenario. */
 static uint64_t round_jitter(mimeshi_node *n) {
     return n->round_jitter_us ? (n->rand(n) % n->round_jitter_us) : 0;
 }
 
-/* Proof list for channel c (4.2): type, node-id, then the ids of the
+/* Proof list for channel c (5.2): type, node-id, then the ids of the
  * direct neighbors at home on c whose reverse-direction evidence
  * ("last proven") expires within the flush margin. Reactionless by
  * design: no receiver ever replies. An empty list is the minimal
- * keepalive beacon (4.1). The packet is an own call on c and resets the
+ * keepalive beacon (5.1). The packet is an own call on c and resets the
  * keepalive counter of c.
  *
- * Combined trigger (4.2): the flush check runs every 20 min rotating
+ * Combined trigger (5.2): the flush check runs every 20 min rotating
  * per channel; a channel that has been silent for T_keepalive pulls
  * its moment forward -- same packet, one airtime for both roles.
  * Cap: at most one proof list per channel per hour. */
@@ -399,57 +399,57 @@ static void proof_send(mimeshi_node *n, uint8_t c) {
         }
     }
     bound_send(n, c, p, (uint16_t)(3 + 2 * cnt), t_proof_us());
-    ka_called(n, c);            /* own call: keepalive counter of c resets (4.1) */
+    ka_called(n, c);            /* own call: keepalive counter of c resets (5.1) */
 }
 
 static void proof_fire(mimeshi_node *n, void *ud) {
     proof_send(n, (uint8_t)(size_t)ud);
 }
 
-/* Flush check, rotating per channel (4.2). Each channel has its own
+/* Flush check, rotating per channel (5.2). Each channel has its own
  * countdown in proof_wait[] ticks; the stagger (c x MC_PROOF_ROT_TICKS)
  * gives each channel one flush moment per hour, 20 minutes apart: no
  * self-congestion. Next to the countdown, a channel silent for
  * T_keepalive (ka_idle at max) is due NOW even without its slot -- the
- * keepalive trigger pulls the moment forward (4.1). The countdown
+ * keepalive trigger pulls the moment forward (5.1). The countdown
  * restarts at MC_KEEPALIVE_TICKS (= 1 h) on every fire: that is the cap,
  * one proof list per channel per hour maximum.
  */
-#define MC_PROOF_ROT_TICKS (MC_KEEPALIVE_TICKS / MC_N_CHANNELS)  /* 20 min = 20 ticks (4.2) */
+#define MC_PROOF_ROT_TICKS (MC_KEEPALIVE_TICKS / MC_N_CHANNELS)  /* 20 min = 20 ticks (5.2) */
 
-/* ---------------- 2-hop map and link store (4.3, 10.1) --------
+/* ---------------- 2-hop map and link store (6.1, 6.3) --------
  * The map holds every node we know: direct neighbours (alive in the
  * neighbor table) and 2-hop nodes from table chunks. The link store
  * holds the advertised links between map nodes (per direction a 3-bit
- * class). Both are bounded (13.2): full = the entry is dropped with a
+ * class). Both are bounded (11.2): full = the entry is dropped with a
  * message, never silently. */
 
-/* Effective age of a map entry in full proof ticks (1 min each),
- * uncapped for internal comparisons (4.4); on air the age byte caps at
+/* Effective age of a map entry in full ticks (1 min each),
+ * uncapped for internal comparisons (6.2); on air the age byte caps at
  * 255 (~4 h) - anything older advertises simply as expired. */
 static uint32_t map_age_ticks(mimeshi_node *n, mimeshi_mapnode *m) {
     return (uint32_t)m->age_ticks + (n->tick - m->arrived_tick);
 }
 
 
-/* Eviction of a map entry (4.4): the entry goes, and with it every
+/* Eviction of a map entry (6.2): the entry goes, and with it every
  * stored link that touches it - the link store stays consistent with
  * the map, and a link is only usable while both endpoints stand. */
-/* Eviction taboo (4.3): the ring of recently evicted star IDs.
+/* Eviction taboo (6.1): the ring of recently evicted star IDs.
  * A catalogue mismatch for a tabooed star creates no miss request -
- * the eviction was a policy choice (pool recycle or expiry), and
- * requesting the star back is a cycle under pool pressure (measured:
+ * the eviction was a policy choice (constellation recycle or expiry), and
+ * requesting the star back is a cycle under constellation pressure (measured:
  * 21,093 requests over 6 h on the islands pressure test, all cycle).
  * An ID that re-enters the map leaves the taboo (freshly learned
  * knowledge is wanted knowledge). */
-#define MC_EV_TABOO 128u          /* the taboo set size (4.3): big enough to
-                                     hold every star a small pool evicts per
+#define MC_EV_TABOO 128u          /* the taboo set size (6.1): big enough to
+                                     hold every star a small constellation evicts per
                                      cycle - at the 480-node scale the world
-                                     minus the pool is ~224, and the ring
+                                     minus the constellation is ~224, and the ring
                                      overwrite only retires the oldest */
 static void ev_taboo_remember(mimeshi_node *n, uint16_t id) {
     /* no overwrite: a rejection stands until the star is stored
-     * again (ev_taboo_forget). The array is the pool size, so every
+     * again (ev_taboo_forget). The array is the constellation size, so every
      * possible rejection fits; a duplicate remember is a no-op. */
     for (int i = 0; i < (int)(sizeof n->ev_taboo / sizeof n->ev_taboo[0]); i++) {
         if (n->ev_taboo[i] == id) return;         /* already judged */
@@ -458,7 +458,7 @@ static void ev_taboo_remember(mimeshi_node *n, uint16_t id) {
 }
 static int ev_taboo_check(mimeshi_node *n, uint16_t id) {
     /* The taboo is a memory of the admission competition, and the
-     * competition runs at pool pressure (4.4/4.3): at a NON-full pool
+     * competition runs at constellation pressure (6.2/6.1): at a NON-full constellation
      * the rejections are stale - the pressure that justified them is
      * gone. The free-slot policy (decided, Oct 2026):
      *  - 0 free slots: the taboo is active (the measured cycle
@@ -466,13 +466,13 @@ static int ev_taboo_check(mimeshi_node *n, uint16_t id) {
      *  - 1-3 free slots: the taboo is TREATED AS EMPTY at the
      *    request gates (rejected stars may ask again - the answers
      *    fill the free slots; the physical list stands, so when the
-     *    pool refills, the old judgments apply again without a new
+     *    constellation refills, the old judgments apply again without a new
      *    judgment cycle). Temporary suboptimal admissions at the rim
      *    of our area are corrected by the complete forms that ride
      *    the origin's guaranteed rounds;
      *  - >= 4 free slots: the taboo is FLUSHED entirely - the pressure
      *    is gone, everyone competes fresh; new judgments come with
-     *    the next full pool.
+     *    the next full constellation.
      * Implemented here so every call site (both miss gates) shares
      * the same view. */
     int free = 0;
@@ -499,14 +499,14 @@ static void ev_taboo_forget(mimeshi_node *n, uint16_t id) {
 
 static uint16_t lnk_owner(uint16_t x, uint16_t y);
 static void map_evict(mimeshi_node *n, mimeshi_mapnode *m) {
-    /* Ownership-aware link cleanup (4.3, from the islands nofit
+    /* Ownership-aware link cleanup (6.1, from the islands nofit
      * finding): evicting P may only remove the links P OWNS - the
      * per-link ownership bit (lnk_owner) decides. The links of OTHER
      * origins that merely name P as a peer are form material of the
      * OWNING origin's star: removing them broke the owner's
      * serialised form (storage-as-received violated), which
      * mismatched every catalogue digest forever - the 39k nofit
-     * cycle measured under pool pressure. A link to an evicted peer
+     * cycle measured under constellation pressure. A link to an evicted peer
      * stays as the owner's claim (routing skips dead endpoints
      * anyway); it leaves with its OWNER. */
     for (int i = 0; i < MC_MAX_LINKS; i++) {
@@ -515,7 +515,7 @@ static void map_evict(mimeshi_node *n, mimeshi_mapnode *m) {
         if (lnk_owner(n->lnk[i].a, n->lnk[i].b) == m->id)
             n->lnk[i].alive = 0;        /* P owned this link: it goes with P */
     }
-    ev_taboo_remember(n, m->id);       /* the taboo: this was a choice (4.3) */
+    ev_taboo_remember(n, m->id);       /* the taboo: this was a choice (6.1) */
     m->alive = 0;
 }
 
@@ -527,7 +527,7 @@ static mimeshi_mapnode *map_find(mimeshi_node *n, uint16_t id) {
 
 static int r_idx(mimeshi_node *n, uint16_t id);
 static uint32_t geo_dist2(uint16_t lat1, uint16_t lon1, uint16_t lat2, uint16_t lon2);
-/* Pool recycle at the cap (4.4, decided Oct 2026): the victim is
+/* Constellation recycle at the cap (6.2, decided Oct 2026): the victim is
  * chosen by ROUTING VALUE, not freshness. Two axes:
  *  - hop distance from us to the star (closer stays: cheaper to
  *    re-confirm, more likely on real routes);
@@ -613,9 +613,9 @@ static mimeshi_mapnode *map_add_geo(mimeshi_node *n, uint16_t id,
     if (m) return m;
     for (int i = 0; i < MC_MAP_NODES; i++)
         if (!n->map[i].alive) {
-            ev_taboo_forget(n, id);   /* re-entering the map ends the taboo (4.3) */
+            ev_taboo_forget(n, id);   /* re-entering the map ends the taboo (6.1) */
             n->map[i].alive = 1; n->map[i].id = id;
-            n->map[i].star_tick_seen = n->tick;   /* liveness starts now (4.4):
+            n->map[i].star_beat_seen = n->tick;   /* liveness starts now (6.2):
                                                      no tick known yet, the first
                                                      advance (or the threshold)
                                                      decides from here */
@@ -624,11 +624,11 @@ static mimeshi_mapnode *map_add_geo(mimeshi_node *n, uint16_t id,
             n->map[i].arrived_tick = n->tick;
             return &n->map[i];
         }
-    /* Pool full (4.4, decided Oct 2026): ADMISSION COMPETITION - the
+    /* Constellation full (6.2, decided Oct 2026): ADMISSION COMPETITION - the
      * arriving star takes part. Score the newcomer (hop distance,
-     * total link length) against the worst entry in the pool:
+     * total link length) against the worst entry in the constellation:
      *  - the newcomer is the worst -> NOT stored, directly on the
-     *    taboo (judged and rejected, 4.3): the pool is untouched. A
+     *    taboo (judged and rejected, 6.1): the constellation is untouched. A
      *    distant/thin star can no longer displace routing capital,
      *    and no half-filled shell of a rejected star circulates
      *    (the shell-mismatch cycle was the request storm of the
@@ -636,7 +636,7 @@ static mimeshi_mapnode *map_add_geo(mimeshi_node *n, uint16_t id,
      *  - the newcomer wins -> it takes the victim's slot; the victim
      *    goes on the taboo (map_evict).
      * Freshness is the EXPIRY trigger (24 h), never the recycle
-     * choice: at a full pool freshness is a rotation-timing lottery. */
+     * choice: at a full constellation freshness is a rotation-timing lottery. */
     evict_hop_fill(n);
     int victim = -1;
     uint8_t v_hop = 0; uint32_t v_len = 0;
@@ -672,10 +672,10 @@ static mimeshi_mapnode *map_add_geo(mimeshi_node *n, uint16_t id,
      * relevant measure for the head-to-head (physically near us is
      * near in hops too, whatever the current store happens to know).
      * Presence shells (glat 0) never compete: they have no form to
-     * score, so at a full pool they are not stored at all - a shell
+     * score, so at a full constellation they are not stored at all - a shell
      * is only an ID, losing it costs nothing. */
     if (!glat) {
-        return 0;                       /* shell at a full pool: not stored */
+        return 0;                       /* shell at a full constellation: not stored */
     }
     {
         int own_i = r_idx(n, n->id);
@@ -693,7 +693,7 @@ static mimeshi_mapnode *map_add_geo(mimeshi_node *n, uint16_t id,
         }
     }
     map_evict(n, &n->map[victim]);
-    ev_taboo_forget(n, id);   /* the newcomer is wanted - never tabooed (4.3) */
+    ev_taboo_forget(n, id);   /* the newcomer is wanted - never tabooed (6.1) */
     n->map[victim].alive = 1; n->map[victim].id = id;
     n->map[victim].geo_lat = 0; n->map[victim].geo_lon = 0;
     n->map[victim].quality = 0; n->map[victim].age_ticks = 255;
@@ -722,21 +722,21 @@ static mimeshi_link *lnk_add(mimeshi_node *n, uint16_t a, uint16_t b) {
     return 0;
 }
 
-/* Content stars per round packet (4.3): 8 x (9 B + links) fits 230 B. */
+/* Content stars per round packet (6.1): 8 x (9 B + links) fits 230 B. */
 #define MC_CHUNK_MAX_ENTRIES 8
 
-/* Table mutation feed (4.3): the local table counter marks the own
+/* Table mutation feed (6.1): the local table counter marks the own
  * star as changed; the next round carries it as content. Nothing is
- * scheduled here - the round timer is the only send path (4.3 hard
+ * scheduled here - the round timer is the only send path (6.1 hard
  * bound). */
 static void tbl_mark_dirty(mimeshi_node *n) {
     n->tbl_dirty = 1;
 }
 
-/* Neighbour addition (4.3): the new neighbour is a content change of
+/* Neighbour addition (6.1): the new neighbour is a content change of
  * the own star - the next round carries it. */
-/* Neighbour confirmation (4.3): the own star gains the link - and the
- * newcomer acceleration (4.3) turns the queue for it: the forward
+/* Neighbour confirmation (6.1): the own star gains the link - and the
+ * newcomer acceleration (6.1) turns the queue for it: the forward
  * state of all prefix stars resets, so the stars of the direct
  * neighbours re-enter the content queue and travel with the coming
  * rounds. The old cadence answered a newcomer with a delta plus a
@@ -754,8 +754,8 @@ static void tbl_nbr_added(mimeshi_node *n, uint16_t id) {
     }
 }
 
-/* ---------------- table chunks (4.3) ----------------
- * Prefix chunk, node-centric and self-contained (4.3):
+/* ---------------- table chunks (6.1) ----------------
+ * Prefix chunk, node-centric and self-contained (6.1):
  *   header: type(1) owner-id(2) chunk-nr(1) n-entries(1)
  *           owner-geo(4) fw-version(1)                      = 10 B
  *   entry:  node-id(2) class(1) age(1) geo(4) link-count(1) = 9 B
@@ -787,7 +787,7 @@ static void lnk_set_class(mimeshi_node *n, uint16_t from, uint16_t to, uint8_t c
     if (cls == 0) {
         /* A zero in an advertisement is NOT a measurement - it is an
          * absent one (the owner has not measured/published that
-         * direction yet, 4.3). Writing it would WIPE a class we
+         * direction yet, 6.1). Writing it would WIPE a class we
          * already learned through our own exchange (the hard-learned
          * lesson of the persistent zero-directions: every star round
          * re-published the not-yet-measured direction as 0 and reset
@@ -813,18 +813,18 @@ static void lnk_set_class(mimeshi_node *n, uint16_t from, uint16_t to, uint8_t c
     else           l->q = (uint8_t)((l->q & 0xF0) | cls);
 }
 
-/* ---- star canonicalisation (4.3) --------------------------------------- */
+/* ---- star canonicalisation (6.1) --------------------------------------- */
 /* The star is the unit of sharing in the star-round concept: one node
- * entry plus the links it OWNS. Canonical form (4.3): links sorted by
+ * entry plus the links it OWNS. Canonical form (6.1): links sorted by
  * neighbour id, so the star has a deterministic byte representation
  * independent of the internal table order - the basis for content
  * digests and the derivable heartbeat match. The entry layout follows
- * the chunk entry of 4.3 exactly (id, quality byte, age, geo), so a
+ * the chunk entry of 6.1 exactly (id, quality byte, age, geo), so a
  * star serialises to bytes a chunk receiver already understands. */
 #define MC_STAR_MAX_LINKS 64
 #define MC_STAR_MAX_BYTES (9 + 3 * MC_STAR_MAX_LINKS)
 
-/* Link ownership (4.3): one bit of a CRC-8 over the normalised pair.
+/* Link ownership (6.1): one bit of a CRC-8 over the normalised pair.
  * The owner of {A,B}: normalise a=min, b=max, hash the 4 bytes, bit 0
  * decides - set: a owns, else b. Both endpoints (and every receiver,
  * whatever the hop distance) compute the same owner from the pair
@@ -852,7 +852,7 @@ static uint16_t lnk_owner(uint16_t x, uint16_t y) {
 }
 
 /* Canonical epilogue of a serialised star: sort the collected links by
- * peer id (the canonical form of 4.3 - deterministic bytes independent of
+ * peer id (the canonical form of 6.1 - deterministic bytes independent of
  * internal table order), check the byte budget, and pack the link area
  * after the 9-byte entry. Returns the total star length, or 0 when the
  * links do not fit maxlen. */
@@ -865,7 +865,7 @@ static uint16_t star_pack_links(uint8_t *buf, uint16_t maxlen,
         ids[j] = id; qc[j] = q;
     }
     if (9 + 3 * cnt > maxlen) return 0;          /* does not fit */
-    buf[8] = (uint8_t)cnt;                       /* link count, chunk entry layout (4.3) */
+    buf[8] = (uint8_t)cnt;                       /* link count, chunk entry layout (6.1) */
     for (uint16_t i = 0; i < cnt; i++) {
         wr16(buf + 9 + 3 * i, ids[i]);
         buf[9 + 3 * i + 2] = qc[i];
@@ -874,17 +874,17 @@ static uint16_t star_pack_links(uint8_t *buf, uint16_t maxlen,
 }
 
 /* Serialise the star of node `center` as known by n - storage as
- * received (4.3): the entry (id, both quality classes, tick, geo) and
+ * received (6.1): the entry (id, both quality classes, tick, geo) and
  * every link OWNED by center, reproduced exactly as the origin
  * advertised them. For the OWN star (center == n->id) the classes of
  * the direct-neighbour links come from the neighbor table (the own
- * measurement and the peer's reported reverse quality, 4.2); for a
+ * measurement and the peer's reported reverse quality, 5.2); for a
  * foreign star the entry class byte is adv_q as received and the
  * link bytes come from the link store as received - the form the
  * origin put on air, so the content hash is a property of the
  * origin, not of the observer (the 6a finding, resolved in design).
- * age_out receives the age byte position in buf (the heartbeat tick
- * lives there, 4.3); the age byte itself is written but excluded from
+ * age_out receives the age byte position in buf (the beat
+ * lives there, 6.1); the age byte itself is written but excluded from
  * the content hash (mimeshi_star_content_hash). Returns the total
  * length, or 0 if the star does not exist or does not fit maxlen. */
 uint16_t mimeshi_star_serialize(mimeshi_node *n, uint16_t center,
@@ -899,8 +899,8 @@ uint16_t mimeshi_star_serialize(mimeshi_node *n, uint16_t center,
         /* the OWN entry: the origin publishes itself. The entry byte
          * is the own link picture toward the strongest confirmed
          * neighbour (own measured class | the class that neighbour
-         * reported about us, 4.2) - a stable, self-computed value.
-         * Self-publication (4.3 storage-as-received): the form is
+         * reported about us, 5.2) - a stable, self-computed value.
+         * Self-publication (6.1 storage-as-received): the form is
          * stored in the own adv_q, so the own catalogue digest is
          * computed over exactly the bytes the neighbours hold. */
         uint8_t q = 0;
@@ -915,27 +915,27 @@ uint16_t mimeshi_star_serialize(mimeshi_node *n, uint16_t center,
             q = (uint8_t)((adv_class_of(nb->quality) << 4)
                           | adv_class_of(nb->rev_quality));
         }
-        m->adv_q = adv_byte_hyst(m->adv_q, q);   /* hysteresis (4.3) */
+        m->adv_q = adv_byte_hyst(m->adv_q, q);   /* hysteresis (6.1) */
         buf[2] = m->adv_q;
     } else if (m->adv_q) {
         buf[2] = m->adv_q;              /* entry classes exactly as the
-                                           origin advertised them (4.3) */
+                                           origin advertised them (6.1) */
     } else {
         /* never received the star itself, only map material: the local
            measurement of the node's signal as the known class */
         buf[2] = (uint8_t)((adv_class_of(m->quality) << 4) | 0);
     }
-    buf[3] = m->star_tick;              /* heartbeat tick in the age byte (4.3):
+    buf[3] = m->star_beat;              /* beat in the age byte (6.1):
                                            the origin's liveness, not the
                                            travelled age - travelled age is
-                                           local (4.4) and never travels in
+                                           local (6.2) and never travels in
                                            the canonical star form */
     wr16(buf + 4, m->geo_lat);
     wr16(buf + 6, m->geo_lon);
     if (age_off_out) *age_off_out = 3;
 
-    /* links of the star, sorted by peer id (canonical form, 4.3).
-     * OWNED share only (4.3): the link {center, peer} travels in
+    /* links of the star, sorted by peer id (canonical form, 6.1).
+     * OWNED share only (6.1): the link {center, peer} travels in
      * exactly one star - the owner's. The owner bit is derived from
      * the pair itself, so every observer packs the same share. */
     uint16_t ids[MC_STAR_MAX_LINKS];
@@ -943,13 +943,13 @@ uint16_t mimeshi_star_serialize(mimeshi_node *n, uint16_t center,
     uint16_t cnt = 0;
     if (center == n->id) {
         /* the OWN star: the origin's own links come from the NEIGHBOR
-         * TABLE, not the link store (4.3) - the origin is the source
+         * TABLE, not the link store (6.1) - the origin is the source
          * of its own star, and at startup the store is still empty
          * (bootstrap: no star received yet, no link stored yet). Every
          * confirmed symmetric neighbour with the ownership bit on our
          * side travels, with the own measured class and the peer's
-         * reported reverse class (4.2), published under hysteresis
-         * (4.3): a >= 2-step class move re-publishes, sub-threshold
+         * reported reverse class (5.2), published under hysteresis
+         * (6.1): a >= 2-step class move re-publishes, sub-threshold
          * EWMA movement does not. */
         for (int i = 0; i < MC_MAX_NEIGHBORS && cnt < MC_STAR_MAX_LINKS; i++) {
             mimeshi_neighbor *pnb = &n->nbr[i];
@@ -970,7 +970,7 @@ uint16_t mimeshi_star_serialize(mimeshi_node *n, uint16_t center,
         if (n->lnk[i].a == center)      peer = n->lnk[i].b;
         else if (n->lnk[i].b == center) peer = n->lnk[i].a;
         else continue;
-        if (lnk_owner(center, peer) != center) continue;   /* owned share (4.3) */
+        if (lnk_owner(center, peer) != center) continue;   /* owned share (6.1) */
         if (map_find(n, peer) == 0) continue;  /* link endpoints are map nodes */
         uint8_t cf = lnk_class(n, center, peer);
         if (cf == 0xFF) continue;
@@ -983,7 +983,7 @@ uint16_t mimeshi_star_serialize(mimeshi_node *n, uint16_t center,
 }
 
 /* 1-byte content hash over the canonical star bytes EXCLUDING the age
- * byte (4.5): the digest covers what is advertised (identity, links,
+ * byte (5.3): the digest covers what is advertised (identity, links,
  * quality classes), not how old the advertisement is - silent EWMA
  * movement under the hysteresis does not change it, and the heartbeat
  * tick (added separately in the digest) can change freely. CRC-8/ATM
@@ -993,7 +993,7 @@ uint8_t mimeshi_star_content_hash(const uint8_t *star, uint16_t len,
                                   uint16_t age_off) {
     uint8_t crc = 0;
     for (uint16_t i = 0; i < len; i++) {
-        if (i == age_off) continue;              /* age excluded (4.5) */
+        if (i == age_off) continue;              /* age excluded (5.3) */
         crc ^= star[i];
         for (int b = 0; b < 8; b++)
             crc = (uint8_t)((crc & 0x80) ? (crc << 1) ^ 0x07 : crc << 1);
@@ -1001,56 +1001,56 @@ uint8_t mimeshi_star_content_hash(const uint8_t *star, uint16_t len,
     return crc;
 }
 
-/* Digest of a star as carried in the catalogue (4.5):
- * digest = (content_hash + tick) mod 256 - derivable: a receiver that
- * has the star can compute the expected digest for tick + k for small
+/* Digest of a star as carried in the catalogue (5.3):
+ * digest = (content_hash + beat) mod 256 - derivable: a receiver that
+ * has the star can compute the expected digest for beat + k for small
  * k, which is the heartbeat match. */
-uint8_t mimeshi_star_digest(uint8_t content_hash, uint8_t tick) {
-    return (uint8_t)(content_hash + tick);
+uint8_t mimeshi_star_digest(uint8_t content_hash, uint8_t beat) {
+    return (uint8_t)(content_hash + beat);
 }
 
-/* Heartbeat match (4.5): does `received` fit content_hash at
- * stored_tick + k for some k in 0..k_max? Returns the matched tick
- * advance (1..k_max), 0 for an exact same-tick match, or -1 when no
+/* Beat match (5.3): does `received` fit content_hash at
+ * stored_beat + k for some k in 0..k_max? Returns the matched beat
+ * advance (1..k_max), 0 for an exact same-beat match, or -1 when no
  * k fits (real content change, or a star we do not have). */
-/* ---- star round (4.5, proposal): the uniform convergence cadence --- */
-/* One chunk per interval (starting value 15 min = 15 proof ticks of
+/* ---- star round (5.3, proposal): the uniform convergence cadence --- */
+/* One chunk per interval (starting value 15 min = 15 ticks of
  * 1 min), all three channels like the re-share round. Content first
  * (stars that changed since they were last forwarded, nearest hops
  * first, the own star at the front), catalogue in the remaining space
  * ((node id, digest) at 3 B per star). Hard bound: never more than
- * one chunk per node per interval, whatever happens (4.5). The own
+ * one chunk per node per interval, whatever happens (5.3). The own
  * star travels in full at least once per hour regardless of its
- * queue position (4.5): the guaranteed own-star round. */
-#define MC_STAR_ROUND_TICKS   15u    /* 15 min interval in proof ticks (1 min each) */
+ * queue position (5.3): the guaranteed own-star round. */
+#define MC_STAR_ROUND_TICKS   15u    /* 15 min interval in ticks (1 min each) */
 #define MC_STAR_FLOOR_TICKS    5u     /* quiet-hour floor: 5 min (6e) - the interval
                                        may shorten to this when there is work and
                                        the channels are quiet */
 #define MC_STAR_QUIET_TICKS    4u     /* a channel is quiet for the acceleration
                                        gate when its ka_idle counter stands at
-                                       4+ proof ticks (4 min without any own
+                                       4+ ticks (4 min without any own
                                        identifying reception, 6e) */
 #define MC_STAR_ROUNDS_PER_H  4u     /* 60 min / 15 min: own-star bound */
-#define MC_STAR_CAT_RESERVE   30u     /* catalogue bytes reserved per round (4.5):
+#define MC_STAR_CAT_RESERVE   30u     /* catalogue bytes reserved per round (5.3):
                                         content may fill the chunk, but the last
                                         30 B are for catalogue entries - the age
                                         maintenance that keeps the resting map
                                         alive must not be starved by a content
                                         backlog; 4 rounds/h x 30 B = 40 entries/h
                                         minimum on air */
-#define PKT_STAR_ROUND        10     /* new packet type (4.5) */
+#define PKT_STAR_ROUND        10     /* new packet type (5.3) */
 #define F_STAR_CATALOGUE 0x10       /* chunk contains catalogue entries */
-#define F_STAR_MISSED   0x20         /* chunk contains missed-star requests (4.5) */
+#define F_STAR_MISSED   0x20         /* chunk contains missed-star requests (5.3) */
 
-/* Star age byte (4.5 heartbeat): the tick counter of the origin.
- * The round is also the tick driver of the own star: at the
- * guaranteed own-star round the tick advances and rides in the age
+/* Star age byte (5.3 heartbeat): the beat counter of the origin.
+ * The round is also the beat driver of the own star: at the
+ * guaranteed own-star round the beat advances and rides in the age
  * byte; neighbours derive the new digest without content. */
-static uint8_t star_own_tick(mimeshi_node *n) { return n->star_tick; }
+static uint8_t star_own_beat(mimeshi_node *n) { return n->star_beat; }
 
 static int r_idx(mimeshi_node *n, uint16_t id);
 
-/* Star-forward usefulness (4.5, graph check): does forwarding the star
+/* Star-forward usefulness (5.3, graph check): does forwarding the star
  * of `center` reach any neighbour that lies strictly FARTHER from the
  * center than we do? Hop distances over the known graph (map + link
  * store + our own edges), the same material routing uses - but pure
@@ -1063,7 +1063,7 @@ static int r_idx(mimeshi_node *n, uint16_t id);
  * echo back into the gradient: everyone we could reach got the star
  * from the same side we did. Unknown neighbours (no map slot, no
  * edges) count as FARTHER - absence of knowledge never silences the
- * forward (never prune on missing information, 4.5).
+ * forward (never prune on missing information, 5.3).
  *
  * Return 1 = useful (forward), 0 = useless (skip). */
 static uint8_t star_dist[MC_MAP_NODES];     /* BFS distances, 0xFF = unreached */
@@ -1131,7 +1131,7 @@ static uint8_t star_fwd_useful(mimeshi_node *n, uint16_t center) {
     return 0;                                 /* everyone is closer or equal: echo */
 }
 
-/* Build and send one star-round chunk (4.5). Return value: number of
+/* Build and send one star-round chunk (5.3). Return value: number of
  * content stars carried (0 = the chunk still went out, catalogue-only). */
 static int node_lonely(mimeshi_node *n);
 
@@ -1143,15 +1143,15 @@ static uint8_t star_round_send(mimeshi_node *n) {
     p[3] = 0;                             /* catalogue count, filled below */
     p[4] = 0;                                   /* content star count, filled below */
     wr16(p + 5, n->geo_lat); wr16(p + 7, n->geo_lon);
-    p[9] = 1;                                   /* firmware version (4.3 header shape) */
+    p[9] = 1;                                   /* firmware version (6.1 header shape) */
 
     /* --- content area: own star first, then nearest-first queue ---
      * The own star: the entry of n itself with its confirmed links,
      * serialised through the same canonical form. It is always a
      * candidate; with the own-star guarantee it goes in as soon as
-     * the hour bound is reached, and its tick advances then. Under
-     * the rotation (4.3) the guaranteed own-star round fires when the
-     * rotation lands on the OWN HOME channel: the tick stays coupled
+     * the hour bound is reached, and its beat advances then. Under
+     * the rotation (6.1) the guaranteed own-star round fires when the
+     * rotation lands on the OWN HOME channel: the beat stays coupled
      * to the home channel, ~1x per hour at the 15-min starting value. */
     uint8_t carried = 0;
     uint8_t queued_left = 0;                /* stars packed but not yet fully carried */
@@ -1159,7 +1159,7 @@ static uint8_t star_round_send(mimeshi_node *n) {
     int home_round = (rot_ch == n->home_ch);
     /* guaranteed own-star round: every time the rotation lands on the
      * own home channel (~1x per 3 intervals = ~45 min at the 15-min
-     * starting value - the once-per-hour bound of 4.3 stays honoured
+     * starting value - the once-per-hour bound of 6.1 stays honoured
      * as a lower bound). star_own_ctr counts home rounds since the
      * last guaranteed carry. */
     int own_due = home_round
@@ -1177,9 +1177,9 @@ static uint8_t star_round_send(mimeshi_node *n) {
             om->geo_lat = n->geo_lat; om->geo_lon = n->geo_lon;
             uint16_t sl = mimeshi_star_serialize(n, n->id, sbuf, sizeof sbuf, &age_off);
             if (sl > 0 && len + sl <= 230) {
-                if (own_due) { n->star_own_ctr = 0; n->star_tick++; }
+                if (own_due) { n->star_own_ctr = 0; n->star_beat++; }
                 else n->star_own_ctr++;
-                sbuf[age_off] = star_own_tick(n);   /* heartbeat tick in the age byte (4.5) */
+                sbuf[age_off] = star_own_beat(n);   /* beat in the age byte (5.3) */
                 memcpy(p + len, sbuf, sl);
                 len = (uint16_t)(len + sl);
                 carried++;
@@ -1192,7 +1192,7 @@ static uint8_t star_round_send(mimeshi_node *n) {
     /* queue: stars whose CONTENT changed since they were last
      * carried, nearest hops first - prefix stars (direct neighbours)
      * before tail stars, in map order. The queue decision is the
-     * content hash (4.5): a star goes back on the queue only when its
+     * content hash (5.3): a star goes back on the queue only when its
      * advertised content differs from the hash of its last carried
      * form; a mere age/refresh touch or sub-hysteresis EWMA movement
      * does NOT re-send it - the catalogue entry below is the cheap
@@ -1201,15 +1201,15 @@ static uint8_t star_round_send(mimeshi_node *n) {
      * guard is needed.
      *
      * No entry cap: stars pack until they do not fit the chunk - the
-     * byte budget of the packet is the bound (4.5), not an entry
-     * count inherited from the 4.3 chunk format. Thin stars pack many
+     * byte budget of the packet is the bound (5.3), not an entry
+     * count inherited from the 6.1 chunk format. Thin stars pack many
      * per round (fast convergence where the air allows it), thick
      * stars few. What was carried is remembered per star
      * (star_fwd_tick + star_fwd_hash), so the next round simply
      * continues with what did not fit: a backlog drains over rounds,
      * bounded by the hard one-chunk-per-interval rule.
      *
-     * One exception (4.5): the last MC_STAR_CAT_RESERVE bytes stay free
+     * One exception (5.3): the last MC_STAR_CAT_RESERVE bytes stay free
      * for catalogue entries. The catalogue is the heartbeat of the
      * resting network - without a guaranteed trickle of digests the
      * ages would run dry during a sustained content backlog and the
@@ -1222,14 +1222,14 @@ static uint8_t star_round_send(mimeshi_node *n) {
             if (!m->alive || m->id == n->id) continue;
             int is_prefix = nbr_find(n, m->id) != 0;
             if ((pass == 0) != (is_prefix != 0)) continue;   /* pass 0: prefix first */
-            /* graph pruning (4.5): skip the star when every known
+            /* graph pruning (5.3): skip the star when every known
              * neighbour lies closer to (or level with) its center than
              * we do - the forward would be an echo back into the
              * gradient. Unknown neighbours never silence: no pruning
              * on missing information. The star stays in the map and
              * keeps its queue state; the missed list of a neighbour
              * that nevertheless wants it re-queues it explicitly. */
-            /* pruning - unless a neighbour explicitly asked (4.3): a
+            /* pruning - unless a neighbour explicitly asked (6.1): a
              * fresh star_wanted overrides the gradient check for a few
              * intervals; the answer rides the next rounds. */
             int wanted = m->star_wanted != 0
@@ -1238,12 +1238,12 @@ static uint8_t star_round_send(mimeshi_node *n) {
             uint8_t sbuf[MC_STAR_BUF];
             uint16_t sl = mimeshi_star_serialize(n, m->id, sbuf, sizeof sbuf, 0);
             if (sl == 0 || len + sl > 230 - MC_STAR_CAT_RESERVE) continue;  /* full
-                                          or would eat the catalogue reserve (4.3):
+                                          or would eat the catalogue reserve (6.1):
                                           stays queued for the next round */
             uint8_t h = mimeshi_star_content_hash(sbuf, sl, 3);
             if (m->star_fwd_tick != 0) {
                 if (h == m->star_fwd_hash && (m->star_fwd_bits & 7) == 7)
-                    continue;   /* unchanged and fully carried: done (4.3) */
+                    continue;   /* unchanged and fully carried: done (6.1) */
                 if (h != m->star_fwd_hash)
                     m->star_fwd_bits = 0;   /* content change: all channels again */
             }
@@ -1259,8 +1259,8 @@ static uint8_t star_round_send(mimeshi_node *n) {
 
     /* --- catalogue area: (node id, digest) in the remaining space ---
      * 3 B per star: what we have, in which version - the receiver
-     * resets ages on a derivable match and prunes its own queue (4.5).
-     * Own entry first (content hash of the own star + tick), then the
+     * resets ages on a derivable match and prunes its own queue (5.3).
+     * Own entry first (content hash of the own star + beat), then the
      * map, nearest first again. */
     uint16_t cat_cnt = 0;
     if (len + 3 <= 230) {
@@ -1271,12 +1271,12 @@ static uint8_t star_round_send(mimeshi_node *n) {
             if (sl > 0) {
                 uint8_t h = mimeshi_star_content_hash(sbuf, sl, 3);
                 wr16(p + len, n->id);
-                p[len + 2] = mimeshi_star_digest(h, star_own_tick(n));
+                p[len + 2] = mimeshi_star_digest(h, star_own_beat(n));
                 len += 3; cat_cnt++;
             }
         }
     }
-    /* Catalogue prioritisation (4.3, from the scenario-6 rest
+    /* Catalogue prioritisation (6.1, from the scenario-6 rest
      * measurement: the resting round carried ~40 triples of which most
      * confirmed knowledge that was fresh anyway). The limited space
      * goes to what is actually needed first; untriggered stars ride
@@ -1306,15 +1306,15 @@ static uint8_t star_round_send(mimeshi_node *n) {
             uint16_t sl = mimeshi_star_serialize(n, m->id, sbuf, sizeof sbuf, 0);
             if (sl == 0) continue;
             uint8_t h = mimeshi_star_content_hash(sbuf, sl, 3);
-            /* tick of a foreign star: its forwarded age byte at arrival
-             * (the origin's tick as it reached us); stored per map entry
-             * as the low bits of arrived_tick are local - the tick
+            /* beat of a foreign star: its forwarded age byte at arrival
+             * (the origin's beat as it reached us); stored per map entry
+             * as the low bits of arrived_tick are local - the beat
              * itself rides in the age byte of the star content, which
              * the digest derivation adds. Use the star's own age byte:
-             * the serialised age IS the tick (4.3). */
-            uint8_t tick = sbuf[3];
+             * the serialised age IS the beat (6.1). */
+            uint8_t beat = sbuf[3];
             wr16(p + len, m->id);
-            p[len + 2] = mimeshi_star_digest(h, tick);
+            p[len + 2] = mimeshi_star_digest(h, beat);
             len += 3; cat_cnt++;
         }
     }
@@ -1326,7 +1326,7 @@ static uint8_t star_round_send(mimeshi_node *n) {
                                               self-contained, no cursor) */
     if (cat_cnt) p[0] |= F_STAR_CATALOGUE;
 
-    /* --- missed area (4.5): requests to specific neighbours ---
+    /* --- missed area (5.3): requests to specific neighbours ---
      * (neighbour id, n, star ids...) at 3 B + 2 B per star; the named
      * neighbour resets the last-carried state of those stars, so they
      * re-enter the content queue and travel with its next round. The
@@ -1336,11 +1336,11 @@ static uint8_t star_round_send(mimeshi_node *n) {
         uint8_t carried_miss = 0;
         for (uint8_t i = 0; i < MC_STAR_MISS_MAX; i++) {
             if (!n->star_miss[i].alive) continue;
-            if (n->star_miss[i].tries >= 2) {   /* damped out (4.5) */
+            if (n->star_miss[i].tries >= 2) {   /* damped out (5.3) */
                 n->star_miss[i].alive = 0;
                 continue;
             }
-            if (!nbr_find(n, n->star_miss[i].nb)) {   /* neighbour gone (4.5):
+            if (!nbr_find(n, n->star_miss[i].nb)) {   /* neighbour gone (5.3):
                                                           the request could never
                                                           be answered - drop it */
                 n->star_miss[i].alive = 0;
@@ -1360,7 +1360,7 @@ static uint8_t star_round_send(mimeshi_node *n) {
         if (carried_miss) { p[0] |= F_STAR_MISSED; len = off; }
     }
 
-    /* --- channel rotation with the backlog override (4.3) ---
+    /* --- channel rotation with the backlog override (6.1) ---
      * At rest (no backlog: everything packed fits, nothing stays
      * queued) the round goes out on ONE channel: the rotation channel
      * (home + round counter) mod 3. The resting overhead is paid once
@@ -1374,7 +1374,7 @@ static uint8_t star_round_send(mimeshi_node *n) {
      * round sets all three carried bits in one blow. */
     {
         int backlog = (queued_left > 0) || (carried >= 8);
-        /* lonely nodes spread in full (4.5): the accelerated round is the
+        /* lonely nodes spread in full (5.3): the accelerated round is the
          * discovery mechanism - neighbours on all home channels must hear
          * it, exactly like the old startup hello round */
         int spread = backlog || node_lonely(n);
@@ -1384,7 +1384,7 @@ static uint8_t star_round_send(mimeshi_node *n) {
             bound_send(n, c, p, len, t_data_us(len));
             ka_called(n, c);
         }
-        /* carried-on-channel bits (4.3): a star leaves the queue only
+        /* carried-on-channel bits (6.1): a star leaves the queue only
          * when all three bits stand (or a content change resets them) */
         for (int i = 0; i < MC_MAP_NODES; i++) {
             mimeshi_mapnode *m = &n->map[i];
@@ -1399,34 +1399,34 @@ static uint8_t star_round_send(mimeshi_node *n) {
     return carried;
 }
 
-/* Reception of a star-round chunk (4.5, receiver step).
+/* Reception of a star-round chunk (5.3, receiver step).
  *
  * The CONTENT area carries stars in exactly the chunk entry layout of
- * 4.3 (id, classes, age, geo, links) - so the content processing goes
+ * 6.1 (id, classes, age, geo, links) - so the content processing goes
  * through the ordinary chunk entry path: a receiver that only
  * understands chunks still gets the full benefit of the content, and
- * the symmetry evidence (an owner naming us) keeps working (4.3).
+ * the symmetry evidence (an owner naming us) keeps working (6.1).
  *
  * The CATALOGUE area carries (node id, digest) at 3 B: what the
  * sender has, in which version. For each entry about a star we know:
- *  - derivable match (digest = content_hash + tick + k, k <= window):
+ *  - derivable match (digest = content_hash + beat + k, k <= window):
  *    the star is unchanged and its origin is alive; we advance the
  *    tick and RESET the travelled age of that star as received from
- *    this source (4.5): fresh-beats-old keeps working without a
+ *    this source (5.3): fresh-beats-old keeps working without a
  *    single content byte.
  *  - no fit: a real content change or a gap - the missed-list step
- *    (later sub-step of 4.5) takes this from here.
+ *    (later sub-step of 5.3) takes this from here.
  *
  * We cannot see the sender's own star tick directly: the catalogue
  * entry for the sender's own star carries its digest, and a match
  * there also confirms the sender's liveness.
  *
  * The digest of a foreign star in OUR store: the content hash over
- * our canonical serialisation (age excluded) plus the tick we last
+ * our canonical serialisation (age excluded) plus the beat we last
  * saw riding in the star's age byte - stored per map entry.
  */
-#define MC_STAR_K_MAX 8u        /* tick-lag window (4.3, starting value) */
-#define MC_STAR_DEAD_TICKS 360u  /* liveness threshold (4.4): a star whose origin
+#define MC_STAR_K_MAX 8u        /* beat-lag window (6.1, starting value) */
+#define MC_STAR_DEAD_TICKS 360u  /* liveness threshold (6.2): a star whose origin
                                    tick has not advanced for 6 h of 1-min proof
                                    ticks is dead - de-weighted at half, evicted at the
                                    threshold, whatever the forwarded copies say */
@@ -1435,7 +1435,7 @@ static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
                           uint16_t len, int star_mode);
 static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t len);
 
-/* Missed list (4.5): a catalogue mismatch (star unknown here, or a
+/* Missed list (5.3): a catalogue mismatch (star unknown here, or a
  * digest that fits no tick) becomes a request to the ADVERTISER - not
  * a pull exchange: the request rides the own round, the answer rides
  * the neighbour's next round as ordinary content. Damped: at most 2
@@ -1444,7 +1444,7 @@ static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t 
  * request (fresh-beats-old and the regular rounds remain the net). */
 static void star_miss_add(mimeshi_node *n, uint16_t nb, uint16_t star) {
     if (nb == n->id) return;
-    if (!nbr_find(n, nb)) return;              /* only direct neighbours (4.5:
+    if (!nbr_find(n, nb)) return;              /* only direct neighbours (5.3:
                                                   channel-filtered by design) */
     for (uint8_t i = 0; i < MC_STAR_MISS_MAX; i++) {
         if (n->star_miss[i].alive && n->star_miss[i].nb == nb
@@ -1464,7 +1464,7 @@ static void star_miss_add(mimeshi_node *n, uint16_t nb, uint16_t star) {
 }
 
 /* A star we were missing arrived (content or derivable match): clear
- * every miss entry about it (4.5 damping: no re-request after fetch). */
+ * every miss entry about it (5.3 damping: no re-request after fetch). */
 static void star_miss_clear(mimeshi_node *n, uint16_t star) {
     for (uint8_t i = 0; i < MC_STAR_MISS_MAX; i++)
         if (n->star_miss[i].alive && n->star_miss[i].star == star)
@@ -1477,7 +1477,7 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
     if (len < 10) return;
     uint16_t owner = rd16(pkt + 1);      /* the advertiser: miss requests address it */
 
-    /* Liveness (4.4, fixed Oct 2026, the warmup expiry finding): a star
+    /* Liveness (6.2, fixed Oct 2026, the warmup expiry finding): a star
      * round is an IDENTIFYING transmission of its advertiser - the id
      * is in the header, and every node sends one each round (~45 min).
      * A direct neighbour's own round therefore proves it is alive;
@@ -1489,7 +1489,7 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
     if (owner != n->id) {
         mimeshi_neighbor *onb = nbr_find(n, owner);
         if (!onb && quality_ok(quality_of(rssi)))
-            onb = nbr_add(n, owner);      /* discovery (4.5): a strongly heard
+            onb = nbr_add(n, owner);      /* discovery (5.3): a strongly heard
                                              round is the identifying
                                              transmission of a new neighbour;
                                              weak receptions add nothing */
@@ -1497,22 +1497,22 @@ static void star_round_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint
             onb->last_seen = 0;
             onb->quality = quality_of(rssi);
         }
-        hello_ack_wait(n, owner, rssi);   /* generalized ack trigger (4.5) */
+        hello_ack_wait(n, owner, rssi);   /* generalized ack trigger (5.3) */
     }
 
     /* --- content area: chunk entry layout, processed via chunk_rx ---
-     * The header (10 B) is identical to a 4.3 chunk, and the entries
+     * The header (10 B) is identical to a 6.1 chunk, and the entries
      * follow the same layout. chunk_rx() expects p[4] entries and
      * processes exactly that: reuse it wholesale by handing it the
      * same packet; the type nibble differs but chunk_rx does not
      * look at it.
      *
-     * After the pass, the star semantics differ from a plain 4.3
+     * After the pass, the star semantics differ from a plain 6.1
      * chunk in exactly one field: the age byte of a star-round entry
-     * carries the ORIGIN HEARTBEAT TICK (4.5), not the travelled age.
-     * chunk_rx stored it into age_ticks; we move it to star_tick and
+     * carries the ORIGIN HEARTBEAT TICK (5.3), not the travelled age.
+     * chunk_rx stored it into age_ticks; we move it to star_beat and
      * reset age_ticks to 0 - the star arrived NOW, its travelled age
-     * starts here (4.4 semantics), and the tick is the liveness. */
+     * starts here (6.2 semantics), and the beat is the liveness. */
     uint16_t cend = 10;                      /* end of the content area */
     for (uint8_t e = 0; e < pkt[4] && cend + 9 <= len; e++)
         cend = (uint16_t)(cend + 9 + 3 * pkt[cend + 8]);   /* walk the content stars */
@@ -1528,29 +1528,29 @@ chunk_rx_mode(n, rssi, pkt, cend, 1);   /* entries only: the catalogue and
             if (eid != n->id) {                    /* our own star is not in the map */
                 mimeshi_mapnode *em = map_find(n, eid);
                 if (em) {
-                    /* fresh beats old (4.3): a form that lags more than
-                     * the k-window behind the stored tick is a stale
+                    /* fresh beats old (6.1): a form that lags more than
+                     * the k-window behind the stored beat is a stale
                      * re-send - the newer knowledge stands, only the
                      * request is settled. */
-                    int16_t d = (int16_t)((int16_t)em->star_tick - (int16_t)pkt[off + 3]);
+                    int16_t d = (int16_t)((int16_t)em->star_beat - (int16_t)pkt[off + 3]);
                     if (!(em->adv_q
                           && (d > (int16_t)MC_STAR_K_MAX || d < -(int16_t)MC_STAR_K_MAX))) {
-                        if ((int16_t)pkt[off + 3] != (int16_t)em->star_tick)
-                            em->star_tick_seen = n->tick;   /* liveness: the origin tick advanced (4.4) */
-                        em->star_tick = pkt[off + 3];  /* the tick as it traveled (4.3) */
+                        if ((int16_t)pkt[off + 3] != (int16_t)em->star_beat)
+                            em->star_beat_seen = n->tick;   /* liveness: the origin beat advanced (6.2) */
+                        em->star_beat = pkt[off + 3];  /* the beat as it traveled (6.1) */
                         em->age_ticks = 0;              /* arrived NOW: travelled age starts here */
                         em->arrived_tick = n->tick;
                     }
                 }
                 star_miss_clear(n, eid);            /* a missing star arrived:
-                                                     its requests are settled (4.3) */
+                                                     its requests are settled (6.1) */
             }
             if (rx_star_n < MC_CHUNK_MAX_ENTRIES) rx_star[rx_star_n++] = eid;
             off += 9 + 3 * pkt[off + 8];
         }
     }
 
-    /* --- catalogue area: after the content stars (4.5) ---
+    /* --- catalogue area: after the content stars (5.3) ---
      * The number of content stars is p[4]; the entries follow the
      * chunk entry layout, so the catalogue starts after the last
      * content star. (n, digest) triples fill the rest. */
@@ -1568,19 +1568,19 @@ chunk_rx_mode(n, rssi, pkt, cend, 1);   /* entries only: the catalogue and
             if (rx_star[i] == sid) { in_content = 1; break; }
         if (in_content) continue;                 /* fresh content beats the
                                                      catalogue mismatch: no
-                                                     request (4.5) */
+                                                     request (5.3) */
         mimeshi_mapnode *m = map_find(n, sid);
         if (!m) {
             /* the neighbour advertises a star we do not hold: either
-             * a genuine gap (never had it) or OUR eviction (the pool
-             * recycle, 4.4). The taboo (4.3) sorts these out: an
+             * a genuine gap (never had it) or OUR eviction (the constellation
+             * recycle, 6.2). The taboo (6.1) sorts these out: an
              * evicted star was a policy choice - requesting it back
-             * is the pool-pressure cycle. Only genuine gaps ask. */
+             * is the constellation-pressure cycle. Only genuine gaps ask. */
             /* A catalogue entry means the neighbour HOLDS the star (a
              * missed advertisement): a legitimate ask - ALSO at a
-             * full pool, because the answer is judged on arrival by
+             * full constellation, because the answer is judged on arrival by
              * the admission competition (it may be better than what
-             * we have; if not, it lands on the taboo, 4.3). The
+             * we have; if not, it lands on the taboo, 6.1). The
              * taboo still blocks the already-judged. Link claims
              * never create requests: they carry no 'the neighbour has
              * this star' promise - only the catalogue does. */
@@ -1589,42 +1589,42 @@ chunk_rx_mode(n, rssi, pkt, cend, 1);   /* entries only: the catalogue and
             continue;
         }
         /* our version: content hash over our canonical bytes (age
-         * excluded), tick = the heartbeat as it reached us. */
+         * excluded), beat = the heartbeat as it reached us. */
         uint8_t sbuf[MC_STAR_BUF];
         uint16_t sl = mimeshi_star_serialize(n, sid, sbuf, sizeof sbuf, 0);
         if (sl == 0) continue;
         uint8_t h = mimeshi_star_content_hash(sbuf, sl, 3);
-        uint8_t our_tick = m->star_tick;        /* origin heartbeat tick (4.5):
+        uint8_t our_beat = m->star_beat;        /* origin beat (5.3):
                                                    separate from age_ticks, which
-                                                   keeps its 4.4 meaning */
-        int k = mimeshi_star_tick_match(digest, h, our_tick, MC_STAR_K_MAX);
+                                                   keeps its 6.2 meaning */
+        int k = mimeshi_star_beat_match(digest, h, our_beat, MC_STAR_K_MAX);
         if (k != -1) {
-            /* derivable match (4.3): unchanged, origin alive. Advance
-             * the tick and reset the travelled age - the knowledge is
+            /* derivable match (6.1): unchanged, origin alive. Advance
+             * the beat and reset the travelled age - the knowledge is
              * confirmed without content. A star we were missing is
              * hereby settled: clear its miss entries. A lagging
              * advertisement (k > 16: a slower route) confirms the same
-             * content: only the age refreshes, the newer stored tick
+             * content: only the age refreshes, the newer stored beat
              * stands (the origin has already reached it). */
             if (k > 0 && k <= (int)MC_STAR_K_MAX) {
-                m->star_tick = (uint8_t)(our_tick + (uint8_t)k);
-                m->star_tick_seen = n->tick;   /* liveness: the origin tick advanced (4.4) */
+                m->star_beat = (uint8_t)(our_beat + (uint8_t)k);
+                m->star_beat_seen = n->tick;   /* liveness: the origin beat advanced (6.2) */
             }
-            m->age_ticks = 0;                   /* travelled age restarts (4.4) */
-            m->arrived_tick = n->tick;          /* fresh as of NOW (4.4) */
+            m->age_ticks = 0;                   /* travelled age restarts (6.2) */
+            m->arrived_tick = n->tick;          /* fresh as of NOW (6.2) */
             star_miss_clear(n, sid);
         } else {
             /* no tick fits: a real content change upstream, a hash
              * collision - or a star WE evicted (the neighbour still has
-             * it). The eviction taboo (4.3) sorts this out: a star in
+             * it). The eviction taboo (6.1) sorts this out: a star in
              * the taboo was our policy choice, requesting it back is
-             * the pool-pressure cycle - no request. Genuine gaps (not
+             * the constellation-pressure cycle - no request. Genuine gaps (not
              * in the taboo) ask as before. */
-            /* No tick fits. Only a COMPLETE local form (star_tick set:
+            /* No beat fits. Only a COMPLETE local form (star_beat set:
              * we once received the origin's full star) can be outdated
              * - a missed advertisement of a newer form: ask, the
-             * answer is judged on arrival (4.4). A PRESENCE SHELL
-             * (star_tick 0: only an ID from a link claim, no form)
+             * answer is judged on arrival (6.2). A PRESENCE SHELL
+             * (star_beat 0: only an ID from a link claim, no form)
              * mismatches every digest BY CONSTRUCTION - the shell never
              * carried the origin's links, so its bare bytes cannot
              * match the advertised full form. That mismatch is a
@@ -1634,16 +1634,16 @@ chunk_rx_mode(n, rssi, pkt, cend, 1);   /* entries only: the catalogue and
              * delivers the full form; from then the entry is a real
              * form and a future nofit is a genuine missed
              * advertisement. The taboo blocks the already-judged. */
-            if (m->star_tick != 0 && !ev_taboo_check(n, sid))
+            if (m->star_beat != 0 && !ev_taboo_check(n, sid))
                 star_miss_add(n, owner, sid);
         }
     }
 
-    /* --- missed area (4.5): requests addressed to US ---
+    /* --- missed area (5.3): requests addressed to US ---
      * A neighbour is missing a star (or saw a content change): reset
      * the last-carried state so the star re-enters the content queue
      * and travels with our next round - no exchange, no ack, the
-     * regular cadence is the answer (4.5). */
+     * regular cadence is the answer (5.3). */
     if (pkt[0] & F_STAR_MISSED) {
         uint16_t moff = cat_end;                /* where the catalogue ended */
         for (; moff + 3 <= len;) {
@@ -1660,7 +1660,7 @@ chunk_rx_mode(n, rssi, pkt, cend, 1);   /* entries only: the catalogue and
                         m->star_fwd_hash = 0;
                         m->star_wanted = n->tick;   /* explicit ask: the
                                         pruning yields for a few
-                                        intervals (4.3) */
+                                        intervals (6.1) */
                     }
                 }
             }
@@ -1669,7 +1669,7 @@ chunk_rx_mode(n, rssi, pkt, cend, 1);   /* entries only: the catalogue and
     }
 }
 
-/* Round timer (4.3): per-node phase offset; the interval is the hard
+/* Round timer (6.1): per-node phase offset; the interval is the hard
  * bound - one chunk per node per interval.
  *
  * Quiet-hour acceleration (6e): when the last round left content work
@@ -1681,11 +1681,11 @@ chunk_rx_mode(n, rssi, pkt, cend, 1);   /* entries only: the catalogue and
  * the full interval stands, and the acceleration self-clears at rest
  * (no backlog, no shortening). The hard bound is untouched - the round
  * still sends at most one chunk, just sooner. */
-/* Lonely node (4.5): no confirmed neighbour. Drives the accelerated
+/* Lonely node (5.3): no confirmed neighbour. Drives the accelerated
  * full-spread star round - the replacement of the old startup hello
  * rounds. A fresh node is always lonely; the first confirmation ends
  * the acceleration (the normal rotation takes over). The cadence
- * itself doubles per unconfirmed round (star_lonely_ctr, 4.5) so the
+ * itself doubles per unconfirmed round (star_lonely_ctr, 5.3) so the
  * acceleration decays even without confirmation. */
 static int node_lonely(mimeshi_node *n) {
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++)
@@ -1696,10 +1696,10 @@ static int node_lonely(mimeshi_node *n) {
 static void star_round_tick(mimeshi_node *n, void *ud) {
     (void)ud;
     n->star_round_sched = 0;
-    if (n->tbl_dirty) { n->tbl_dirty = 0; }       /* the round carries mutations (4.3) */
+    if (n->tbl_dirty) { n->tbl_dirty = 0; }       /* the round carries mutations (6.1) */
     star_round_send(n);
     n->star_round_sched = 1;
-    /* Three-way closure, re-anchored (4.5): the star round is the
+    /* Three-way closure, re-anchored (5.3): the star round is the
      * identifying transmission that collects the generalized acks; at
      * the end of the ack window one COLLECTIVE proof ack confirms all
      * responders of this round - but only when acks actually arrived
@@ -1712,7 +1712,7 @@ static void star_round_tick(mimeshi_node *n, void *ud) {
         n->timer(n, MC_HELLO_ACK_WIN_US + MC_HELLO_ACK_JITTER_US + t_ack_us(),
                  proof_ack_fire, 0);
     }
-    /* lonely ladder (4.5): the acceleration is the discovery mechanism,
+    /* lonely ladder (5.3): the acceleration is the discovery mechanism,
      * but it needs the old hello's doubling brake - a node that keeps
      * failing to confirm (the startup storm, or an isolated node whose
      * links never clear the quality gate) must not hammer full spread
@@ -1743,26 +1743,26 @@ static void star_round_tick(mimeshi_node *n, void *ud) {
              + (n->rand(n) % MC_KEEPALIVE_TICK_US), star_round_tick, 0);
 }
 
-/* Heartbeat tick match (4.3): the received digest fits when it was
- * computed from the same content hash at stored_tick + k, for small
+/* Beat match (6.1): the received digest fits when it was
+ * computed from the same content hash at stored_beat + k, for small
  * k. The window is SYMMETRIC: a catalogue may lag behind our stored
- * tick (a slower route carried the newer tick here first, 4.3) - an
+ * tick (a slower route carried the newer tick here first, 6.1) - an
  * older advertisement with the same content hash still confirms the
  * content. Return convention: 0 = exact, 1..k_max = the advertisement
- * is AHEAD (advance the stored tick by k), 17..16+k_max = the
- * advertisement LAGS by (r - 16) (keep the stored tick, only the age
+ * is AHEAD (advance the stored beat by k), 17..16+k_max = the
+ * advertisement LAGS by (r - 16) (keep the stored beat, only the age
  * refreshes), -1 = no fit (a real content change, or an unknown
  * star). The two windows cannot collide with the sentinel. */
 #define MC_TICK_LAG_BASE 16
-int mimeshi_star_tick_match(uint8_t received, uint8_t content_hash,
-                           uint8_t stored_tick, uint8_t k_max) {
-    if (received == mimeshi_star_digest(content_hash, stored_tick)) return 0;
+int mimeshi_star_beat_match(uint8_t received, uint8_t content_hash,
+                           uint8_t stored_beat, uint8_t k_max) {
+    if (received == mimeshi_star_digest(content_hash, stored_beat)) return 0;
     for (uint8_t k = 1; k <= k_max; k++) {
         if (received == mimeshi_star_digest(content_hash,
-                                            (uint8_t)(stored_tick + k)))
+                                            (uint8_t)(stored_beat + k)))
             return (int)k;
         if (received == mimeshi_star_digest(content_hash,
-                                            (uint8_t)(stored_tick - k)))
+                                            (uint8_t)(stored_beat - k)))
             return (int)k + MC_TICK_LAG_BASE;
     }
     return -1;
@@ -1774,32 +1774,32 @@ int mimeshi_star_tick_match(uint8_t received, uint8_t content_hash,
  * 2026): ETX per link = 1/p on the integer scale x16, one lookup table
  * indexed on the advertised quality class; the route cost is the sum
  * over the path, so the computation minimises the expected number of
- * transmissions. Age multiplier (10.2): an endpoint above half of
+ * transmissions. Age multiplier (7.1): an endpoint above half of
  * T_active makes the edge 1.5x as expensive, above T_active itself
  * 3x - stale knowledge loses against fresh. First step (hard
- * requirement, 10.1): only confirmed symmetric neighbours above the
+ * requirement, 6.3): only confirmed symmetric neighbours above the
  * quality threshold. */
-#define MC_ROUTE_SCALE 16u                /* cost 1.0 (10.2) */
+#define MC_ROUTE_SCALE 16u                /* cost 1.0 (7.1) */
 static const uint16_t mc_etx_class[8] = {
-    0,                                /* class 0: not routable (10.2) */
+    0,                                /* class 0: not routable (7.1) */
     228, 145, 94, 64, 43, 29, 20      /* classes 1..7: cost x16 (10.2 table) */
 };
 
 /* Age multiplier on an edge endpoint: follows the effective age of the
- * map entry (4.4), in proof ticks (1 min). Returns 2 = 1.5x, 3 = 3x. */
+ * map entry (6.2), in ticks (1 min). Returns 2 = 1.5x, 3 = 3x. */
 static uint16_t route_age_mult(uint32_t age) {
     if (age >= MC_T_ACTIVE_TICKS) return 3;
     if (age >= MC_T_ACTIVE_TICKS / 2) return 2;
     return 0;
 }
 
-/* Liveness de-weight (4.4): a star whose origin tick has stalled for
+/* Liveness de-weight (6.2): a star whose origin tick has stalled for
  * more than half the liveness threshold costs like a half-stale entry
  * - the routes move away from possibly-dead knowledge before the
  * eviction takes it out entirely. */
 static uint16_t route_live_mult(mimeshi_node *n, mimeshi_mapnode *m) {
     if (m->id == n->id) return 0;               /* the own star is alive by definition */
-    if (n->tick - m->star_tick_seen < MC_STAR_DEAD_TICKS / 2) return 0;
+    if (n->tick - m->star_beat_seen < MC_STAR_DEAD_TICKS / 2) return 0;
     return 2;
 }
 
@@ -1811,7 +1811,7 @@ static uint32_t mult_apply(uint32_t c, uint16_t m) {
 
 /* Cost of the own edge toward a confirmed neighbour: the measured
  * quality class (finer than the advertised classes), with the age
- * addition of the map entry when we have one. Penalty (10.4) follows
+ * addition of the map entry when we have one. Penalty (8.5) follows
  * in a later building step. */
 static uint32_t route_edge_own(mimeshi_node *n, mimeshi_neighbor *nb) {
     /* the AUTHORITATIVE class (decided Oct 2026): the star of the link
@@ -1842,7 +1842,7 @@ static uint32_t route_edge_own(mimeshi_node *n, mimeshi_neighbor *nb) {
     return c;
 }
 
-/* Dijkstra scratch: bounded like the map (13.2); static because the
+/* Dijkstra scratch: bounded like the map (11.2); static because the
  * core has no heap and is single-threaded per node (13b). */
 #define MC_DIST_INF 0x7FFFFFFFu
 static uint32_t r_dist[MC_MAP_NODES];
@@ -1857,12 +1857,12 @@ static int r_idx(mimeshi_node *n, uint16_t id) {
 
 /* The first hop toward dst on the own known graph, or 0 when dst is
  * unreachable. The first step runs only over confirmed symmetric
- * neighbours above the quality threshold (10.1); further edges run
+ * neighbours above the quality threshold (6.3); further edges run
  * over the link store, direction of travel known, endpoints not
- * expired (4.4). A confirmed direct neighbour is its own first hop
+ * expired (6.2). A confirmed direct neighbour is its own first hop
  * even without a map slot: it is the destination itself.
  * `excl` (excl_cnt entries) are next hops that already failed for
- * THIS message: cumulative exclusion per series (7.4) - the
+ * THIS message: cumulative exclusion per series (8.4) - the
  * computation must not propose a hop the series has buried. */
 static uint16_t route_next_hop_ex_prev(mimeshi_node *n, uint16_t dst,
                                   const uint16_t *excl, uint8_t excl_cnt,
@@ -1896,7 +1896,7 @@ static uint16_t route_next_hop_ex_prev(mimeshi_node *n, uint16_t dst,
             for (uint8_t e = 0; e < excl_cnt; e++) if (excl[e] == dst) return 0;
             return dst;                          /* the only edge toward it is the own one */
         }
-        return 0;                                /* not in the graph: no flood (10.2) */
+        return 0;                                /* not in the graph: no flood (7.1) */
     }
     for (int i = 0; i < MC_MAP_NODES; i++) { r_dist[i] = MC_DIST_INF; r_prev[i] = 0xFFFF; r_done[i] = 0; }
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {           /* own edges (virtual start) */
@@ -1919,7 +1919,7 @@ static uint16_t route_next_hop_ex_prev(mimeshi_node *n, uint16_t dst,
         if (!nb->alive || !nb->sym) continue;
         int ex = 0;
         for (uint8_t e = 0; e < excl_cnt; e++) if (excl[e] == nb->id) { ex = 1; break; }
-        if (ex) continue;                          /* failed for this message (7.4) */
+        if (ex) continue;                          /* failed for this message (8.4) */
         /* The prev-neighbourhood rule is REMOVED (decided Oct 2026, the
          * 6670 lesson): 'prev already considered its neighbours and chose us'
          * does not hold - prev's choice is one optimum under ITS cost model
@@ -1930,7 +1930,7 @@ static uint16_t route_next_hop_ex_prev(mimeshi_node *n, uint16_t dst,
          * cluster the last hops are each other's neighbours AND shared
          * neighbours of the destination - the rule filtered the delivery edge
          * at every forwarder (the 6670 packet circled a reachable destination
-         * in its pool until the sender gave up). The prev hop ITSELF stays
+         * in its constellation until the sender gave up). The prev hop ITSELF stays
          * excluded (the original anti-ping-pong rule, via the excl array);
          * only the neighbourhood extension is gone. Triangle loops are then
          * possible again - the measurement decides whether the heuristic was
@@ -1981,12 +1981,12 @@ static uint16_t route_next_hop_ex_prev(mimeshi_node *n, uint16_t dst,
 static uint16_t route_bridge_node(mimeshi_node *n, uint16_t lat, uint16_t lon,
                                   const uint16_t *excl, uint8_t excl_cnt);
 
-/* Plain variant: no exclusions (first choice, 10.2). */
+/* Plain variant: no exclusions (first choice, 7.1). */
 static uint16_t route_next_hop(mimeshi_node *n, uint16_t dst) {
     return route_next_hop_ex(n, dst, 0, 0);
 }
 
-/* First hop toward dst with, when known, the dest geo (10.2): the
+/* First hop toward dst with, when known, the dest geo (7.1): the
  * graph decides when the destination lies in it; otherwise the
  * bridge-node rule routes toward the closest graph node near the
  * dest geo (15% candidate band, best route cost wins). geo (0,0)
@@ -2004,26 +2004,26 @@ static uint16_t route_next_hop_geo_prev(mimeshi_node *n, uint16_t dst,
                        via the excl array by the callers (schedule_candidates) */
     uint16_t nh = route_next_hop_ex_prev(n, dst, excl, excl_cnt, prev);
     if (nh) return nh;
-    if (!lat && !lon) return 0;               /* no geo: no flood (10.2) */
+    if (!lat && !lon) return 0;               /* no geo: no flood (7.1) */
     uint16_t bridge = route_bridge_node(n, lat, lon, excl, excl_cnt);
     if (!bridge) return 0;
     /* the route toward the bridge goes through the same computation as
      * the direct route (prev itself is excluded via the excl array,
-     * 10.2); the old prev-neighbourhood rule is gone */
+     * 7.1); the old prev-neighbourhood rule is gone */
     return route_next_hop_ex_prev(n, bridge, excl, excl_cnt, prev);
 }
 
 /* Squared distance on the coarse 16-bit geo grid (5): comparison only,
  * so no sqrt. Longitude steps shrink with cos(latitude); at the NL
  * latitudes the factor is roughly 3/4 - folded into a fixed weight,
- * good enough to rank bridge-node candidates (10.2). */
+ * good enough to rank bridge-node candidates (7.1). */
 static uint32_t geo_dist2(uint16_t lat1, uint16_t lon1, uint16_t lat2, uint16_t lon2) {
     int32_t dlat = (int32_t)lat1 - (int32_t)lat2;
     int32_t dlon = ((int32_t)lon1 - (int32_t)lon2) * 3 / 4;
     return (uint32_t)(dlat * dlat + dlon * dlon);
 }
 
-/* Route cost toward dst on the own graph (10.2), or MC_DIST_INF when
+/* Route cost toward dst on the own graph (7.1), or MC_DIST_INF when
  * unreachable. Shares the Dijkstra scratch with route_next_hop_ex: a
  * run settles every reachable node, so the cost of any candidate can
  * be read from r_dist afterwards. */
@@ -2052,8 +2052,8 @@ static uint16_t route_bridge_node(mimeshi_node *n, uint16_t lat, uint16_t lon,
      * cotangent to the destination, taking the message nowhere.
      * Measured (the 8h and 16h scale runs): the stranded out-of-graph
      * messages circled a flat plateau at ~130 km from their
-     * destinations for every hop, while the pool simulation showed the
-     * median pool holds a candidate at 16 km from the destination -
+     * destinations for every hop, while the constellation simulation showed the
+     * median constellation holds a candidate at 16 km from the destination -
      * the knowledge was there, the cost pass kept choosing the
      * useless local step over it. The own entry is NEVER a candidate
      * (the self-loop fix stands). The rule now: the candidate CLOSEST
@@ -2064,7 +2064,7 @@ static uint16_t route_bridge_node(mimeshi_node *n, uint16_t lat, uint16_t lon,
      * know better than our forward-thinking here. */
     /* REACHABILITY-FIRST (decided Oct 2026, the two hoptrace findings):
      * an unreachable candidate must NEVER win the bridge choice. The old
-     * distance-first rule picked the closest pool entry, and when the
+     * distance-first rule picked the closest constellation entry, and when the
      * Dijkstra then found no route toward it the WHOLE geo-route failed
      * (route_next_hop_geo_prev: if (!bridge) return 0) - while a slightly
      * farther but REACHABLE candidate stood ready. Measured (the two
@@ -2078,13 +2078,13 @@ static uint16_t route_bridge_node(mimeshi_node *n, uint16_t lat, uint16_t lon,
      * nearest unreachable candidate is skipped, not chosen; the first
      * reachable one on the distance ladder wins. The tiebreak (~5% on
      * the squared distance) stays for equal distances. This is one
-     * Dijkstra per candidate - bounded by the pool, the same cost the
+     * Dijkstra per candidate - bounded by the constellation, the same cost the
      * old tiebreak already paid. */
     uint16_t pick = 0;
     uint32_t pick_d = 0, pick_cost = MC_DIST_INF;
     for (int i = 0; i < MC_MAP_NODES; i++) {
         if (!n->map[i].alive || !n->map[i].geo_lat) continue;   /* no geo: no candidate (5) */
-        if (n->map[i].id == n->id) continue;     /* never the own entry (10.2) */
+        if (n->map[i].id == n->id) continue;     /* never the own entry (7.1) */
         uint32_t d = geo_dist2(n->map[i].geo_lat, n->map[i].geo_lon, lat, lon);
         if (!pick) {
             /* the first candidate only sticks when reachable */
@@ -2112,10 +2112,10 @@ static uint16_t route_bridge_node(mimeshi_node *n, uint16_t lat, uint16_t lon,
 
 
 
-/* Reception of a table chunk (4.3). Self-contained: every entry is
+/* Reception of a table chunk (6.1). Self-contained: every entry is
  * processed on its own against the own map and link store. The owner
  * naming US in an entry is reverse-direction evidence for the link
- * owner->us (10.1) — gated on quality like every confirmation. */
+ * owner->us (6.3) — gated on quality like every confirmation. */
 static void chunk_rx(mimeshi_node *n, int8_t rssi, const uint8_t *pkt, uint16_t len) {
     chunk_rx_mode(n, rssi, pkt, len, 0);
 }
@@ -2137,20 +2137,20 @@ static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
     for (uint8_t e = 0; e < n_ent && off + 9 <= len; e++) {
         uint16_t eid = rd16(pkt + off);
         uint8_t qbyte = pkt[off + 2];
-        uint8_t cls = qbyte >> 4;              /* origin->entry class (4.3) */
+        uint8_t cls = qbyte >> 4;              /* origin->entry class (6.1) */
         uint8_t age = pkt[off + 3];
         uint16_t gl = rd16(pkt + off + 4), go = rd16(pkt + off + 6);
         uint8_t lcnt = pkt[off + 8];
         off += 9;
-        if (eid == n->id) {                    /* the origin's own entry naming US: reverse evidence (10.1) */
+        if (eid == n->id) {                    /* the origin's own entry naming US: reverse evidence (6.3) */
             if (nb) {
                 nb->proven_age_us = 0;
                 /* the origin's entry class for us IS its measurement of
                  * our signal: our reverse quality, refreshed with every
-                 * star that names us (6.2) — no extra airtime */
+                 * star that names us (10.2) — no extra airtime */
                 uint8_t oq = quality_from_class(cls);
                 nb->rev_quality = quality_ewma(nb->rev_quality ? nb->rev_quality : oq, oq);
-                /* the TWO-SIDED THRESHOLD (4.2, final form): his star
+                /* the TWO-SIDED THRESHOLD (5.2, final form): his star
                  * naming us is his direction's claim (his class for us
                  * becomes the link quality rev_quality, no gate); our
                  * reception of THIS star is the measured other
@@ -2164,7 +2164,7 @@ static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
             /* our entry in the origin's star carries the origin's links,
              * ours included: consume them like every entry's links and
              * store them as received (the owner's advertised form of OUR
-             * link is routing material, 4.3) - the link loop below runs
+             * link is routing material, 6.1) - the link loop below runs
              * for this entry too. */
             for (uint8_t k = 0; k < lcnt && off + 3 <= len; k++) {
                 uint16_t peer = rd16(pkt + off);
@@ -2172,7 +2172,7 @@ static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
                 off += 3;
                 if (peer == n->id || peer == owner) continue;  /* our own entry in
                     the origin's star names only us; a self-link does not exist */
-                mimeshi_mapnode *pm = map_add(n, peer);  /* named by the link (10.1) */
+                mimeshi_mapnode *pm = map_add(n, peer);  /* named by the link (6.3) */
                 if (pm) { pm->age_ticks = age; pm->arrived_tick = n->tick; }
                 lnk_set_class(n, eid, peer, (uint8_t)(lb >> 4));
                 lnk_set_class(n, peer, eid, (uint8_t)(lb & 0x0F));
@@ -2180,29 +2180,29 @@ static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
         } else {
             mimeshi_mapnode *em = map_add_geo(n, eid, gl, go);   /* content arrival:
                 the star's own geo rides in the packet, so the admission
-                competition can score it honestly (4.4) */
+                competition can score it honestly (6.2) */
             int stale = 0;
             if (em && star_mode) {
-                /* fresh beats old on CONTENT (4.3): a form whose
+                /* fresh beats old on CONTENT (6.1): a form whose
                  * advertised entry byte differs from the stored one is
-                 * only accepted when its heartbeat tick is AHEAD of
-                 * the stored tick - a differing form at an equal or
+                 * only accepted when its beat is AHEAD of
+                 * the stored beat - a differing form at an equal or
                  * older tick is a stale copy racing a newer one (a
                  * slow route, a missed-list answer) and must not roll
                  * the newer knowledge back. Identical content is
                  * always fine (an echo refreshes nothing but the
                  * age). Geo and presence still refresh - map
                  * material is never wasted. */
-                int16_t ahead = (int16_t)((int16_t)age - (int16_t)em->star_tick);
+                int16_t ahead = (int16_t)((int16_t)age - (int16_t)em->star_beat);
                 if (em->adv_q && qbyte != em->adv_q && ahead <= 0)
                     stale = 1;
             }
             if (em && !stale) {
                 ev_taboo_forget(n, eid);   /* the complete form arrives as content:
-                                              the rejection is over (4.3) - only
+                                              the rejection is over (6.1) - only
                                               here, not on presence shells */
                 if (gl) { em->geo_lat = gl; em->geo_lon = go; }   /* (0,0) = none (5) */
-                /* storage as received (4.3): the entry class byte is
+                /* storage as received (6.1): the entry class byte is
                  * stored exactly as the origin advertised it - reproduced
                  * unchanged on every hop, hashed by the content hash.
                  * The local quality (our own measurement of the node's
@@ -2212,7 +2212,7 @@ static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
                 em->age_ticks = age; em->arrived_tick = n->tick;
             }
             /* the star's links: claims of the ORIGIN (eid), stored as
-             * received (4.3) - the link store is the forwarded picture,
+             * received (6.1) - the link store is the forwarded picture,
              * the advertised forms of the owning stars. Skipped for a
              * stale form: its link claims belong to the older copy. */
             if (!stale) {
@@ -2222,12 +2222,12 @@ static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
                     off += 3;
                     if (peer == n->id) {
                         /* the origin's (eid's) link to US: reverse-direction
-                         * evidence (10.1) - the high nibble is the origin's
+                         * evidence (6.3) - the high nibble is the origin's
                          * measurement of our signal, the low nibble our class
                          * as it reported it. Only meaningful when the origin
                          * is a direct neighbour of ours (the claim reaches us
-                         * possibly via a forwarder, 4.3). The link itself is
-                         * stored as received like every other claim (4.3):
+                         * possibly via a forwarder, 6.1). The link itself is
+                         * stored as received like every other claim (6.1):
                          * the owner's advertised form of OUR link is routing
                          * material - the old cadence covered it in our own
                          * entry, the star round carries it only here. */
@@ -2238,7 +2238,7 @@ static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
                             enb->proven_age_us = 0;
                             uint8_t oq = quality_from_class((uint8_t)(lb >> 4));
                             enb->rev_quality = quality_ewma(enb->rev_quality ? enb->rev_quality : oq, oq);
-                            /* two-sided threshold, final form (4.2, Oct 2026):
+                            /* two-sided threshold, final form (5.2, Oct 2026):
                              * the claim is his direction, our reception of
                              * the star is the other - the only gate */
                             if (quality_ok(quality_of(rssi))) {
@@ -2248,7 +2248,7 @@ static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
                         }
                         continue;
                     }
-                    mimeshi_mapnode *pm = map_add(n, peer);  /* named by the link (10.1) */
+                    mimeshi_mapnode *pm = map_add(n, peer);  /* named by the link (6.3) */
                     if (pm) {
                         /* the peer is exactly as fresh as the star that named
                          * it: the origin just advertised knowledge of it. */
@@ -2266,10 +2266,10 @@ static void chunk_rx_mode(mimeshi_node *n, int8_t rssi, const uint8_t *pkt,
 
 static void nbr_expire(mimeshi_node *n);
 
-/* Death detection (4.4): every identifying reception refreshes
- * last_seen; per proof tick it ages. At T_expire (~4 h) the neighbour
+/* Death detection (6.2): every identifying reception refreshes
+ * last_seen; per tick it ages. At T_expire (~4 h) the neighbour
  * is dead: the entry disappears from our table, and with it from our
- * own star - silence plus the round propagates the removal (4.4:
+ * own star - silence plus the round propagates the removal (6.2:
  * no tombstone, no negative delta). */
 static void nbr_expire(mimeshi_node *n) {
     for (int i = 0; i < MC_MAX_NEIGHBORS; i++) {
@@ -2279,7 +2279,7 @@ static void nbr_expire(mimeshi_node *n) {
         if (nb->last_seen >= MC_T_EXPIRE_TICKS) {
             nb->alive = 0; nb->sym = 0; nb->ack_try = 0;
             nb->quality = 0; nb->rev_quality = 0; nb->proven_age_us = 0;
-            tbl_mark_dirty(n);              /* the own star loses the link (4.3) */
+            tbl_mark_dirty(n);              /* the own star loses the link (6.1) */
             printf("[core] node %u: neighbour %u expired after ~4 h of silence\n", n->id, nb->id);
         }
     }
@@ -2287,29 +2287,29 @@ static void nbr_expire(mimeshi_node *n) {
 
 static void proof_tick(mimeshi_node *n, void *ud) {
     (void)ud;
-    n->tick++;                                 /* local time base, 1 min per tick (4.4) */
-    nbr_expire(n);                             /* death detection (4.4) */
-    /* map aging (4.4): an entry nobody has refreshed anymore dies at
+    n->tick++;                                 /* local time base, 1 min per tick (6.2) */
+    nbr_expire(n);                             /* death detection (6.2) */
+    /* map aging (6.2): an entry nobody has refreshed anymore dies at
      * 2 x T_active (~24 h) - after that it is stale beyond every
-     * cadence and only takes pool space from fresher knowledge. */
+     * cadence and only takes constellation space from fresher knowledge. */
     for (int i = 0; i < MC_MAP_NODES; i++) {
         if (!n->map[i].alive) continue;
         if (n->map[i].id == n->id) continue;   /* the own entry: alive by definition */
         if (nbr_find(n, n->map[i].id)) continue;           /* prefix work */
-        /* liveness axis (4.4): a star whose origin tick has not advanced
+        /* liveness axis (6.2): a star whose origin tick has not advanced
          * for the threshold is dead, whatever the freshness of the
          * forwarded copies - the echo cannot fake a tick. Direct
-         * neighbours live in the neighbor table (last_seen, 4.4). */
-        if (n->tick - n->map[i].star_tick_seen >= MC_STAR_DEAD_TICKS) {
-            printf("[core] node %u: star %u dead (tick stalled %lu ticks)\n",
-                   n->id, n->map[i].id, (unsigned long)(n->tick - n->map[i].star_tick_seen));
+         * neighbours live in the neighbor table (last_seen, 6.2). */
+        if (n->tick - n->map[i].star_beat_seen >= MC_STAR_DEAD_TICKS) {
+            printf("[core] node %u: star %u dead (beat stalled %lu ticks)\n",
+                   n->id, n->map[i].id, (unsigned long)(n->tick - n->map[i].star_beat_seen));
             map_evict(n, &n->map[i]);
             continue;
         }
         if (map_age_ticks(n, &n->map[i]) >= 2 * MC_T_ACTIVE_TICKS)
             map_evict(n, &n->map[i]);
     }
-    for (int i = 0; i < MC_MAX_NEIGHBORS; i++)          /* evidence ages per tick (4.2) */
+    for (int i = 0; i < MC_MAX_NEIGHBORS; i++)          /* evidence ages per tick (5.2) */
         if (n->nbr[i].alive && n->nbr[i].proven_age_us < MC_T_SYM_US)
             n->nbr[i].proven_age_us += MC_KEEPALIVE_TICK_US;
     for (uint8_t c = 0; c < MC_N_CHANNELS; c++) {
@@ -2328,13 +2328,13 @@ static void proof_tick(mimeshi_node *n, void *ud) {
  * sender sits there outside its own exchanges and catches answers
  * within the response window. One exchange, then home.
  *
- * Directional format (6 B, 6.2): the destination is the acked sender.
+ * Directional format (6 B, 10.2): the destination is the acked sender.
  * Only because of that does the ack prove symmetry — the responder
  * received OUR identifying transmission (its ack is a reaction to it)
- * and its ack reached us (4.2, 10.1). That is the proof channel of the
- * generalized ack (4.5): available before the first unicast.
+ * and its ack reached us (5.2, 6.3). That is the proof channel of the
+ * generalized ack (5.3): available before the first unicast.
  * Eavesdroppers process the sender as "seen" at most; the state
- * version is dropped (4.3: no pull anymore). */
+ * version is dropped (6.1: no pull anymore). */
 /* Pending hello-ack between wait and fire: the measured quality of the
  * hello travels along to the fire moment (no extra airtime). */
 #define MC_MAX_PENDING_HACKS 8
@@ -2358,8 +2358,8 @@ static void hello_ack_fire(mimeshi_node *n, void *ud) {
     for (int i = 0; i < MC_MAX_PENDING_HACKS; i++)
         if (phack[i].used && phack[i].to == to) { p[5] = phack[i].quality; phack[i].used = 0; break; }
     bound_send(n, (uint8_t)(to % MC_N_CHANNELS), p, 6, t_hack_us()); /* to HOME of the sender */
-    ka_called(n, (uint8_t)(to % MC_N_CHANNELS));    /* own call on that channel (4.1) */
-    /* three-way closure bookkeeping (4.2, Oct 2026): we acked this
+    ka_called(n, (uint8_t)(to % MC_N_CHANNELS));    /* own call on that channel (5.1) */
+    /* three-way closure bookkeeping (5.2, Oct 2026): we acked this
      * neighbour's round - a later PROOF_ACK from it closes our side. */
     {
         mimeshi_neighbor *nb = nbr_find(n, to);
@@ -2382,7 +2382,7 @@ static void hello_ack_fire(mimeshi_node *n, void *ud) {
  *   - Price: the ranking is "soft" — responders within ~16 dB can swap
  *     order. Preventing collisions weighs heavier than strict order (2).
  *
- * Ack on demand (4.1, Oct 2026): a confirmed neighbor (sym, 4.2) gets
+ * Ack on demand (5.1, Oct 2026): a confirmed neighbor (sym, 5.2) gets
  * two more courtesy acks after our own confirmation and after that not
  * a single one — snooping already maintains liveness, version and
  * quality. The two extra acks are needed because confirmation almost
@@ -2404,8 +2404,8 @@ static void hello_ack_fire(mimeshi_node *n, void *ud) {
  * without a third chance.
  */
 static void hello_ack_wait(mimeshi_node *n, uint16_t from, int8_t rssi) {
-    /* Generalized ack gate (4.5): called for every identifying
-     * transmission of a neighbour. Quality gate (10.1), same threshold
+    /* Generalized ack gate (5.3): called for every identifying
+     * transmission of a neighbour. Quality gate (6.3), same threshold
      * as the confirmation: a reception below it can never become a
      * routing link, so an ack on it is pure airtime -- and around
      * boundary links it feeds the ack storm the pace gate prevents. */
@@ -2416,7 +2416,7 @@ static void hello_ack_wait(mimeshi_node *n, uint16_t from, int8_t rssi) {
             if (nb->ack_try >= 3) return;       /* courtesy used up (after 2) */
             nb->ack_try++;
         } else {
-            /* time-based doubling backoff (4.5): the brake is independent
+            /* time-based doubling backoff (5.3): the brake is independent
              * of the neighbour's transmission volume. After each ack that
              * does not close the three-way the spacing doubles, up to the
              * 24 h cap - a permanently one-way link costs one ack per day
@@ -2451,40 +2451,40 @@ static void hello_ack_wait(mimeshi_node *n, uint16_t from, int8_t rssi) {
 static void ack1_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint8_t ch, int8_t rssi) {
     uint8_t p[8] = { PKT_ACK1, 0,0, 0,0, 0,0, 0 };
     wr16(p + 1, msg_id); wr16(p + 3, src); wr16(p + 5, n->id);
-    p[7] = quality_of(rssi);              /* what we measured on the data (6.2) */
+    p[7] = quality_of(rssi);              /* what we measured on the data (10.2) */
     n->tx(n, ch, p, 8, t_ack_us());       /* same channel as the data (switch rule) */
-    ka_called(n, ch);                     /* own call on the data channel (4.1) */
+    ka_called(n, ch);                     /* own call on the data channel (5.1) */
     MTRACE(n, "ACK1 -> %u for msg %u (their quality %u)\n", src, msg_id, p[7]);
 }
 
-/* Ack2 to the previous hop, on ITS home channel (2, 7.1): the previous
+/* Ack2 to the previous hop, on ITS home channel (2, 8.1): the previous
  * hop listens there without its own window. Positive = the own next
- * hop has ack1'd, so the message is two hops along (7.1/7.2, revised
+ * hop has ack1'd, so the message is two hops along (7.1/8.2, revised
  * Oct 2026); negative = forwarding failed after every series, via
- * F_NEG_ACK2, with the spent budget of the message in byte 7 (7.4):
+ * F_NEG_ACK2, with the spent budget of the message in byte 7 (8.4):
  * the previous hop sees what is left and can stop against an
  * exhausted budget. */
 static void ack2_send(mimeshi_node *n, uint16_t msg_id, uint16_t src, uint16_t prev,
                       bool neg, uint8_t budget_left) {
     uint8_t p[8] = { (uint8_t)(PKT_ACK2 | (neg ? F_NEG_ACK2 : 0)), 0,0, 0,0, 0,0, 0 };
     wr16(p + 1, msg_id); wr16(p + 3, src); wr16(p + 5, n->id);
-    p[7] = budget_left;                       /* spent budget travels along (6.2, 7.4) */
+    p[7] = budget_left;                       /* spent budget travels along (6.2, 8.4) */
     bound_send(n, (uint8_t)(prev % MC_N_CHANNELS), p, 8, t_ack_us()); /* HOME of previous hop */
-    ka_called(n, (uint8_t)(prev % MC_N_CHANNELS));  /* own call there (4.1) */
+    ka_called(n, (uint8_t)(prev % MC_N_CHANNELS));  /* own call there (5.1) */
     MTRACE(n, "ACK2 %s -> %u for msg %u (budget %u)\n", neg ? "NEG" : "pos", prev, msg_id, budget_left);
 }
 
 static void pending_try(mimeshi_node *n, mimeshi_pending *p);
 static void schedule_fail(mimeshi_node *n, mimeshi_pending *p);
 
-/* Candidate collector for the attempt schedule (7.4): every candidate is
+/* Candidate collector for the attempt schedule (8.4): every candidate is
  * the BEST HOP of a full Dijkstra run - not a ranking of own edges.
  * Candidate 1 is the computed route toward dst; candidate 2 is the
  * best route that does not start with candidate 1; candidate 3
  * likewise without the first two. So each candidate is a real,
  * computed alternative over the whole known graph, and the best
  * candidate always leads. Same admission rules as every route
- * (10.1/10.2): confirmed symmetric, above the quality gate, never
+ * (10.1/7.1): confirmed symmetric, above the quality gate, never
  * the previous hop (no bounce). */
 static uint8_t schedule_candidates(mimeshi_node *n, uint16_t dst,
                                 uint16_t gl, uint16_t go,
@@ -2495,7 +2495,7 @@ static uint8_t schedule_candidates(mimeshi_node *n, uint16_t dst,
     uint8_t cnt = 0;
     for (int round = 0; round < 3; round++) {
         /* prev goes into the Dijkstra exclusion itself, exactly like
-         * the baseline first choice (10.2): a post-filter that drops
+         * the baseline first choice (7.1): a post-filter that drops
          * the result when it happens to be prev would discard the
          * whole plan when the best route leads back - the second-best
          * non-prev route exists but was never computed (measured:
@@ -2513,7 +2513,7 @@ static uint8_t schedule_candidates(mimeshi_node *n, uint16_t dst,
 
 /* attempts of the plan by its size: 1 candidate = 4 (1 fast + 3 slow);
  * 2 = 5 alternating (the best hop gets the extra attempt); 3 = 6. */
-/* Total attempts of the schedule by its size (7.4): 1 candidate = 4
+/* Total attempts of the schedule by its size (8.4): 1 candidate = 4
  * (A,A,A,A - the damper table then runs 0.8, 1.2, 1.8 s); 2 = 6
  * (A,B,A,B,A,B - each node 3x); 3 = 6 (A,B,C,A,B,C - each node 2x).
  * At most 4 toward the same node, at most 6 total. */
@@ -2521,7 +2521,7 @@ static uint8_t schedule_attempts(const mimeshi_pending *p) {
     return p->cand_cnt == 1 ? 4 : 6;
 }
 
-/* The wait before attempt try_idx+1 (7.4). Small fixed gap inside a
+/* The wait before attempt try_idx+1 (8.4). Small fixed gap inside a
  * pass over the candidates - the next attempt goes to a DIFFERENT
  * node, so no damper needed; escalating gap at each pass boundary -
  * the same node comes back there. */
@@ -2543,7 +2543,7 @@ static void retry_fire(mimeshi_node *n, void *ud) {
 
 /* Ack1 stayed out: attempts left -> retry after schedule_wait_us; otherwise
  * the schedule for this hop failed definitively (cumulative exclusion +
- * negative ack2, 7.4). */
+ * negative ack2, 8.4). */
 static void ack1_timeout(mimeshi_node *n, void *ud) {
     mimeshi_pending *p = (mimeshi_pending *)ud;
     if (!p->active || p->acked1) return;
@@ -2564,9 +2564,9 @@ static void schedule_fail(mimeshi_node *n, mimeshi_pending *p) {
     printf("[core] node %u: schedule failed toward %u..%u (msg %u)\n",
            n->id, p->cand[0], p->cand[p->cand_cnt ? p->cand_cnt - 1 : 0], p->msg_id);
     for (uint8_t k = 0; k < p->cand_cnt && p->excl_cnt < 3; k++) {
-        p->excl[p->excl_cnt++] = p->cand[k];      /* cumulative (7.4) */
+        p->excl[p->excl_cnt++] = p->cand[k];      /* cumulative (8.4) */
         mimeshi_neighbor *fnb = nbr_find(n, p->cand[k]);
-        if (fnb && fnb->penalty < 255) fnb->penalty++;   /* long-term lesson (10.4) */
+        if (fnb && fnb->penalty < 255) fnb->penalty++;   /* long-term lesson (8.5) */
     }
     p->active = 0;
     printf("[core] node %u: FAIL msg %u (schedule exhausted, budget %u)\n",
@@ -2577,14 +2577,14 @@ static void schedule_fail(mimeshi_node *n, mimeshi_pending *p) {
 
 /* One transmit attempt: update the budget in the header (offset 9,
  * 6.1/9), the exchange toward next_hop, and schedule the ack1 timeout.
- * The timeout is (7.3) S + t_data + t_ack + margin, measured from the
+ * The timeout is (8.3) S + t_data + t_ack + margin, measured from the
  * moment of submission. Assumption: the platform layer delivers the
  * transmission quickly (queue short); if the switch takes longer, the
  * timeout fires too early and the attempt counts as failed. */
 /* T_ack2 timeout (7.3, fixed 8 s): the next hop received (ack1 came)
  * but its own forwarding stayed silent beyond every series. The
  * silence counts as a failed series toward this hop: 6 units off the
- * budget, then the 7.4 structure takes over - next-best hop if
+ * budget, then the 8.4 structure takes over - next-best hop if
  * attempts remain, otherwise the definitive fail. */
 static void ack2_timeout(mimeshi_node *n, void *ud) {
     mimeshi_pending *p = (mimeshi_pending *)ud;
@@ -2594,7 +2594,7 @@ static void ack2_timeout(mimeshi_node *n, void *ud) {
            (uint8_t)(p->budget_left > MC_ACK2_BUDGET_PENALTY ? p->budget_left - MC_ACK2_BUDGET_PENALTY : 0));
     p->budget_left = (uint8_t)(p->budget_left > MC_ACK2_BUDGET_PENALTY ? p->budget_left - MC_ACK2_BUDGET_PENALTY : 0);
     p->acked1 = 0;
-    p->try_idx = (uint8_t)(schedule_attempts(p) - 1);   /* the wait consumed the remaining attempts (7.3) */
+    p->try_idx = (uint8_t)(schedule_attempts(p) - 1);   /* the wait consumed the remaining attempts (8.3) */
     schedule_fail(n, p);
 }
 
@@ -2613,14 +2613,14 @@ static void pending_try(mimeshi_node *n, mimeshi_pending *p) {
         static const uint8_t bias[6] = { 0, 1, 0, 2, 0, 1 };
         p->next_hop = p->cand[bias[p->try_idx % 6] % p->cand_cnt];
     } else {
-        p->next_hop = p->cand[p->try_idx % p->cand_cnt];   /* round-robin over the schedule (7.4) */
+        p->next_hop = p->cand[p->try_idx % p->cand_cnt];   /* round-robin over the schedule (8.4) */
     }
     p->pkt[9] = p->budget_left;
-    wr16(p->pkt + 10, p->next_hop);           /* next hop in the header (6.1) */
+    wr16(p->pkt + 10, p->next_hop);           /* next hop in the header (10.1) */
     MTRACE(n, "TRY %u/%u msg %u via %u (budget %u)\n",
            (unsigned)(p->try_idx + 1), (unsigned)schedule_attempts(p), p->msg_id, p->next_hop, p->budget_left);
     bound_send(n, (uint8_t)(p->next_hop % MC_N_CHANNELS), p->pkt, p->pkt_len, t_data_us(p->pkt_len));
-    ka_called(n, (uint8_t)(p->next_hop % MC_N_CHANNELS));   /* data as prev_hop (4.1) */
+    ka_called(n, (uint8_t)(p->next_hop % MC_N_CHANNELS));   /* data as prev_hop (5.1) */
     n->timer(n, MC_S_SWITCH_US + t_data_us(p->pkt_len) + t_ack_us() + MC_ACK1_MARGIN_US, ack1_timeout, p);
 }
 
@@ -2634,8 +2634,8 @@ static void pending_try(mimeshi_node *n, mimeshi_pending *p) {
  * One-direction proof: every neighbor table entry originated from a
  * reception (hello or hello-ack) and therefore only proves the
  * direction neighbor->us. The opposite direction (us->neighbor) is only
- * proven by the neighbor itself: via its tablepull (4.3) or via a
- * successful unicast with ack1. Routing (building block 2, 10.1) must
+ * proven by the neighbor itself: via its tablepull (6.1) or via a
+ * successful unicast with ack1. Routing (building block 2, 6.3) must
  * demand that confirmation before forwarding; until then this direct
  * sending is bounded by retries+budget and fails visibly on the ack1
  * timeout. */
@@ -2678,7 +2678,7 @@ static void hoptrace_dossier(mimeshi_node *n, uint16_t dst, uint16_t prev,
         if (!m->alive) continue;
         fprintf(f, "%s{\"id\":%u,\"geo\":[%u,%u],\"aq\":%u,\"age\":%u,\"st\":%u}",
                 first ? "" : ",", m->id, m->geo_lat, m->geo_lon,
-                m->adv_q, m->age_ticks, m->star_tick);
+                m->adv_q, m->age_ticks, m->star_beat);
         first = 0;
     }
     fprintf(f, "],\"links\":[");
@@ -2695,9 +2695,9 @@ static void hoptrace_dossier(mimeshi_node *n, uint16_t dst, uint16_t prev,
 
 int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uint16_t len, bool ack3,
                       uint16_t dest_lat, uint16_t dest_lon) {
-    /* routing (10.2): the first hop follows from the own known graph -
+    /* routing (7.1): the first hop follows from the own known graph -
      * a direct neighbour only when its link is confirmed symmetric
-     * (10.1), otherwise the computation decides; a destination outside
+     * (6.3), otherwise the computation decides; a destination outside
      * the graph routes via the bridge-node rule when the client
      * supplied its geo, and is refused without geo (no flood). */
     if (len > MC_MAX_PAYLOAD) return -3;
@@ -2707,24 +2707,24 @@ int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uin
     memset(p, 0, sizeof(*p));
     p->active = 1;
     p->budget_left = MC_BUDGET_INIT;
-    /* attempt schedule (7.4): up to 3 Dijkstra-best hops toward dst; the
+    /* attempt schedule (8.4): up to 3 Dijkstra-best hops toward dst; the
      * route itself is the first candidate - or the send is refused. */
     p->cand_cnt = schedule_candidates(n, dst, dest_lat, dest_lon, n->id, 0, 0, p->cand);
-    p->in_graph = r_idx(n, dst) >= 0 || nbr_find(n, dst) != 0;   /* Dijkstra-proven plan? (7.4) */
+    p->in_graph = r_idx(n, dst) >= 0 || nbr_find(n, dst) != 0;   /* Dijkstra-proven plan? (8.4) */
     if (n->hoptrace)
         hoptrace_dossier(n, dst, n->id, dest_lat, dest_lon, p->budget_left,
                          p->excl, 0, p->cand, p->cand_cnt,
                          p->cand_cnt ? p->cand[0] : 0);
-    if (p->cand_cnt == 0) return -1;           /* not in the graph: no flood (10.2) */
+    if (p->cand_cnt == 0) return -1;           /* not in the graph: no flood (7.1) */
     uint16_t nh = p->cand[0];
     p->msg_id = (uint16_t)n->rand(n);
     p->src = n->id; p->dst = dst; p->prev_hop = n->id; p->next_hop = nh;
     uint8_t *k = p->pkt;
     bool geo = (dest_lat || dest_lon);
-    /* Waypoint (10.2): an out-of-graph send attaches the heading - the geo
+    /* Waypoint (7.1): an out-of-graph send attaches the heading - the geo
      * of the chosen bridge candidate - so the hops route toward its zone
      * with locally routable steps instead of every hop re-inventing a
-     * bridge from possibly worse knowledge (the plateau finding: pools
+     * bridge from possibly worse knowledge (the plateau finding: constellations
      * held candidates at 11 km median from the destination, but no hop
      * could ROUTE to them - toward the zone, every step is local). */
     /* Waypoint retired (Oct 2026): the heading was built against the
@@ -2737,10 +2737,10 @@ int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uin
     k[0] = (uint8_t)(PKT_DATA | (ack3 ? F_ACK3_REQ : 0)
                      | (geo ? F_DEST_GEO : 0));
     wr16(k + 1, p->msg_id); wr16(k + 3, n->id); wr16(k + 5, dst); wr16(k + 7, n->id);
-    k[9] = p->budget_left;                 /* header: budget at offset 9 (section 6.1) */
-    wr16(k + 10, nh);                      /* next hop at offset 10 (6.1) */
+    k[9] = p->budget_left;                 /* header: budget at offset 9 (section 10.1) */
+    wr16(k + 10, nh);                      /* next hop at offset 10 (10.1) */
     uint8_t off = 12;
-    if (geo) {                              /* dest geo after the fixed header (6.1, 10.2) */
+    if (geo) {                              /* dest geo after the fixed header (6.1, 7.1) */
         wr16(k + 12, dest_lat); wr16(k + 14, dest_lon);
         off = 16;
     }
@@ -2762,10 +2762,10 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
     uint8_t type = pkt[0] & 0x0F, flags = pkt[0] & 0xF0;
     switch (type) {
     case PKT_HELLO: {
-        /* Startup beacon (3 B, 4.1): update or add the neighbor, then
+        /* Startup beacon (3 B, 5.1): update or add the neighbor, then
          * schedule an ack. Quality is the RSSI measurement of this
-         * reception; last_seen is still a stub — real aging policy (4.4)
-         * follows. No state version on air anymore (4.3). */
+         * reception; last_seen is still a stub — real aging policy (6.2)
+         * follows. No state version on air anymore (6.1). */
         uint16_t from = rd16(pkt + 1);
         mimeshi_neighbor *nb = nbr_find(n, from);
         if (!nb) nb = nbr_add(n, from);
@@ -2779,12 +2779,12 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
     }
     case PKT_HELLO_ACK: {
         uint16_t dst0 = rd16(pkt + 1);
-        if (dst0 == n->id) n->proof_ack_pend = 1;   /* OUR round collected an ack (4.2) */
+        if (dst0 == n->id) n->proof_ack_pend = 1;   /* OUR round collected an ack (5.2) */
         /* Directional ack (5 B): destination = the original hello
          * sender.
          *  - Addressed to US: the responder received our hello and
          *    this ack reached us — both directions worked at that
-         *    moment: symmetry proven (4.2, 10.1). This is the proof
+         *    moment: symmetry proven (5.2, 6.3). This is the proof
          *    channel of the hello process, available before the first
          *    unicast.
          *  - Addressed to someone else (snooping, 2): the sender is
@@ -2800,10 +2800,10 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
             nb->quality = quality_of(rssi);
             nb->proven_age_us = 0;      /* fresh reception of an identifying transmission */
             if (dst == n->id && len >= 6) {
-                uint8_t rq = pkt[5];     /* what the responder measured on OUR signal (6.2) */
+                uint8_t rq = pkt[5];     /* what the responder measured on OUR signal (10.2) */
                 nb->rev_quality = rq ? quality_ewma(nb->rev_quality ? nb->rev_quality : rq, rq)
                                      : nb->rev_quality;
-                /* the round's STRONGEST received evidence (4.2, the
+                /* the round's STRONGEST received evidence (5.2, the
                  * two-sided threshold): the PROOF_ACK fires only when
                  * the best received rq clears the gate - a round of
                  * weak acks confirms nothing and the sender stays
@@ -2811,7 +2811,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                  * agreement falls out of the shared threshold. */
                 if (rq > n->proof_ack_best_rq) n->proof_ack_best_rq = rq;
             }
-            /* the TWO-SIDED THRESHOLD (4.2, decided Oct 2026), final
+            /* the TWO-SIDED THRESHOLD (5.2, decided Oct 2026), final
              * form: the reception quality of THIS packet is the only
              * gate here. The responder's side of the threshold is
              * already enforced by HIS ack gate (hello_ack_wait: he
@@ -2826,18 +2826,18 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
              * the route cost. The stored nb->quality never gates
              * what the packet proved either - same role: route cost. */
             if (dst == n->id && quality_ok(quality_of(rssi))) {
-                if (!nb->sym) tbl_nbr_added(n, from);  /* delta + table round (4.3) */
-                nb->sym = 1; nb->ack_try = 0;          /* confirmed symmetric (4.2, 10.1) */
+                if (!nb->sym) tbl_nbr_added(n, from);  /* delta + table round (6.1) */
+                nb->sym = 1; nb->ack_try = 0;          /* confirmed symmetric (5.2, 6.3) */
             }
         }
-        /* no generalized ack on a received ack (4.5): the exchange
+        /* no generalized ack on a received ack (5.3): the exchange
          * closes via the collective proof ack - and acking an ack
          * would ping-pong forever, because every received ack resets
          * the receiver's courtesy counter */
         break;
     }
     case PKT_PROOF_ACK: {
-        /* The collective third step (4.2, decided Oct 2026): the hello
+        /* The collective third step (5.2, decided Oct 2026): the hello
          * sender confirms all received hello-acks of its round at once.
          * Only a node that ACKED that round has an open agreement - for
          * it, this packet is the closure: our ack ARRIVED (the packet is
@@ -2855,20 +2855,20 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         if (nb && nb->acked_round) {
             nb->acked_round = 0;                  /* the agreement is closed */
             nb->proven_age_us = 0;                /* reverse direction freshly proven */
-            if (!nb->sym) tbl_nbr_added(n, from); /* delta + table round (4.3) */
-            nb->sym = 1; nb->ack_try = 0;         /* confirmed symmetric (4.2) */
+            if (!nb->sym) tbl_nbr_added(n, from); /* delta + table round (6.1) */
+            nb->sym = 1; nb->ack_try = 0;         /* confirmed symmetric (5.2) */
         }
         break;
     }
     case PKT_PROOF: {
-        /* Proof list (4.2): type, node-id, n x neighbour-id. Reactionless:
+        /* Proof list (5.2): type, node-id, n x neighbour-id. Reactionless:
          * never reply, whatever the content. Two effects:
          *  - WE appear in the list: the sender claims it hears us —
-         *    both directions confirmed in a single reception (4.2),
+         *    both directions confirmed in a single reception (5.2),
          *    reverse evidence freshly refreshed.
          *  - We do not appear: snooping — liveness and quality for the
          *    sender, "seen" at most. No downgrade either: absence in
-         *    one packet is no negative evidence (4.2, decided). */
+         *    one packet is no negative evidence (5.2, decided). */
         uint16_t from = rd16(pkt + 1);
         uint16_t ids = (uint16_t)((len - 3) / 2);
         mimeshi_neighbor *nb = nbr_find(n, from);
@@ -2877,13 +2877,13 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
             nb->last_seen = 0;
             nb->quality = quality_of(rssi);
         }
-        /* appearing in the list = reverse evidence refreshed (4.2);
-         * symmetry only above the quality threshold (10.1) */
+        /* appearing in the list = reverse evidence refreshed (5.2);
+         * symmetry only above the quality threshold (6.3) */
         for (uint16_t i = 0; i < ids; i++) {
             if (rd16(pkt + 3 + 2 * i) == n->id && nb) {
                 nb->proven_age_us = 0;
                 /* his proof list naming us = he claims the link works both
-                 * ways. The TWO-SIDED threshold (4.2, decided Oct 2026):
+                 * ways. The TWO-SIDED threshold (5.2, decided Oct 2026):
                  * his claim is one direction's evidence; our reception
                  * quality of THIS packet is the other. Both above the
                  * gate = mutual; a claim received weakly confirms
@@ -2894,7 +2894,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                 }
             }
         }
-        hello_ack_wait(n, from, rssi);       /* generalized ack trigger (4.5):
+        hello_ack_wait(n, from, rssi);       /* generalized ack trigger (5.3):
                                                 the list itself stays reactionless
                                                 for its CONTENT - the sender's
                                                 link state is the ack reason */
@@ -2903,31 +2903,31 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
     case PKT_ACK1: {
         /* our own outstanding transmission has arrived at the next hop:
          * free the pending record. The hop is done; ack2 arrives on its
-         * own on our home channel (7.1). Matching on msg-id suffices in
+         * own on our home channel (8.1). Matching on msg-id suffices in
          * building block 1 (ids are random per transmission); with
          * routing added, the source should be counted along.
          *
          * The sender of this ack1 received our message AND its ack
-         * reached us: the link is hereby proven symmetric (4.2). This
+         * reached us: the link is hereby proven symmetric (5.2). This
          * is the first exact symmetry proof the core knows; the second
-         * is the tablepull of the neighbor (4.3, building block 2). A
+         * is the tablepull of the neighbor (6.1, building block 2). A
          * hello-ack proves no symmetry — unaddressed on a shared home
          * channel. */
         uint16_t msg_id = rd16(pkt + 1);
-        hello_ack_wait(n, rd16(pkt + 5), rssi);   /* generalized ack trigger (4.5) */
+        hello_ack_wait(n, rd16(pkt + 5), rssi);   /* generalized ack trigger (5.3) */
         for (int i = 0; i < MC_MAX_PENDING; i++) {
             mimeshi_pending *p = &n->pend[i];
             if (p->active && p->msg_id == msg_id && !p->acked1) {
-                p->acked1 = 1;                     /* the own hop succeeded (7.1) */
+                p->acked1 = 1;                     /* the own hop succeeded (8.1) */
                 mimeshi_neighbor *nb = nbr_find(n, rd16(pkt + 5));
-                if (nb) {                               /* confirmed symmetric (4.2, 10.1) */
+                if (nb) {                               /* confirmed symmetric (5.2, 6.3) */
                     nb->quality = quality_of(rssi);     /* the ack1 itself is the measurement (its direction) */
                     nb->proven_age_us = 0;
-                    if (nb->penalty) nb->penalty--;      /* recovery via ordinary traffic (10.4) */
-                    if (len >= 8 && pkt[7]) {            /* what the acker measured on OUR data (6.2) */
+                    if (nb->penalty) nb->penalty--;      /* recovery via ordinary traffic (8.5) */
+                    if (len >= 8 && pkt[7]) {            /* what the acker measured on OUR data (10.2) */
                         nb->rev_quality = quality_ewma(nb->rev_quality ? nb->rev_quality : pkt[7], pkt[7]);
                     }
-                    /* two-sided threshold, final form (4.2, Oct 2026): the
+                    /* two-sided threshold, final form (5.2, Oct 2026): the
                      * ack1 arriving here IS the reverse direction worked;
                      * our reception quality of it is the measured gate.
                      * The rq byte (pkt[7]) is the link quality toward us,
@@ -2947,7 +2947,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                 } else {
                     /* source: the hop is done; ack2 comes back on the
                      * own home channel. T_ack2 (8 s) is the safety
-                     * net (7.3). Exception (decided Oct 2026, the
+                     * net (8.3). Exception (decided Oct 2026, the
                      * one-hop closing piece): when the own next hop
                      * IS the final destination, its ack1 is the end
                      * confirmation - there is no second hop whose
@@ -2970,14 +2970,14 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         break;
     }
     case PKT_ACK2: {
-        /* Ack2 from the next hop (7.1/7.2, revised Oct 2026). Positive
+        /* Ack2 from the next hop (7.1/8.2, revised Oct 2026). Positive
          * = two hops of progress: the next hop received AND its own hop
          * succeeded - the pending record closes. Negative = its
          * forwarding failed after every series; the spent budget
-         * travels along (byte 7, 7.4): weigh the own alternatives
+         * travels along (byte 7, 8.4): weigh the own alternatives
          * against what is left, stop when it is gone. */
         uint16_t msg_id = rd16(pkt + 1);
-        hello_ack_wait(n, rd16(pkt + 5), rssi);   /* generalized ack trigger (4.5) */
+        hello_ack_wait(n, rd16(pkt + 5), rssi);   /* generalized ack trigger (5.3) */
         for (int i = 0; i < MC_MAX_PENDING; i++) {
             mimeshi_pending *p = &n->pend[i];
             if (p->active && p->acked1 && p->msg_id == msg_id) {
@@ -2989,7 +2989,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                     if (len >= 8 && pkt[7] < p->budget_left) p->budget_left = pkt[7];
                     p->acked1 = 0;
                     p->try_idx = (uint8_t)(schedule_attempts(p) - 1);   /* the plan toward this hop is done */
-                    schedule_fail(n, p);          /* exclusion + next plan (7.4) */
+                    schedule_fail(n, p);          /* exclusion + next plan (8.4) */
                 }
                 return;
             }
@@ -2997,7 +2997,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         break;
     }
     case PKT_ACK3: {
-        /* final destination has had the message delivered (11): routed
+        /* final destination has had the message delivered (8.8): routed
          * back to the source, here still without routing logic. */
         printf("[core] node %u: ACK3 — delivered at destination\n", n->id);
         break;
@@ -3028,7 +3028,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
              * dedup check there gates double deliveries, the ack1
              * closes the sender's pending. */
         }
-        /* next-hop addressing (6.1): only the hop the sender chose
+        /* next-hop addressing (10.1): only the hop the sender chose
          * processes the packet; other hearers on the home channel
          * snoop (liveness, quality) - a routed unicast must not
          * multiply. */
@@ -3041,15 +3041,15 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         bool fresh = dedup_fresh(n, msg_id, src);
         if (!fresh) { ack1_send(n, msg_id, src, ch, rssi); return; }
         if (dst == n->id) {
-            uint8_t poff = (flags & F_DEST_GEO) ? 16 : 12;   /* geo sits between header and payload (6.1) */
+            uint8_t poff = (flags & F_DEST_GEO) ? 16 : 12;   /* geo sits between header and payload (10.1) */
             printf("[core] node %u: DATA from %u: '%.*s\n", n->id, src, (int)(len - poff), (const char *)(pkt + poff));
             MTRACE(n, "DELIVERED msg %u from %u (budget %u, via %u)\n", msg_id, src, pkt[9], prev);
-            ack1_send(n, msg_id, src, ch, rssi);       /* same channel; quality of the data travels along (7.1) */
+            ack1_send(n, msg_id, src, ch, rssi);       /* same channel; quality of the data travels along (8.1) */
             /* No ack2 from the destination: the positive ack2 of this
              * final hop goes out by the previous forwarder on OUR
              * ack1 (7.1, revised Oct 2026: two hops per ack2). */
             if (flags & F_ACK3_REQ) {
-                /* ack3 as a routed message (6.2): DATA format, payload
+                /* ack3 as a routed message (10.2): DATA format, payload
                  * = the original msg-id, back toward the source - with
                  * routing, via the first hop computation. */
                 uint16_t ah = route_next_hop(n, src);
@@ -3059,7 +3059,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
                     wr16(a + 5, src); wr16(a + 7, n->id); a[9] = MC_BUDGET_INIT;
                     wr16(a + 10, ah); wr16(a + 12, msg_id);
                     bound_send(n, (uint8_t)(ah % MC_N_CHANNELS), a, 16, t_data_us(16));
-                    ka_called(n, (uint8_t)(ah % MC_N_CHANNELS));   /* own call (4.1) */
+                    ka_called(n, (uint8_t)(ah % MC_N_CHANNELS));   /* own call (5.1) */
                 }
             }
             break;
@@ -3067,13 +3067,13 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         /* forwarding (10.2, stateless per message): ack the previous
          * hop, then recompute the own first step toward the
          * destination. The budget bounds the chain (9); the next-hop
-         * field in the header makes the chain unambiguous (6.1). */
+         * field in the header makes the chain unambiguous (10.1). */
         if (len < 12 || src == n->id) return;    /* malformed, or our own message echoed back */
         uint8_t budget = pkt[9];
-        ack1_send(n, msg_id, src, ch, rssi);      /* the exchange of this hop (7.1) */
+        ack1_send(n, msg_id, src, ch, rssi);      /* the exchange of this hop (8.1) */
         if (budget == 0) return;                  /* budget spent: the chain stops here */
         uint16_t gl = 0, go = 0;
-        if (flags & F_DEST_GEO) { gl = rd16(pkt + 12); go = rd16(pkt + 14); }   /* geo stays in the header (10.2) */
+        if (flags & F_DEST_GEO) { gl = rd16(pkt + 12); go = rd16(pkt + 14); }   /* geo stays in the header (7.1) */
         /* prev-hop exclusion at the FIRST forward choice (decided Oct
          * 2026, measured under load): the hop the message came from
          * is not a candidate for the next one. The known graph is
@@ -3081,19 +3081,19 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
          * first hop toward the destination (measured: 279<->285
          * bounced one message 166 times, kept alive by the dedup
          * pass-through, only broken by a 15 s T_ack2). The retry
-         * machinery of 7.4 applies this exclusion from its second
+         * machinery of 8.4 applies this exclusion from its second
          * series onward; here it prevents the two-hop loop from ever
          * starting. The source itself stays reachable as a fallback:
          * when the exclusion leaves no candidate, the hop simply does
-         * not forward (the negative ack2 / failure report of 10.5
+         * not forward (the negative ack2 / failure report of 8.6
          * follows later). */
         {
             mimeshi_pending *p = 0;
             for (int i = 0; i < MC_MAX_PENDING; i++) if (!n->pend[i].active) { p = &n->pend[i]; break; }
             if (!p) {
-                /* No slot (backpressure, 7.2): say NEGATIVE instead of
+                /* No slot (backpressure, 8.2): say NEGATIVE instead of
                  * dropping silently - the previous hop can try an
-                 * alternative with its own retry plan (7.4) instead of
+                 * alternative with its own retry plan (8.4) instead of
                  * burning its T_ack2 window on a hop that already let
                  * go of the message. The budget we pass back is the
                  * full remaining one minus this hop's unit: nothing was
@@ -3112,22 +3112,22 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
              * geo directly. No traveling state; the header format keeps the
              * F_WAYPOINT_GEO flag defined but unused. */
 
-            /* attempt schedule (7.4): up to 3 Dijkstra-best hops toward
+            /* attempt schedule (8.4): up to 3 Dijkstra-best hops toward
              * dst; the collector never proposes the previous hop (the
-             * 10.2 prev-hop exclusion is thereby part of every
+             * 7.1 prev-hop exclusion is thereby part of every
              * candidate, not only the first). active goes on only
              * after the check - an unforwardable message must not
              * leak its pending slot. */
             p->cand_cnt = schedule_candidates(n, dst, gl, go, prev, 0, 0, p->cand);
-            p->in_graph = r_idx(n, dst) >= 0 || nbr_find(n, dst) != 0;   /* Dijkstra-proven plan? (7.4) */
+            p->in_graph = r_idx(n, dst) >= 0 || nbr_find(n, dst) != 0;   /* Dijkstra-proven plan? (8.4) */
             if (n->hoptrace)
                 hoptrace_dossier(n, dst, prev, gl, go, (uint8_t)(budget - 1),
                                  p->excl, 0, p->cand, p->cand_cnt,
                                  p->cand_cnt ? p->cand[0] : 0);
             if (p->cand_cnt == 0) {
-                /* No routable path from here (7.2/10.5): NEGATIVE back,
+                /* No routable path from here (7.2/8.6): NEGATIVE back,
                  * not silence - the previous hop retries via its own
-                 * plan (7.4). Same budget arithmetic: nothing spent. */
+                 * plan (8.4). Same budget arithmetic: nothing spent. */
                 ack2_send(n, msg_id, src, prev, true,
                           (uint8_t)(budget > 1 ? budget - 1 : 0));
                 return;
@@ -3172,12 +3172,12 @@ void mimeshi_init(mimeshi_node *n, uint16_t id, mimeshi_tx_fn tx, mimeshi_timer_
     n->channel_free = cad;
 }
 
-/* First hello round immediately (fast map building, 4.1), then the
+/* First hello round immediately (fast map building, 5.1), then the
  * adaptive timer with random phase. Idempotent for the rest of the
  * core: after start the hello runs on the timer; do not repeat
  * mimeshi_start() itself. After the startup phase the hello stops; the
- * proof tick carries keepalive and symmetry flush from here (4.1, 4.2). */
-/* Stagger the flush moments (4.2): channel c is due for the first time
+ * tick carries keepalive and symmetry flush from here (5.1, 5.2). */
+/* Stagger the flush moments (5.2): channel c is due for the first time
  * after c x 20 min, so the three channels lie 20 minutes apart. */
 static void proof_stagger(mimeshi_node *n) {
     for (uint8_t c = 0; c < MC_N_CHANNELS; c++)
@@ -3185,7 +3185,7 @@ static void proof_stagger(mimeshi_node *n) {
 }
 
 /* Own geo in the 16-bit grid (5): (0,0) = none. A later call with a
- * different value is a mutation and feeds the table push (4.3). */
+ * different value is a mutation and feeds the table push (6.1). */
 void mimeshi_set_geo(mimeshi_node *n, uint16_t lat, uint16_t lon) {
     if (lat == n->geo_lat && lon == n->geo_lon) return;
     n->geo_lat = lat; n->geo_lon = lon;
@@ -3194,16 +3194,16 @@ void mimeshi_set_geo(mimeshi_node *n, uint16_t lat, uint16_t lon) {
 
 void mimeshi_start(mimeshi_node *n) {
     proof_stagger(n);
-    /* proof tick: time base for keepalive + symmetry flush (4.1, 4.2) */
+    /* tick: time base for keepalive + symmetry flush (5.1, 5.2) */
     n->timer(n, MC_KEEPALIVE_TICK_US, proof_tick, 0);
-    /* star round (4.3, 4.5): the uniform convergence cadence AND the
+    /* star round (6.1, 5.3): the uniform convergence cadence AND the
      * discovery mechanism. A fresh node is lonely (no confirmed
      * neighbour), so the first round rides the accelerated interval:
      * a random phase within it prevents synchronous rounds on
      * simultaneous startup - the old hello jitter, now on the star
-     * round (4.1). */
+     * round (5.1). */
     n->star_own_ctr = 0;
-    n->star_tick = 0;
+    n->star_beat = 0;
     n->star_round_sched = 1;
     n->timer(n, (n->rand(n) % MC_STAR_LONELY_TICKS) * MC_KEEPALIVE_TICK_US,
              star_round_tick, 0);

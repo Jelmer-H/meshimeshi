@@ -1,8 +1,8 @@
 /*
- * test_star.c — star canonicalisation and digest (4.5, step 1).
+ * test_star.c — star canonicalisation and digest (5.3, step 1).
  *
  * Radio-less unit tests of the smallest building block of the star
- * round concept (design 4.5, proposal):
+ * round concept (design 5.3, proposal):
  *  - canonical serialisation: entry (id, quality classes, age, geo) +
  *    links, each (peer id, classes per direction), SORTED by peer id;
  *  - order independence: the internal slot order does not change the
@@ -10,7 +10,7 @@
  *    digests and the derivable heartbeat match of the later steps);
  *  - a content change changes the bytes; a silent age change does not;
  *  - the content hash excludes the age byte;
- *  - digest derivation (content_hash + tick) and the heartbeat tick
+ *  - digest derivation (content_hash + beat) and the beat
  *    match, including the k-window edge and the wrap at 256.
  *
  * The star state is built the way the core builds it in practice:
@@ -62,7 +62,7 @@ static int chunk_has_entry(const uint8_t *p, uint16_t len, uint16_t id) {
     return 0;
 }
 
-/* Build a table chunk as the wire format of 4.3 prescribes, carrying
+/* Build a table chunk as the wire format of 6.1 prescribes, carrying
  * one entry (id, classes, age, geo) plus its links — the same layout
  * a star-round content area carries. Used to give a receiver real
  * map/link state through the public rx path. */
@@ -100,7 +100,7 @@ int main(void) {
 
     /* S receives the star of 0x0301 (origin 0x0301, entry classes 5,
      * tick 20, geo) with its OWNED links: {0x0301, 0x0200} and
-     * {0x0301, 0x0303} are owned by 0x0301 (per-link hash bit, 4.3),
+     * {0x0301, 0x0303} are owned by 0x0301 (per-link hash bit, 6.1),
      * {0x0301, 0x0302} is owned by 0x0302 and never travels in this
      * star. Injected UNSORTED (peer 0x0303 before 0x0200) to prove
      * the serialiser sorts. The link bytes as received: class
@@ -116,7 +116,7 @@ int main(void) {
     uint16_t age_off = 0xFFFF;
     uint16_t slen = mimeshi_star_serialize(&S, 0x0301, star, sizeof star, &age_off);
     /* the star of 0x0301: the entry plus the two OWNED links - the
-     * share the origin advertises (4.3), stored as received. */
+     * share the origin advertises (6.1), stored as received. */
     assert(slen == 9 + 3 * 2);                 /* entry + two owned links */
     assert(age_off == 3);                     /* age byte position */
     assert(t_rd16(star) == 0x0301);           /* entry id */
@@ -169,32 +169,32 @@ int main(void) {
         b[3] = (uint8_t)(b[3] + 7);           /* age moved, content identical */
         uint8_t ha = mimeshi_star_content_hash(a, slen3, 3);
         uint8_t hb = mimeshi_star_content_hash(b, slen3, 3);
-        assert(ha == hb);                     /* age excluded (4.5) */
+        assert(ha == hb);                     /* age excluded (5.3) */
         uint8_t c[MC_STAR_BUF];
         memcpy(c, star3, slen3);
         c[9 + 2] ^= 0x01;                     /* one link class differs */
         assert(mimeshi_star_content_hash(c, slen3, 3) != ha);
     }
 
-    /* digest derivation and heartbeat match (4.5) */
+    /* digest derivation and heartbeat match (5.3) */
     {
         uint8_t h = mimeshi_star_content_hash(star3, slen3, 3);
         uint8_t tick = 40;
         uint8_t d = mimeshi_star_digest(h, tick);
         assert(d == (uint8_t)(h + 40));
         /* same tick: exact match */
-        assert(mimeshi_star_tick_match(d, h, tick, 8) == 0);
+        assert(mimeshi_star_beat_match(d, h, tick, 8) == 0);
         /* tick +1..+8: derivable match, returns the advance */
-        assert(mimeshi_star_tick_match(mimeshi_star_digest(h, tick + 1), h, tick, 8) == 1);
-        assert(mimeshi_star_tick_match(mimeshi_star_digest(h, tick + 8), h, tick, 8) == 8);
+        assert(mimeshi_star_beat_match(mimeshi_star_digest(h, tick + 1), h, tick, 8) == 1);
+        assert(mimeshi_star_beat_match(mimeshi_star_digest(h, tick + 8), h, tick, 8) == 8);
         /* tick +9: outside the k-window -> no fit */
-        assert(mimeshi_star_tick_match(mimeshi_star_digest(h, tick + 9), h, tick, 8) == -1);
+        assert(mimeshi_star_beat_match(mimeshi_star_digest(h, tick + 9), h, tick, 8) == -1);
         /* content change: no k fits */
-        assert(mimeshi_star_tick_match((uint8_t)(d ^ 0x5A), h, tick, 8) == -1);
+        assert(mimeshi_star_beat_match((uint8_t)(d ^ 0x5A), h, tick, 8) == -1);
         /* wrap at 256: tick 250 advancing by 10 wraps to 4; within a
          * k-window of 16 it must still match (modulo arithmetic) */
         uint8_t wrapped = (uint8_t)(250u + 10u);
-        assert(mimeshi_star_tick_match(mimeshi_star_digest(h, wrapped), h, 250, 16) == 10);
+        assert(mimeshi_star_beat_match(mimeshi_star_digest(h, wrapped), h, 250, 16) == 10);
     }
 
     printf("test_star: all assertions passed\n");

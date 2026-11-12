@@ -1,5 +1,5 @@
 /*
- * test_star_missed.c — the missed list (4.5, step 4b).
+ * test_star_missed.c — the missed list (5.3, step 4b).
  *
  * The closed request loop, driven through the real round timer:
  *  1. B hears A's catalogue advertising a star B does not have ->
@@ -13,7 +13,7 @@
  *     damping rule: no re-request after fetch);
  *  5. a second mismatch of the same star does not duplicate the entry;
  *  6. requests to a non-neighbour are refused (only direct
- *     neighbours, 4.5);
+ *     neighbours, 5.3);
  *  7. damping: an unanswered entry is dropped after 2 attempts.
  */
 #include <stdio.h>
@@ -104,7 +104,7 @@ int main(void) {
     mimeshi_rx(&B, B.home_ch, -60, ack_a, 5);
     mimeshi_rx(&A, A.home_ch, -60, ack_b, 5);
 
-    /* A knows the star 0x0301 (far star via a 4.3 chunk) and has
+    /* A knows the star 0x0301 (far star via a 6.1 chunk) and has
      * already carried it once: the last-carried state is set, so the
      * queue would NOT re-send it without a request. */
     {
@@ -129,7 +129,7 @@ int main(void) {
         assert(sl > 0);
         m->star_fwd_tick = 1;                 /* carried once */
         m->star_fwd_hash = mimeshi_star_content_hash(sbuf, sl, 3);
-        m->star_tick = 7;
+        m->star_beat = 7;
     }
 
     /* 1. B hears A's catalogue: star 0x0301 unknown at B -> miss entry. */
@@ -151,7 +151,7 @@ int main(void) {
     printf("5. no duplicate: ok\n");
 
     /* 2. B's round carries the request in the missed area. */
-    mimeshi_start(&B);                        /* starts the round timer (4.3) */
+    mimeshi_start(&B);                        /* starts the round timer (6.1) */
     pump_until(INTERVAL_US);                   /* B's first round fires */
     assert(cap_len[1] > 0);
     {
@@ -172,7 +172,7 @@ int main(void) {
     /* 3. A receives the request and re-queues the star; its next
      * round carries it as CONTENT. */
     deliver(1, &A);                            /* B's captured round -> A */
-    mimeshi_start(&A);                         /* starts the round timer (4.3) */
+    mimeshi_start(&A);                         /* starts the round timer (6.1) */
     pump_until(now + INTERVAL_US);             /* A's next round */
     assert(cap_len[0] > 0);
     {
@@ -233,7 +233,7 @@ int main(void) {
     assert(miss_count(&B, 0x0100, 0x0304) == 1);
     pump_until(now + 3 * INTERVAL_US);         /* rounds of B: attempt 1, attempt 2,
                                                    then the pack of the third drops
-                                                   the damped-out entry (4.5) */
+                                                   the damped-out entry (5.3) */
     assert(miss_count(&B, 0x0100, 0x0304) == 0);   /* damped out after 2 tries */
     printf("7. damping drops the entry after 2 attempts: ok\n");
 

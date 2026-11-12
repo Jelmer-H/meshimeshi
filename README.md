@@ -6,27 +6,27 @@ Protocol core in C for repeaters/companions + Python simulator. See
 ## Status (Oct 2026)
 
 - **Building block 1 complete**: discovery and first evidence without a
-  hello (4.5): accelerated full-spread star rounds for lonely nodes,
+  hello (5.3): accelerated full-spread star rounds for lonely nodes,
   directional generalized hello-acks
   with snooping, symmetry status per neighbor (seen/confirmed), unicast
   with ack1/2/3, retries, budget, collision and capture model, GPS/height
   link budget.
   Scenarios up to and including `local-net` (40 nodes from a node list).
-- **Building block 2 complete**: star rounds (4.3, the uniform convergence
+- **Building block 2 complete**: star rounds (6.1, the uniform convergence
   cadence — the old chunk-push path is removed from the code), expiry
-  and aging (4.4), routing (10): Dijkstra over the known
+  and aging (6.2), routing (10): Dijkstra over the known
   graph with the ETX cost table and age multiplier, forwarding with
-  next-hop addressing, retry series with cumulative exclusion (7.4), the
+  next-hop addressing, retry series with cumulative exclusion (8.4), the
   revised ack2 mechanism (two hops per ack2, spent budget along, T_ack2
-  15 s), destination geo in the header and the bridge-node rule (10.2).
+  15 s), destination geo in the header and the bridge-node rule (7.1).
   Measured on `local-net`/`traffic`/`load` (utrecht40): 100% delivery for
   neighbor traffic, 81.7% random-to-random under sustained load (the
   remainder: source nodes below the symmetry gate and collision loss).
-- **In preparation**: failed delivery report (10.5), cost table/parameter
-  calibration under load, ack-on-demand in the core (4.1), slot × 3/n
+- **In preparation**: failed delivery report (8.6), cost table/parameter
+  calibration under load, ack-on-demand in the core (5.1), slot × 3/n
   (open point 3).
 - All decisions and measurements are documented with rationale in
-  `docs/design.md`; the work order in 14.1.
+  `docs/design.md`; the work order in 12.1.
 
 ## Structure
 
@@ -34,7 +34,7 @@ Protocol core in C for repeaters/companions + Python simulator. See
 meshimeshi/
 ├── core/            # protocol core: platform-independent, no dynamic allocation
 │   ├── core.h       #   API + hardware interface (tx / timer / switch / RNG)
-│   └── core.c       #   discovery (4.5), neighbor table, acks, unicast, budget, switch rule
+│   └── core.c       #   discovery (5.3), neighbor table, acks, unicast, budget, switch rule
 ├── sim/             # simulator (event-driven virtual radio, SF7/62.5 kHz)
 │   ├── sim1.py      #   platform layer (clock/radio/RNG) + link-test scenario
 │   └── meshsim.py   #   simpy engine + scenario registry (reuses sim1.py)
@@ -66,7 +66,7 @@ python3 sim/sim1.py                # link-test scenario, uses build/libmimeshi.s
 python3 -m venv .venv && .venv/bin/pip install simpy
 .venv/bin/python sim/meshsim.py --list          # available scenarios
 .venv/bin/python sim/meshsim.py link-test     # same run as sim1.py (engine check)
-.venv/bin/python sim/meshsim.py collision       # collision + capture (6 dB margin, design 14.1)
+.venv/bin/python sim/meshsim.py collision       # collision + capture (6 dB margin, design 12.1)
 .venv/bin/python sim/meshsim.py local-net    # 40 nodes from sim/nodes/*.csv (GPS+height)
 .venv/bin/python sim/meshsim.py local-net --nodes sim/nodes/utrecht40.csv --duration 8
 ```

@@ -2,7 +2,7 @@
 """
 sim1.py — Meshimeshi simulator, scenario 1 (link test: 2 nodes).
 
-Architecture (design 14.1): event-driven discrete simulation; the protocol
+Architecture (design 12.1): event-driven discrete simulation; the protocol
 core is C and is called via ctypes (default build/libmimeshi.so, built with
   gcc -O2 -fPIC -shared core/core.c -o build/libmimeshi.so).
 The C core is the only protocol implementation (design 13b): this file is
@@ -24,16 +24,16 @@ Measurements: airtime per channel, home-deafness per node, delivery outcome.
 import argparse, ctypes, heapq, math, os, random, sys
 from collections import deque
 
-T_HELLO = 62_000          # us, hello 3 B (6.3)
-T_HACK  = 70_000          # hello-ack 5 B (6.2)
-T_ACK   = 78_000          # ack1/ack2 7 B (6.2)
+T_HELLO = 62_000          # us, hello 3 B
+T_HACK  = 70_000          # hello-ack 5 B (10.2)
+T_ACK   = 78_000          # ack1/ack2 7 B (10.2)
 T_DATA  = lambda l: 173_000 if l <= 40 else 459_000 if l <= 150 else 869_000
-S_SWITCH = 5_000          # channel switch incl. settling (design 14.1)
+S_SWITCH = 5_000          # channel switch incl. settling (design 12.1)
 ACK1_MARGIN = 80_000      # margin on the ack1 wait time, equal to core.c
 N_CH = 3
 HOME = lambda nid: nid % N_CH
 RSSI = -60                # link quality default; settable per pair (Wire.links)
-CAPTURE_DB = 6            # margin at which the strongest wins (design 2/14.1)
+CAPTURE_DB = 6            # margin at which the strongest wins (design 2/12.1)
 
 VERBOSE = True             # False: suppress radio logs (tx/hears-nothing)
 
@@ -47,7 +47,7 @@ def radio_log(*a):
 class Wire:
     """Channel model shared by both engines: ongoing transmissions per
     channel, link RSSI per (sender, receiver), collision and capture
-    (design 2 and 14.1: two overlapping transmissions on the same channel
+    (design 2 and 12.1: two overlapping transmissions on the same channel
     collide, unless the strongest wins with >= CAPTURE_DB margin)."""
     def __init__(self):
         self.chan = [[] for _ in range(N_CH)]   # (start, end, sender-id)
@@ -131,7 +131,7 @@ class DutyLedger:
         return sum(us for t, us in self.log.get((nid, ch), ()) if t > nu - self.window)
 
 # ---------------- node list and link budget (scenario layer) -----------
-# Radio model (Proposal; NL calibration: Open, see design 14.1):
+# Radio model (Proposal; NL calibration: Open, see design 12.1):
 #   reception = TX - FSPL(d) - 2 x clutter(h), bounded by the radio horizon.
 # clutter(h) = 30 - 14 log10(1+h) dB: low masts lose a lot to the
 # environment, high masts look over it. Per direction a fading offset of
@@ -178,13 +178,13 @@ def linkbudget(pa, pb):
     return TX_DBM - fspl - clutter
 
 class StarStats:
-    """Star-round measurement (4.5, scenario 6): per transmitted chunk the
+    """Star-round measurement (5.3, scenario 6): per transmitted chunk the
     content star count (p[4]), the catalogue count (p[3]) and the missed
     entries - the three areas of the round. Aggregates per node:
     rounds, content stars, catalogue entries, missed requests, and the
     byte split, plus the hard-bound check (max rounds per node per
-    interval of 15 proof ticks)."""
-    INTERVAL_US = 15 * 60000000          # 15 min (4.5 starting value; 1 tick = 1 min)
+    interval of 15 ticks)."""
+    INTERVAL_US = 15 * 60000000          # 15 min (5.3 starting value; 1 tick = 1 min)
     def __init__(self):
         self.per_node = {}                # id -> dict of counters
         self.air_total = 0
@@ -220,7 +220,7 @@ class StarStats:
         self.air_total += airtime
     def hard_bound_violations(self):
         """Rounds per node per interval: more than 1 in an interval
-        violates the one-chunk-per-interval bound (4.5). Returns a
+        violates the one-chunk-per-interval bound (5.3). Returns a
         list of (nid, t1, t2) violation tuples."""
         out = []
         iv = self.INTERVAL_US
@@ -250,8 +250,8 @@ class Radio:  # virtual radio + clock
         self.ack_air = [0]*N_CH     # airtime of hello-acks (type 2) per channel
         self.proof_air = [0]*N_CH   # airtime of proof lists (type 3) per channel
         self.chunk_air = [0]*N_CH   # airtime of table chunks (type 4) per channel
-        self.star_air = [0]*N_CH    # airtime of star rounds (type 10) per channel (4.5)
-        self.star_stats = StarStats()  # star-round measurement (4.5, scenario 6)
+        self.star_air = [0]*N_CH    # airtime of star rounds (type 10) per channel (5.3)
+        self.star_stats = StarStats()  # star-round measurement (5.3, scenario 6)
         self.duty = DutyLedger()
         self.wire = Wire()
         self.seq = 0
@@ -354,7 +354,7 @@ class Node:
     def tx(self, ch, pkt, airtime, wait=None):
         """Transmission on the current channel; wait>0 keeps the node on
         the channel for the return. Default: data gets an ack1 window
-        (t_ack + margin, design 7.3) on the exchange channel."""
+        (t_ack + margin, design 8.3) on the exchange channel."""
         if wait is None:
             wait = T_ACK + ACK1_MARGIN if (pkt[0] & 0x0F) == 5 else 0
         start = max(self.radio.now, self.busy_until)
@@ -412,14 +412,14 @@ MC_MAX_NEIGHBORS, MC_MAX_PENDING, MC_MAX_DEDUP, MC_MAX_PAYLOAD = 64, 64, 128, 23
 class CNeighbor(ctypes.Structure):
     _fields_ = [("id", ctypes.c_uint16), ("quality", ctypes.c_uint8),
                 ("rev_quality", ctypes.c_uint8),
-                ("ack_try", ctypes.c_uint8),      # courtesy counter (4.5)
-                ("ack_spacing", ctypes.c_uint16), # pace gate: current backoff spacing (4.5)
-                ("ack_next_tick", ctypes.c_uint32), # pace gate: earliest next ack tick (4.5)
+                ("ack_try", ctypes.c_uint8),      # courtesy counter (5.3)
+                ("ack_spacing", ctypes.c_uint16), # pace gate: current backoff spacing (5.3)
+                ("ack_next_tick", ctypes.c_uint32), # pace gate: earliest next ack tick (5.3)
                 ("last_seen", ctypes.c_uint32),
                 ("proven_age_us", ctypes.c_uint64), ("alive", ctypes.c_uint8),
                 ("sym", ctypes.c_uint8), ("adv_class", ctypes.c_uint8),
                 ("penalty", ctypes.c_uint8),
-                ("acked_round", ctypes.c_uint8)]   # three-way closure (4.2): we acked this neighbour's round
+                ("acked_round", ctypes.c_uint8)]   # three-way closure (5.2): we acked this neighbour's round
 
 class CPending(ctypes.Structure):
     _fields_ = [("active", ctypes.c_uint8), ("tries_left", ctypes.c_uint8),
@@ -444,17 +444,17 @@ class CMapNode(ctypes.Structure):
     _fields_ = [("id", ctypes.c_uint16),
                 ("geo_lat", ctypes.c_uint16), ("geo_lon", ctypes.c_uint16),
                 ("quality", ctypes.c_uint8),   # local measurement of the node's signal
-                ("adv_q", ctypes.c_uint8),      # entry class byte as the origin advertised (4.3)
+                ("adv_q", ctypes.c_uint8),      # entry class byte as the origin advertised (6.1)
                 ("arrived_tick", ctypes.c_uint16),
                 ("age_ticks", ctypes.c_uint8),
-                ("star_tick", ctypes.c_uint8),      # origin heartbeat tick (4.3)
+                ("star_beat", ctypes.c_uint8),      # origin beat (6.1)
                 ("alive", ctypes.c_uint8),
-                ("star_fwd_tick", ctypes.c_uint16), # queue entry tick (4.3)
-                ("star_fwd_hash", ctypes.c_uint8),  # content hash as last carried (4.3)
-                ("star_fwd_bits", ctypes.c_uint8),  # carried-on-channel bits (4.3 rotation)
-                ("star_miss_ctr", ctypes.c_uint8),  # missed-list damping (4.3)
-                ("star_wanted", ctypes.c_uint16),    # tick of the last explicit ask (4.3)
-                ("star_tick_seen", ctypes.c_uint16)]  # local tick of the last origin-tick advance (4.4 liveness)
+                ("star_fwd_tick", ctypes.c_uint16), # queue entry tick (6.1)
+                ("star_fwd_hash", ctypes.c_uint8),  # content hash as last carried (6.1)
+                ("star_fwd_bits", ctypes.c_uint8),  # carried-on-channel bits (6.1 rotation)
+                ("star_miss_ctr", ctypes.c_uint8),  # missed-list damping (6.1)
+                ("star_wanted", ctypes.c_uint16),    # tick of the last explicit ask (6.1)
+                ("star_beat_seen", ctypes.c_uint16)]  # local tick of the last origin-tick advance (6.2 liveness)
 
 class CLink(ctypes.Structure):
     _fields_ = [("a", ctypes.c_uint16), ("b", ctypes.c_uint16),
@@ -481,26 +481,26 @@ CNode._fields_ = [
     ("id", ctypes.c_uint16), ("home_ch", ctypes.c_uint8), ("local_tbl_ctr", ctypes.c_uint16),
     ("nbr", CNeighbor * MC_MAX_NEIGHBORS), ("pend", CPending * MC_MAX_PENDING),
     ("dedup", CDedup * MC_MAX_DEDUP),
-    ("round_jitter_us", ctypes.c_uint64),   # random phase per scheduled own call (4.2)
-    ("ka_idle", ctypes.c_uint8 * 3),   # keepalive counters per channel (4.1)
-    ("proof_wait", ctypes.c_uint8 * 3),  # flush countdown per channel (4.2)
+    ("round_jitter_us", ctypes.c_uint64),   # random phase per scheduled own call (5.2)
+    ("ka_idle", ctypes.c_uint8 * 3),   # keepalive counters per channel (5.1)
+    ("proof_wait", ctypes.c_uint8 * 3),  # flush countdown per channel (5.2)
     ("geo_lat", ctypes.c_uint16), ("geo_lon", ctypes.c_uint16),  # own geo grid (5)
-    ("tick", ctypes.c_uint32),          # local time base in proof ticks (4.4)
+    ("tick", ctypes.c_uint32),          # local time base in ticks (6.2)
     ("dedup_seq", ctypes.c_uint16),
-    ("tbl_dirty", ctypes.c_uint8),             # own-star content change pending (4.3)
-    ("star_round_sched", ctypes.c_uint8),     # star-round timer running (4.3)
-    ("proof_ack_pend", ctypes.c_uint8),       # three-way closure (4.2): acked round pending
+    ("tbl_dirty", ctypes.c_uint8),             # own-star content change pending (6.1)
+    ("star_round_sched", ctypes.c_uint8),     # star-round timer running (6.1)
+    ("proof_ack_pend", ctypes.c_uint8),       # three-way closure (5.2): acked round pending
     ("proof_ack_best_rq", ctypes.c_uint8),     # the round's strongest received rq (two-sided gate)
     ("star_backlog", ctypes.c_uint8),         # content work remained (6e acceleration)
-    ("star_rot_ctr", ctypes.c_uint8),         # rotation counter (4.3)
-    ("ev_taboo", ctypes.c_uint16 * 256),      # eviction taboo (4.3): judged-and-rejected set
+    ("star_rot_ctr", ctypes.c_uint8),         # rotation counter (6.1)
+    ("ev_taboo", ctypes.c_uint16 * 256),      # eviction taboo (6.1): judged-and-rejected set
     ("ev_taboo_idx", ctypes.c_uint8),         # taboo ring write position
-    ("star_miss", CStarMiss * 12),           # missed list (4.3, MC_STAR_MISS_MAX)
-    ("star_own_ctr", ctypes.c_uint8),         # home rounds since the last own-star carry (4.3)
-    ("star_tick", ctypes.c_uint8),            # own-star heartbeat tick (4.3)
-    ("star_lonely_ctr", ctypes.c_uint8),     # lonely ladder spacing (4.5)
-    ("map", CMapNode * MC_MAP_NODES),   # 2-hop map (10.1)
-    ("lnk", CLink * MC_MAX_LINKS),      # link store (4.3)
+    ("star_miss", CStarMiss * 12),           # missed list (6.1, MC_STAR_MISS_MAX)
+    ("star_own_ctr", ctypes.c_uint8),         # home rounds since the last own-star carry (6.1)
+    ("star_beat", ctypes.c_uint8),            # own-star beat (6.1)
+    ("star_lonely_ctr", ctypes.c_uint8),     # lonely ladder spacing (5.3)
+    ("map", CMapNode * MC_MAP_NODES),   # 2-hop map (6.3)
+    ("lnk", CLink * MC_MAX_LINKS),      # link store (6.1)
     ("hoptrace", ctypes.c_void_p),             # hop-decision trace FILE* (deep forensics)
     ("trace", ctypes.c_uint8),                 # message tracing (forensics runs)
     ("tx", TX_FN), ("timer", TIMER_FN), ("switch_ch", SWITCH_FN), ("rand", RAND_FN),
@@ -605,12 +605,12 @@ class CCore:
     def set_geo(self, lat, lon):
         self.lib.mimeshi_set_geo(ctypes.byref(self.mn), lat, lon)
     def star_state(self, star_id):
-        """(present, star_tick, age_ticks, effective_age) of a star in the
-        map - the 4.5 liveness/age measurement probes."""
+        """(present, star_beat, age_ticks, effective_age) of a star in the
+        map - the 5.3 liveness/age measurement probes."""
         for m in self.mn.map:
             if m.alive and m.id == star_id:
                 eff = m.age_ticks + (self.mn.tick - m.arrived_tick)
-                return True, m.star_tick, m.age_ticks, eff
+                return True, m.star_beat, m.age_ticks, eff
         return False, 0, 0, 0
     def miss_count(self):
         return sum(1 for e in self.mn.star_miss if e.alive)
@@ -620,7 +620,7 @@ class CCore:
         return sum(1 for l in self.mn.lnk if l.alive)
     def send_data(self, dst, data, ack3=True, geo=None):
         """geo: (lat, lon) in the 16-bit grid of section 5 - the
-        client-supplied destination geo (10.2); None = unknown."""
+        client-supplied destination geo (7.1); None = unknown."""
         payload = data.encode() if isinstance(data, str) else bytes(data)
         gl, go = geo if geo else (0, 0)
         rc = self.lib.mimeshi_send_data(ctypes.byref(self.mn), dst, payload, len(payload), ack3, gl, go)
@@ -630,7 +630,7 @@ class CCore:
 
 def sym_count(node):
     """Number of neighbors with confirmed symmetric traffic (nb.sym,
-    4.2/10.1). Only visible on the C core (the status lives in the node
+    5.2/6.3). Only visible on the C core (the status lives in the node
     struct)."""
     core = node.core
     if isinstance(core, CCore):
@@ -669,7 +669,7 @@ def main():
     a.core.start()
     radio.schedule(500_000, b.core.start)   # real nodes never start on the same
     # microsecond. Discovery rides the accelerated lonely star round
-    # (4.5): the first round comes within ~5 min (random phase), full
+    # (5.3): the first round comes within ~5 min (random phase), full
     # spread; the generalized acks and the collective proof ack close
     # both sides - so the unicasts wait for the first confirmed
     # neighbour (~2 accelerated rounds).

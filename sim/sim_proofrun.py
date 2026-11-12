@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-sim_proofrun.py — long-run check of the keepalive replacement (4.1/4.2).
+sim_proofrun.py — long-run check of the keepalive replacement (5.1/5.2).
 
 Two nodes, straight from the scenario-1 setup in sim1.py, but run for
 6.5 hours of virtual time. Verifies against the design:
   - the hello exists only during the startup phase (last round at the
     1920 s interval); after that no PKT_HELLO goes on air anymore;
-  - each channel gets about one proof list per hour (rotation, 4.2),
-    pulled forward on silence (keepalive role, 4.1);
+  - each channel gets about one proof list per hour (rotation, 5.2),
+    pulled forward on silence (keepalive role, 5.1);
   - both directions stay confirmed symmetric over the whole run
     (appearing in each other's proof lists refreshes the evidence).
 """

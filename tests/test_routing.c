@@ -1,5 +1,5 @@
 /*
- * test_routing.c — route computation (10.2) directly on the C core.
+ * test_routing.c — route computation (7.1) directly on the C core.
  *
  * Diamond topology:
  *
@@ -16,7 +16,7 @@
  *
  * Verifies (10.2, building block 2, step 1):
  *  - cost table: the direct bad link loses against the 2-hop detour;
- *  - the chosen first hop is a confirmed symmetric neighbour (10.1);
+ *  - the chosen first hop is a confirmed symmetric neighbour (6.3);
  *  - age multiplier: when C's map entry is old (age above half of
  *    T_active), the route shifts to D (cheaper after the multiplier);
  *  - unknown destination: refused with -1 (no flood);
@@ -68,19 +68,19 @@ static bool vrcad(mimeshi_node *n, uint8_t ch) { (void)n; (void)ch; return true;
 static void r16w(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 
 /* hello-ack addressed to `hsender` from `responder`, injected at
- * hsender with the given RSSI quality: proves symmetry there (4.2). */
+ * hsender with the given RSSI quality: proves symmetry there (5.2). */
 static void confirm_sym(mimeshi_node *hsender, uint16_t responder, int8_t rssi) {
     uint8_t ha[6] = { 2, 0,0, 0,0, 0 };
     /* the rq byte carries the responder's measurement of OUR signal
-     * (6.2) - the three-way closure (4.2, Oct 2026) gates symmetry on
+     * (10.2) - the three-way closure (5.2, Oct 2026) gates symmetry on
      * this received evidence, so a realistic quality travels along */
     r16w(ha + 1, hsender->id); r16w(ha + 3, responder); ha[5] = 34;
     mimeshi_rx(hsender, (uint8_t)(hsender->id % MC_N_CHANNELS), rssi, ha, 6);
 }
 
-/* Build a star-round content packet in the 4.3 wire form: the star of
+/* Build a star-round content packet in the 6.1 wire form: the star of
  * `origin` - its entry (classes in both nibbles) plus the links the
- * origin OWNS. Ownership follows the 4.3 rule (one bit of a CRC-8
+ * origin OWNS. Ownership follows the 6.1 rule (one bit of a CRC-8
  * over the normalised pair); the helper mirrors the core so the test
  * injects exactly what the owner's star carries on air. A wanted link
  * toward `peer` (class both nibbles) is included when the origin owns
@@ -118,7 +118,7 @@ static uint16_t star_build(uint8_t *ck, uint16_t origin,
 }
 /* the OLD helper name, kept for the few one-entry injection sites:
  * one star of `owner` (entry e1, classes cls1) that owns the link
- * toward e2 with the given class - the 4.3 claim "owner knows e2". */
+ * toward e2 with the given class - the 6.1 claim "owner knows e2". */
 static uint16_t chunk_build(uint8_t *ck, uint16_t owner,
                             uint16_t e1, uint8_t cls1, uint8_t age1,
                             uint16_t e2, uint8_t cls2, uint8_t age2,
@@ -177,7 +177,7 @@ static void f_rx(mimeshi_node *r, uint8_t ch, const uint8_t *pkt, uint16_t len) 
 static void f_confirm(mimeshi_node *hs, uint16_t responder) {
     uint8_t ha[6] = { 2, 0,0, 0,0, 0 };
     ha[1] = (uint8_t)hs->id; ha[2] = (uint8_t)(hs->id >> 8);
-    ha[3] = (uint8_t)responder; ha[4] = (uint8_t)(responder >> 8); ha[5] = 34;   /* rq: the three-way closure evidence (4.2) */
+    ha[3] = (uint8_t)responder; ha[4] = (uint8_t)(responder >> 8); ha[5] = 34;   /* rq: the three-way closure evidence (5.2) */
     mimeshi_rx(hs, (uint8_t)(hs->id % MC_N_CHANNELS), -55, ha, 6);
 }
 static void f_deliver(const uint8_t *pkt, uint16_t len) {
@@ -196,7 +196,7 @@ static int e_tx[4], e_deliv[4];
 static void e_confirm(mimeshi_node *hs, uint16_t responder) {
     uint8_t ha[6] = { 2, 0,0, 0,0, 0 };
     ha[1] = (uint8_t)hs->id; ha[2] = (uint8_t)(hs->id >> 8);
-    ha[3] = (uint8_t)responder; ha[4] = (uint8_t)(responder >> 8); ha[5] = 34;   /* rq: the three-way closure evidence (4.2) */
+    ha[3] = (uint8_t)responder; ha[4] = (uint8_t)(responder >> 8); ha[5] = 34;   /* rq: the three-way closure evidence (5.2) */
     mimeshi_rx(hs, (uint8_t)(hs->id % MC_N_CHANNELS), -55, ha, 6);
 }
 static void e_rxnode(mimeshi_node *r, uint8_t ch, const uint8_t *pkt, uint16_t len) {
@@ -243,7 +243,7 @@ static uint8_t g_last_ch;
 static void g_confirm(mimeshi_node *hs, uint16_t responder) {
     uint8_t ha[6] = { 2, 0,0, 0,0, 0 };
     ha[1] = (uint8_t)hs->id; ha[2] = (uint8_t)(hs->id >> 8);
-    ha[3] = (uint8_t)responder; ha[4] = (uint8_t)(responder >> 8); ha[5] = 34;   /* rq: the three-way closure evidence (4.2) */
+    ha[3] = (uint8_t)responder; ha[4] = (uint8_t)(responder >> 8); ha[5] = 34;   /* rq: the three-way closure evidence (5.2) */
     mimeshi_rx(hs, (uint8_t)(hs->id % MC_N_CHANNELS), -55, ha, 6);
 }
 static void g_deliv_reset(void) { g_last_ch = 0xFF; }
@@ -280,7 +280,7 @@ int main(void) {
     }
 
     /* The graph: A learns the paths C->B (class 7) and D->B (class 6)
-     * from the stars of the link OWNERS (4.3): C owns {C,B}, so C's
+     * from the stars of the link OWNERS (6.1): C owns {C,B}, so C's
      * star carries the link; {D,B} is owned by B, so B's star carries
      * it. Injected at A as star-round content packets. */
     uint8_t ck[64];
@@ -315,13 +315,13 @@ int main(void) {
     assert((last_type & 0x0F) == PKT_DATA_VAL);
     assert(last_ch == (uint8_t)(idC % MC_N_CHANNELS));   /* first hop: C, not B */
 
-    /* Test 2: unknown destination -> refuse (no flood, 10.2). */
+    /* Test 2: unknown destination -> refuse (no flood, 7.1). */
     assert(mimeshi_send_data(&A, 0x0BEE, (const uint8_t *)"x", 1, false, 0, 0) == -1);
 
     /* Test 4: unreachable destination - in the map (C names E with
      * id and geo), but without a single known link toward it (class 0
-     * = never reported, 4.3): map material, not route material
-     * (10.2). Refused, no flood. */
+     * = never reported, 6.1): map material, not route material
+     * (7.1). Refused, no flood. */
     {
         uint8_t ck2[64];
         uint16_t l2 = star_build(ck2, 0x0C0C, 7, 0, 0, 0, 0);
@@ -333,17 +333,17 @@ int main(void) {
         assert(mimeshi_send_data(&A, 0x0C0C, (const uint8_t *)"x", 1, false, 0, 0) == -1);
     }
 
-    /* Test 3: age multiplier (10.2). Let proof ticks pass so every
+    /* Test 3: age multiplier (7.1). Let ticks pass so every
      * entry ages above half of T_active (6 h = 360 ticks of 1 min);
      * then refresh ONLY D's path (fresh age). C's entries stay old:
      * the C-route costs 1.5x and D wins. */
-    mimeshi_start(&A);                       /* starts the proof tick (1 min) */
+    mimeshi_start(&A);                       /* starts the tick (1 min) */
     pump_until(400 * 60000000ull);            /* 400 ticks = 6.7 h: C and D entries now stale */
     /* D comes back as a confirmed neighbour the way the protocol does
-     * it: a hello ack addressed to us (4.2) - neighbour freshness is
+     * it: a hello ack addressed to us (5.2) - neighbour freshness is
      * the hello/ack/traffic path, not a star reception. C stays
      * silent: its entries keep the stale age. The D->B link class 6
-     * arrives as B's owned star (4.3). */
+     * arrives as B's owned star (6.1). */
     confirm_sym(&A, idD, -70);
     {
         uint16_t peers[1] = { idD };
@@ -377,7 +377,7 @@ int main(void) {
         f_confirm(&A, idn[1]); f_confirm(&B, idn[0]);
         f_confirm(&B, idn[2]); f_confirm(&C, idn[1]);
         f_confirm(&C, idn[3]); f_confirm(&D, idn[2]);
-        /* the graph under link ownership (4.3): C owns BOTH {B,C} and
+        /* the graph under link ownership (6.1): C owns BOTH {B,C} and
          * {C,D} (per-link hash bit), so C's star carries the two
          * links - A learns the path A-B-C-D from it: A-B is an own
          * edge, B-C and C-D travel in C's star. B owns nothing on
@@ -395,7 +395,7 @@ int main(void) {
         assert(mimeshi_send_data(&A, idn[3], (const uint8_t *)"hop", 3, false, 0, 0) == 0);
         pump_until(now + 50000000ull);      /* the whole chain: switches, hops, acks */
         /* D received the DATA (a retry of the last hop may arrive too
-         * and gets its ack1 under the 7.4 retry rule - it counts as a
+         * and gets its ack1 under the 8.4 retry rule - it counts as a
          * reception at the destination, the core dedups the delivery;
          * the [core] delivery print appears exactly once). */
         assert(f_delivered[3] >= 1);
@@ -409,7 +409,7 @@ int main(void) {
     }
 
     /* ------------------------------------------------------------------
-     * Test 6: retry series and cumulative exclusion (7.4). A has two
+     * Test 6: retry series and cumulative exclusion (8.4). A has two
      * confirmed neighbours toward B: C (best) and D (second). The
      * radio blackholes C: both attempts toward C stay unanswered; the
      * series fails, C goes into the exclusion, and the recompute must
@@ -446,7 +446,7 @@ int main(void) {
     }
 
     /* ------------------------------------------------------------------
-     * Test 7: the bridge-node rule (10.2). A knows B (confirmed, with
+     * Test 7: the bridge-node rule (7.1). A knows B (confirmed, with
      * geo) and B knows C (with geo) - but A does NOT know C: C lies
      * outside A's graph. The client supplies C's geo. The bridge rule
      * must pick the graph node closest to C's geo - B - and route the
