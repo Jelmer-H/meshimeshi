@@ -333,7 +333,14 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
         if (!fresh) { ack1_send(n, msg_id, src, ch, rssi); return; }
         if (dst == n->id) {
             uint8_t poff = (flags & F_DEST_GEO) ? 16 : 12;   /* geo sits between header and payload (10.1) */
-            printf("[core] node %u: DATA from %u: '%.*s\n", n->id, src, (int)(len - poff), (const char *)(pkt + poff));
+            printf("[core] node %u: DATA from %u: '", n->id, src);
+            for (uint16_t i = poff; i < len; i++) {
+                uint8_t c = pkt[i];
+                putchar((c >= 0x20 && c < 0x7F) ? c : '.');   /* payload may
+                    be binary (the load scenario sends every byte value):
+                    control bytes must not corrupt the log stream */
+            }
+            printf("'\n");
             MTRACE(n, "DELIVERED msg %u from %u (budget %u, via %u)\n", msg_id, src, pkt[9], prev);
             ack1_send(n, msg_id, src, ch, rssi);       /* same channel; quality of the data travels along (8.1) */
             /* No ack2 from the destination: the positive ack2 of this
