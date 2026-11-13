@@ -13,3 +13,5 @@ build/
 # sim run outputs (rerunnable from the scenario + seed; keep the repo clean)
 *.log
 graph*.json
+*.cp
+hoptrace*.json
