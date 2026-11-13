@@ -1688,6 +1688,12 @@ def load(mk, jitter):
     for i, nd in enumerate(nodes_list):
         kn = Node(radio, nd['id'])
         kn.core = set_jitter(mk(kn), jitter)
+        kn.core.set_geo(*grid_geo(nd['lat'], nd['lon']))   # own geo: the star
+        #   round header carries it, so map entries gain geo and the
+        #   bridge-node rule (7.1) has candidates for out-of-graph
+        #   destinations - without this every out-of-graph send is
+        #   refused (measured: ~51% refusals pinned to the out-of-graph
+        #   share, whatever the warmup)
         nodes.append(kn)
         radio.schedule(i * 250_000, kn.core.start)
     ids = [n['id'] for n in nodes_list]
@@ -1703,6 +1709,23 @@ def load(mk, jitter):
     out(f"{len(nodes_list)} nodes from {_ARGS.nodes}, "
         f"warmup {_ARGS.warmup} h, load {_ARGS.duration} h, "
         f"one unicast per {_ARGS.interval} s, payload {payload_b} B")
+
+    # progress probes: a sampled convergence picture (like star-scale)
+    # plus the load counters so far - hourly, warmup included.
+    probe_rng = random.Random(2026)
+    probe_sample = probe_rng.sample(nodes, 24)   # 24 observer nodes
+    def probe():
+        known = [sum(1 for m in kn.core.mn.map if m.alive) for kn in probe_sample]
+        links = [sum(1 for l in kn.core.mn.lnk if l.alive) for kn in probe_sample]
+        att, dlv = attempted[0], delivered[0]
+        pct = f" ({100*dlv/att:.1f}% of attempts)" if att else ""
+        out(f"[probe t={radio.now/3.6e9:.2f} h] map avg "
+            f"{sum(known)/len(known):.1f}/{len(ids)} ({100*sum(known)/len(known)/len(ids):.1f}%), "
+            f"links avg {sum(links)/len(links):.1f}, "
+            f"attempts {att}, refused {refused_graph[0]}, delivered {dlv}{pct}")
+        if radio.now + 3_600_000_000 < warmup_us + duration_us:
+            radio.schedule(3_600_000_000, probe)
+    radio.schedule(3_600_000_000, probe)
 
     # delivery bookkeeping on the raw bytes, before the core's own
     # next-hop filter and dedup: a DATA reception at the destination
@@ -1798,7 +1821,8 @@ def load(mk, jitter):
         rows = []
         for nid, a in sorted(gen._att.items()):
             d = per_src.get(nid, 0)
-            rows.append((d / max(a, 1), nid, a, d, gen._ref.get((nid, -1), 0)))
+            rows.append((d / max(a, 1), nid, a, d,
+                         getattr(gen, '_ref', {}).get((nid, -1), 0)))
         rows.sort()
         out("per source: attempts / delivered / refused-not-in-graph (worst delivery first)")
         for r, nid, a, d, rf in rows[:8]:
