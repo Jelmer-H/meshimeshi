@@ -97,23 +97,11 @@ typedef struct {
                               Dijkstra run without the earlier ones */
     uint8_t  try_idx;       /* attempt counter over the plan; cand[try_idx
                               % cand_cnt] is the next hop of the attempt */
-    uint8_t  excl_cnt;      /* failed next hops of THIS message (7.4:
+    uint8_t  excl_cnt;      /* failed next hops of THIS message (8.4:
                               cumulative exclusion per message, no
                               protocol field - the penalty 8.5 carries
                               the long-term lesson) */
     uint16_t msg_id, src, dst, prev_hop, next_hop;
-    uint8_t  in_graph;     /* the destination lies in the own graph (7.1):
-                              the plan is Dijkstra-proven, not a geo guess -
-                              the attempt order then favours the optimum
-                              (7.4, the in-graph retry bias, Oct 2026: a
-                              failed exchange on a proven route is more
-                              likely fluctuation than structure - the
-                              16h scale run: 179 messages reached their
-                              destination as a chosen hop, the single
-                              exchange failed, and the round-robin then
-                              wandered to suboptimal detours that never
-                              came back; in-graph the optimum gets the
-                              majority of the attempts instead) */
     uint16_t cand[3];      /* the attempt plan, best first (8.4) */
     uint16_t excl[3];       /* the failed hops (8.4) */
     uint8_t  pkt[16 + MC_MAX_PAYLOAD];

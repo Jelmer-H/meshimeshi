@@ -325,7 +325,7 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
          * multiply. */
         else if (rd16(pkt + 10) != n->id) return;
         /* dedup gates the processing (no second delivery, no second
-         * forward), but a retry STILL gets its ack1 (7.4, decided Oct
+         * forward), but a retry STILL gets its ack1 (8.4, decided Oct
          * 2026): the most likely reason for the retry is a lost ack1,
          * not a lost data packet - silence would make the sender
          * declare the link dead and detour. */
@@ -417,7 +417,6 @@ void mimeshi_rx(mimeshi_node *n, uint8_t ch, int8_t rssi, const uint8_t *pkt, ui
              * after the check - an unforwardable message must not
              * leak its pending slot. */
             p->cand_cnt = schedule_candidates(n, dst, gl, go, prev, 0, 0, p->cand);
-            p->in_graph = r_idx(n, dst) >= 0 || nbr_find(n, dst) != 0;   /* Dijkstra-proven plan? (8.4) */
             if (n->hoptrace)
                 hoptrace_dossier(n, dst, prev, gl, go, (uint8_t)(budget - 1),
                                  p->excl, 0, p->cand, p->cand_cnt,

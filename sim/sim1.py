@@ -405,7 +405,7 @@ class Node:
 # ---------------------------------------------------------------------------
 # C core via ctypes — the only protocol implementation (design 13b).
 # Struct layout verified against sizeof/offsetof of core.h
-# (neighbor 32, pending 256, mapnode 12, link 6, node 36792 B).
+# (neighbor 32, pending 278, mapnode 24, link 6, node 36664 B).
 # ---------------------------------------------------------------------------
 MC_MAX_NEIGHBORS, MC_MAX_PENDING, MC_MAX_DEDUP, MC_MAX_PAYLOAD = 64, 64, 128, 230
 
@@ -429,7 +429,6 @@ class CPending(ctypes.Structure):
                 ("msg_id", ctypes.c_uint16), ("src", ctypes.c_uint16),
                 ("dst", ctypes.c_uint16), ("prev_hop", ctypes.c_uint16),
                 ("next_hop", ctypes.c_uint16),
-                ("in_graph", ctypes.c_uint8), ("pad0", ctypes.c_uint8),   # alignment: C pads to 4 before cand[3]
                 ("cand", ctypes.c_uint16 * 3),
                 ("excl", ctypes.c_uint16 * 3),
                 ("pkt", ctypes.c_uint8 * (16 + MC_MAX_PAYLOAD)),

@@ -41,7 +41,7 @@
  * 0.8, 1.2, 1.8 s. Worst case total (6 attempts, 3 candidates):
  * ~6 s incl. attempt times - inside T_ack2 = 8 s (8.3). */
 #define MC_ACK1_MARGIN_US   80000ull       /* processing + margin on top of t_data + t_ack (8.3) */
-#define MC_T_ACK2_US        8000000ull    /* ack2 timeout (7.3, revised Oct 2026): 8 s - the attempt
+#define MC_T_ACK2_US        8000000ull    /* ack2 timeout (8.3, revised Oct 2026): 8 s - the attempt
                                    schedule of the next hop (8.4) completes in ~6 s worst case,
                                    so silence beyond 8 s means its forwarding truly stalled;
                                    measured against 15 s: fired 17x in 6h, all legitimate */
