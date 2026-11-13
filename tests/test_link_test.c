@@ -142,7 +142,7 @@ int main(void) {
     assert(star_cnt_A[0] == 3 && star_cnt_A[1] == 3 && star_cnt_A[2] == 3);
     assert(star_cnt_B[0] == 3 && star_cnt_B[1] == 3 && star_cnt_B[2] == 3);
     assert(A.star_lonely_ctr == 15);         /* at the cap: the normal cadence
-                                                (MC_STAR_ROUND_TICKS lives in core.c) */
+                                                (MC_STAR_ROUND_TICKS lives in core/star_round.c) */
     /* B confirms A (below): the ladder resets lazily in the round tick -
      * B's next round runs at the normal cadence again. Checked after
      * the confirmation via the internal field. */

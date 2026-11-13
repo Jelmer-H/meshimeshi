@@ -13,7 +13,18 @@ add_compile_options(-Wall -Wextra -Werror)
 # ---- protocol core as shared library ---------------------------------
 # The simulator (sim/sim1.py) calls this via ctypes; firmware platforms
 # link the same source statically. No dynamic allocation in the core (13b).
-add_library(mimeshi_shared SHARED core/core.c core/core.h)
+set(MC_CORE_SOURCES
+  core/nbr.c
+  core/bound.c
+  core/proof.c
+  core/map.c
+  core/star.c
+  core/star_round.c
+  core/route.c
+  core/unicast.c
+  core/core.c
+)
+add_library(mimeshi_shared SHARED ${MC_CORE_SOURCES} core/core.h)
 set_target_properties(mimeshi_shared PROPERTIES OUTPUT_NAME mimeshi)
 # the shared .so is also loaded by the simulator (all nodes of a scenario
 # in one process): the larger bound pool, as in the README gcc line
@@ -21,7 +32,7 @@ target_compile_definitions(mimeshi_shared PRIVATE MC_BOUND_POOL=8192)
 target_include_directories(mimeshi_shared PUBLIC ${CMAKE_SOURCE_DIR})
 
 # Static variant for firmware builds.
-add_library(mimeshi_static STATIC core/core.c core/core.h)
+add_library(mimeshi_static STATIC ${MC_CORE_SOURCES} core/core.h)
 target_include_directories(mimeshi_static PUBLIC ${CMAKE_SOURCE_DIR})
 
 # ---- test programs ---------------------------------------------------------

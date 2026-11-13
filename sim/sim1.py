@@ -4,7 +4,7 @@ sim1.py — Meshimeshi simulator, scenario 1 (link test: 2 nodes).
 
 Architecture (design 12.1): event-driven discrete simulation; the protocol
 core is C and is called via ctypes (default build/libmimeshi.so, built with
-  gcc -O2 -fPIC -shared core/core.c -o build/libmimeshi.so).
+  gcc -O2 -fPIC -shared core/*.c -o build/libmimeshi.so).
 The C core is the only protocol implementation (design 13b): this file is
 exclusively platform layer — clock, radio, RNG — and contains no protocol
 logic. The simpy-based simulator (meshsim.py) reuses Node/Wire/CCCore here.
@@ -29,7 +29,7 @@ T_HACK  = 70_000          # hello-ack 5 B (10.2)
 T_ACK   = 78_000          # ack1/ack2 7 B (10.2)
 T_DATA  = lambda l: 173_000 if l <= 40 else 459_000 if l <= 150 else 869_000
 S_SWITCH = 5_000          # channel switch incl. settling (design 12.1)
-ACK1_MARGIN = 80_000      # margin on the ack1 wait time, equal to core.c
+ACK1_MARGIN = 80_000      # margin on the ack1 wait time, equal to core/config.h
 N_CH = 3
 HOME = lambda nid: nid % N_CH
 RSSI = -60                # link quality default; settable per pair (Wire.links)
