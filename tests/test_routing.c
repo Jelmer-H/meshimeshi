@@ -433,12 +433,11 @@ int main(void) {
         le = chunk_build(cke, ei[2], ei[0], 7, 0, ei[3], 7, 0, 7);
         e_deliver_all(cke, le);
         /* A -> B: first choice is C (both cost 20+20, C first in the
-         * table order). Blackhole C; after the failed series (2
-         * attempts, 2 s + jitter apart) the exclusion must switch to
-         * D and deliver. */
+         * table order). Blackhole C; round-robin (8.4) sends attempt 2
+         * to D after one intra-pass gap and the message delivers. */
         e_blackout = ei[1];                    /* radio drops everything to/from C */
         assert(mimeshi_send_data(&AA, ei[3], (const uint8_t *)"alt", 3, false, 0, 0) == 0);
-        pump_until(now + 30000000ull);          /* series: 2 x (350 ms + 2 s + jitter) + the D route */
+        pump_until(now + 30000000ull);          /* series: ack1 timeout + 400 ms gap + the D route */
         assert(e_deliv_count(ei[3]) >= 1);      /* B delivered via D */
         assert(e_tx_count(2) >= 1);              /* D forwarded at least once */
         /* the exclusion is per message: a fresh send uses C again */

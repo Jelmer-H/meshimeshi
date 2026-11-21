@@ -74,8 +74,6 @@ uint8_t schedule_candidates(mimeshi_node *n, uint16_t dst,
     return cnt;
 }
 
-/* attempts of the plan by its size: 1 candidate = 4 (1 fast + 3 slow);
- * 2 = 5 alternating (the best hop gets the extra attempt); 3 = 6. */
 /* Total attempts of the schedule by its size (8.4): 1 candidate = 4
  * (A,A,A,A - the damper table then runs 0.8, 1.2, 1.8 s); 2 = 6
  * (A,B,A,B,A,B - each node 3x); 3 = 6 (A,B,C,A,B,C - each node 2x).
@@ -91,14 +89,16 @@ uint8_t schedule_attempts(const mimeshi_pending *p) {
 #define PLAN_INTRA_MS       400u           /* A->B within a pass (different node) */
 static const uint32_t PLAN_PASS_MS[3] = { 800, 1200, 1800 };  /* escalating per pass (same node) */
 
-/* The wait before attempt try_idx+1 (8.4). Small fixed gap inside a
- * pass over the candidates - the next attempt goes to a DIFFERENT
- * node, so no damper needed; escalating gap at each pass boundary -
- * the same node comes back there. */
+/* The wait before attempt try_idx+1 (8.4). The boundary gap applies
+ * when THAT attempt starts a new pass - the same node comes back,
+ * and it may be briefly busy on another channel, so the damper
+ * belongs there; inside a pass the next attempt goes to a different
+ * node, so the small fixed gap suffices. */
 static uint64_t schedule_wait_us(mimeshi_node *n, const mimeshi_pending *p) {
-    uint8_t pass = p->try_idx / p->cand_cnt;            /* completed passes */
-    uint8_t boundary = (uint8_t)((p->try_idx % p->cand_cnt) == 0 && pass > 0);
-    uint32_t base = boundary ? PLAN_PASS_MS[pass > 2 ? 2 : pass] : PLAN_INTRA_MS;
+    uint8_t next = p->try_idx + 1;                      /* attempt this wait leads to */
+    uint8_t npass = next / p->cand_cnt;                 /* pass of that attempt */
+    uint8_t boundary = (uint8_t)((next % p->cand_cnt) == 0 && npass > 0);
+    uint32_t base = boundary ? PLAN_PASS_MS[npass > 3 ? 2 : npass - 1] : PLAN_INTRA_MS;
     uint32_t jit = base / 4;                            /* +-25% */
     return 1000ull * (base - jit + (n->rand(n) % (2 * jit + 1)));
 }
@@ -124,9 +124,9 @@ static void ack1_timeout(mimeshi_node *n, void *ud) {
     schedule_fail(n, p);
 }
 
-/* The attempt schedule toward this destination is exhausted (7.4,
- * revised Oct 2026 - no rebuild: the 6 attempts ARE the retry space of
- * the hop). All candidates go into the cumulative exclusion together
+/* The attempt schedule toward this destination is exhausted (8.4 -
+ * no rebuild: the attempts ARE the retry space of the hop). All
+ * candidates go into the cumulative exclusion together
  * and the message fails definitively with the negative ack2 to the
  * previous hop, the spent budget along. The previous hop decides with
  * its own plan and budget whether another route remains. */
@@ -151,7 +151,7 @@ void schedule_fail(mimeshi_node *n, mimeshi_pending *p) {
  * moment of submission. Assumption: the platform layer delivers the
  * transmission quickly (queue short); if the switch takes longer, the
  * timeout fires too early and the attempt counts as failed. */
-/* T_ack2 timeout (7.3, fixed 8 s): the next hop received (ack1 came)
+/* T_ack2 timeout (8.3, fixed 8 s): the next hop received (ack1 came)
  * but its own forwarding stayed silent beyond every series. The
  * silence counts as a failed series toward this hop: 6 units off the
  * budget, then the 8.4 structure takes over - next-best hop if
@@ -170,21 +170,10 @@ void ack2_timeout(mimeshi_node *n, void *ud) {
 
 void pending_try(mimeshi_node *n, mimeshi_pending *p) {
     if (p->cand_cnt == 0) return;             /* no schedule: nothing to send (defensive) */
-    /* Attempt order (7.4, revised Oct 2026 - the in-graph retry bias):
-     * round-robin gives every candidate the same number of attempts -
-     * fair for a geo-guess plan, wasteful for a Dijkstra-proven one: a
-     * failed exchange on the proven optimum is more likely fluctuation
-     * than structure, and detouring to the second-best abandons proven
-     * quality for a guess. In-graph the order is therefore
-     * optimum-first: cand0 twice, then cand1, cand0 again, cand2, cand0
-     * (the 4-6 attempts of the series, the optimum getting the
-     * majority). Out-of-graph (geo/bridge) the round-robin stands. */
-    if (p->in_graph) {
-        static const uint8_t bias[6] = { 0, 1, 0, 2, 0, 1 };
-        p->next_hop = p->cand[bias[p->try_idx % 6] % p->cand_cnt];
-    } else {
-        p->next_hop = p->cand[p->try_idx % p->cand_cnt];   /* round-robin over the schedule (8.4) */
-    }
+    /* Attempt order (8.4): round-robin over the candidates - two
+     * attempts toward the same node are then always a full pass
+     * apart, so the intra-pass wait can stay short. */
+    p->next_hop = p->cand[p->try_idx % p->cand_cnt];   /* round-robin over the schedule (8.4) */
     p->pkt[9] = p->budget_left;
     wr16(p->pkt + 10, p->next_hop);           /* next hop in the header (10.1) */
     MTRACE(n, "TRY %u/%u msg %u via %u (budget %u)\n",
@@ -280,7 +269,6 @@ int mimeshi_send_data(mimeshi_node *n, uint16_t dst, const uint8_t *payload, uin
     /* attempt schedule (8.4): up to 3 Dijkstra-best hops toward dst; the
      * route itself is the first candidate - or the send is refused. */
     p->cand_cnt = schedule_candidates(n, dst, dest_lat, dest_lon, n->id, 0, 0, p->cand);
-    p->in_graph = r_idx(n, dst) >= 0 || nbr_find(n, dst) != 0;   /* Dijkstra-proven plan? (8.4) */
     if (n->hoptrace)
         hoptrace_dossier(n, dst, n->id, dest_lat, dest_lon, p->budget_left,
                          p->excl, 0, p->cand, p->cand_cnt,
