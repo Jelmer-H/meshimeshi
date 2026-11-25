@@ -71,15 +71,22 @@ collision loss that CAD alone does not remove.
 
 ### 3.3 Learning layer: per-neighbour, per-slot failure counters
 
-- For each neighbour, the sender keeps **S one-byte collision counters**,
+- For each neighbour, the sender keeps **S one-byte collision counters**, 
   one per slot. A failed exchange increments the counter of the slot it
-  used. Counters **decay every superframe** (e.g. halve), so old damage
+  used. Every 15 minutes (one star-round interval, no extra timer needed: 
+  decay on the round boundary) each counter is halved, so old damage
   fades and the counters stay small.
 - On collision, the sender re-picks its slot **at random among the 4
   slots with the lowest counters** (exploration), rather than
   deterministically. This keeps the population moving away from
   contested slots without synchronising them onto one "best" slot.
-- Cost: 8 bytes of RAM per neighbour. Acceptable on the target pieces.
+- Memory cost: 8 one-byte slots per neighbour, capped at 64 neighbours
+  (the neighbour-table limit), i.e. **512 bytes of RAM worst case**.
+- Counters double as a **passive congestion indicator**: their sum per
+  neighbour is a locally observed load signal, available for free and
+  usable as input for the link-pressure cost that open point 15 asks
+  for. It measures contention *experienced*, not queue depth at the
+  neighbour — the two are complementary, not the same signal.
 
 ### 3.4 Interaction with existing mechanisms
 
@@ -98,7 +105,7 @@ collision loss that CAD alone does not remove.
 |---|---|---|
 | Slots per superframe `S` | 8 | Raise to 16/32 if measurements show residual slot collisions under load. |
 | Slot duration | ~0.6 s (data 100 B + ack + guard) | Follows from §12.3; recompute for other frame sizes. |
-| Counter width | 1 byte per (neighbour, slot) | Saturating, with per-superframe decay. |
+| Counter width | 1 byte per (neighbour, slot) | Saturating; halved every 15 min on the star-round boundary. |
 | Exploration set | 4 lowest counters | Keeps escaping collided slots cheap without full reshuffles. |
 | Fallback | — | No fresh anchor for the receiver → behave exactly as today. |
 
