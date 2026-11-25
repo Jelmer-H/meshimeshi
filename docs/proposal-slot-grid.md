@@ -99,6 +99,28 @@ collision loss that CAD alone does not remove.
 | Hidden nodes | Partially addressed: counters learn contested slots even when the interferer is invisible, because the cost shows up as loss regardless of who caused it. |
 | Companions | Out of scope for now; companion traffic may move to a separate channel/SF (see open questions). |
 
+### 3.5 Phase measurement from every packet
+
+Every disciplined transmission doubles as a phase observation, free of
+charge: a packet's arrival time minus its known airtime reconstructs the
+sender's transmit start, and comparing that against the expected slot
+position yields an offset measurement. The measurement rate therefore
+scales with traffic — the busier the network, the denser the timing
+evidence — and no new packet format is required.
+
+Rules for using these observations:
+
+- **Only disciplined traffic counts.** First attempts under ALOHA are
+  unpositioned by design and are excluded from the phase estimate; star
+  rounds and slot-placed retries are the primary sources.
+- **Robust filtering.** Each node keeps a short history of offsets per
+  neighbour; the phase estimate follows the median (or a similarly
+  robust statistic), so a single noisy sample — or a node with a bad
+  crystal — cannot pull anyone along.
+- **Self-reinforcing.** The more traffic runs on the grid, the denser
+  the sync evidence becomes: discipline produces the very signal that
+  keeps the whole network locked to one rhythm.
+
 ## 4. Parameters
 
 | Parameter | Default | Notes |
