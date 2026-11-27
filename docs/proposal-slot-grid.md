@@ -121,6 +121,27 @@ Rules for using these observations:
   the sync evidence becomes: discipline produces the very signal that
   keeps the whole network locked to one rhythm.
 
+### 3.6 Placement rule: align to the slot's end
+
+Exchanges are aligned to the **end** of their slot, not the start: the
+transmission is placed so that data plus acknowledgement finish at the
+slot boundary. This turns packet length into the within-slot arbiter:
+
+- The longest packet in a slot starts first and claims the slot.
+- Shorter contenders do their CAD while the longer transmission is
+  already on the air, hear it busy, and defer. With start-alignment,
+  all contenders see a free channel and start simultaneously — CAD is
+  defeated by the simultaneity itself. End-alignment restores CAD as
+  the effective arbiter *within* a slot, complementing the grid that
+  arbitrates *between* slots.
+- **Equal-length residue.** Two same-length packets still start
+  together. The existing jitter (§5.1), natural clock drift, and the
+  learning layer (§3.3) catch this residue: a chronically deferred
+  node moves to another slot.
+- **Ack placement.** The exchange (data + ack1) ends at the slot
+  boundary; the ack1 remains a CAD-exempt direct reply inside the
+  slot.
+
 ## 4. Parameters
 
 | Parameter | Default | Notes |
